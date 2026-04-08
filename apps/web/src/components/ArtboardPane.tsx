@@ -1,0 +1,235 @@
+import { useRef } from "react";
+import type { CSSProperties, Dispatch, PointerEvent, RefObject, SetStateAction } from "react";
+import type { FrameVersion, FrameWithVersions } from "@designer/shared";
+import type { CaptureLogEntry } from "../lib/figmaCapture";
+import type { FramePairLink, FrameSourceMeta } from "../lib/frameLinking";
+import type { CopyState } from "../types/ui";
+import { FrameCard } from "./FrameCard";
+
+type PendingCanvasCard = {
+  id: string;
+  sourceType: "figma-reference" | "image-reference";
+  sourceRole: "reference-screen" | "design-system";
+  name: string;
+  subtitle: string;
+  position: { x: number; y: number };
+  size: { width: number; height: number };
+};
+
+type ArtboardPaneProps = {
+  interactionType: "drag" | "resize" | "pan" | null;
+  artboardBackgroundStyle: CSSProperties;
+  viewport: { x: number; y: number; scale: number };
+  viewportRef: RefObject<HTMLDivElement>;
+  frames: FrameWithVersions[];
+  frameLookup: Map<string, FrameVersion | undefined>;
+  frameMetaById: Map<string, FrameSourceMeta>;
+  frameLinks: FramePairLink[];
+  copyStates: Record<string, { state: CopyState; logs: CaptureLogEntry[] }>;
+  expandedHistoryFrameId: string | null;
+  setExpandedHistoryFrameId: Dispatch<SetStateAction<string | null>>;
+  zoomBy: (factor: number) => void;
+  buildPreviewDocument: (frameId: string, version?: FrameVersion) => string;
+  beginDrag: (event: PointerEvent, frameId: string) => void;
+  beginResize: (event: PointerEvent, frameId: string) => void;
+  selectFrame: (frameId: string) => Promise<void>;
+  clearCanvasSelection: () => Promise<void>;
+  copyFrameToFigma: (frameId: string) => Promise<void>;
+  resyncFrameReference: (frameId: string) => Promise<void>;
+  openProjectDesignSystem: () => void;
+  allowFrameInteraction: boolean;
+  pendingCanvasCards: PendingCanvasCard[];
+};
+
+export function ArtboardPane(props: ArtboardPaneProps) {
+  const {
+    interactionType,
+    artboardBackgroundStyle,
+    viewport,
+    viewportRef,
+    frames,
+    frameLookup,
+    frameMetaById,
+    frameLinks,
+    copyStates,
+    expandedHistoryFrameId,
+    setExpandedHistoryFrameId,
+    zoomBy,
+    buildPreviewDocument,
+    beginDrag,
+    beginResize,
+    selectFrame,
+    clearCanvasSelection,
+    copyFrameToFigma,
+    resyncFrameReference,
+    openProjectDesignSystem,
+    allowFrameInteraction,
+    pendingCanvasCards
+  } = props;
+
+  const backgroundPointerRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    canClear: boolean;
+  } | null>(null);
+  const frameById = new Map(frames.map((frame) => [frame.id, frame]));
+
+  return (
+    <main className="canvas-pane">
+      <div
+        className={`artboard-viewport ${interactionType === "pan" ? "is-panning" : ""}`}
+        ref={viewportRef}
+        style={artboardBackgroundStyle}
+        onPointerDown={(event) => {
+          const target = event.target as HTMLElement;
+          if (target.closest(".frame-card, .canvas-floating-controls")) {
+            backgroundPointerRef.current = null;
+            return;
+          }
+
+          backgroundPointerRef.current = {
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            canClear: true
+          };
+        }}
+        onPointerMove={(event) => {
+          const pointerState = backgroundPointerRef.current;
+          if (!pointerState || pointerState.pointerId !== event.pointerId) {
+            return;
+          }
+          if (Math.abs(event.clientX - pointerState.startX) > 5 || Math.abs(event.clientY - pointerState.startY) > 5) {
+            pointerState.canClear = false;
+          }
+        }}
+        onPointerUp={(event) => {
+          const pointerState = backgroundPointerRef.current;
+          backgroundPointerRef.current = null;
+          if (!pointerState || pointerState.pointerId !== event.pointerId) {
+            return;
+          }
+          if (!pointerState.canClear || interactionType) {
+            return;
+          }
+          void clearCanvasSelection();
+        }}
+        onPointerCancel={() => {
+          backgroundPointerRef.current = null;
+        }}
+      >
+        <div className="canvas-floating-controls">
+          <button onClick={() => zoomBy(0.9)} aria-label="Zoom out">
+            -
+          </button>
+          <button onClick={() => zoomBy(1.12)} aria-label="Zoom in">
+            +
+          </button>
+        </div>
+
+        <div className="artboard-world" style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}>
+          <div className="artboard-surface">
+            {frameLinks.length > 0 ? (
+              <svg className="artboard-link-layer" viewBox="0 0 12000 9000" preserveAspectRatio="none">
+                {frameLinks.map((link) => {
+                  const fromFrame = frameById.get(link.fromFrameId);
+                  const toFrame = frameById.get(link.toFrameId);
+                  if (!fromFrame || !toFrame) {
+                    return null;
+                  }
+
+                  const x1 = fromFrame.position.x + fromFrame.size.width / 2;
+                  const y1 = fromFrame.position.y + fromFrame.size.height / 2;
+                  const x2 = toFrame.position.x + toFrame.size.width / 2;
+                  const y2 = toFrame.position.y + toFrame.size.height / 2;
+                  const isImage = link.sourceType === "image-reference";
+
+                  return (
+                    <g key={`${link.sourceGroupId}-${link.fromFrameId}-${link.toFrameId}`}>
+                      <line
+                        x1={x1}
+                        y1={y1}
+                        x2={x2}
+                        y2={y2}
+                        className={`artboard-link-line ${isImage ? "artboard-link-line--image" : "artboard-link-line--figma"}`}
+                      />
+                      <circle
+                        cx={x1}
+                        cy={y1}
+                        r={6}
+                        className={`artboard-link-node ${isImage ? "artboard-link-node--image" : "artboard-link-node--figma"}`}
+                      />
+                      <circle cx={x2} cy={y2} r={7} className="artboard-link-node artboard-link-node--design-system" />
+                    </g>
+                  );
+                })}
+              </svg>
+            ) : null}
+
+            {frames.map((frame) => {
+              const sourceMeta = frameMetaById.get(frame.id) ?? null;
+              const canResyncReference = sourceMeta?.sourceType === "figma-reference";
+              return (
+                <FrameCard
+                  key={frame.id}
+                  frame={frame}
+                  version={frameLookup.get(frame.id)}
+                  sourceMeta={sourceMeta}
+                  copy={copyStates[frame.id] ?? { state: "idle", logs: [] }}
+                  expandedHistoryFrameId={expandedHistoryFrameId}
+                  setExpandedHistoryFrameId={setExpandedHistoryFrameId}
+                  buildPreviewDocument={buildPreviewDocument}
+                  beginDrag={beginDrag}
+                  beginResize={beginResize}
+                  selectFrame={selectFrame}
+                  copyFrameToFigma={copyFrameToFigma}
+                  resyncFrameReference={resyncFrameReference}
+                  canResyncReference={canResyncReference}
+                  openProjectDesignSystem={openProjectDesignSystem}
+                  allowFrameInteraction={allowFrameInteraction}
+                />
+              );
+            })}
+
+            {pendingCanvasCards.map((pendingCard) => {
+              const pendingClassName = [
+                "frame-card",
+                "frame-card--pending",
+                pendingCard.sourceType === "figma-reference" ? "frame-card--special-figma" : "frame-card--special-image",
+                pendingCard.sourceRole === "reference-screen"
+                  ? "frame-card--special-reference-screen"
+                  : "frame-card--special-design-system"
+              ]
+                .filter(Boolean)
+                .join(" ");
+              return (
+                <article
+                  key={pendingCard.id}
+                  className={pendingClassName}
+                  style={{
+                    left: pendingCard.position.x,
+                    top: pendingCard.position.y,
+                    width: pendingCard.size.width,
+                    height: pendingCard.size.height
+                  }}
+                >
+                  <header className="frame-card__header">
+                    <div>
+                      <h3>{pendingCard.name}</h3>
+                      <p>building • syncing to canvas</p>
+                    </div>
+                  </header>
+                  <div className="frame-card__preview frame-card__preview--pending">
+                    <div className="frame-card__pending-spinner" />
+                    <p>{pendingCard.subtitle}</p>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </main>
+  );
+}

@@ -1,0 +1,22 @@
+{
+  "name": "conversational-ui-designer",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev -w @designer/api\" \"npm run dev -w @designer/web\"",
+    "dev:api": "npm run dev -w @designer/api",
+    "dev:web": "npm run dev -w @designer/web",
+    "build": "npm run build -w @designer/shared && npm run build -w @designer/api && npm run build -w @designer/web",
+    "start:api": "npm run start -w @designer/api",
+    "test": "npm run test -w @designer/shared && npm run test -w @designer/api && npm run test -w @designer/web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.8.2",
+    "vitest": "^2.1.9"
+  }
+}
