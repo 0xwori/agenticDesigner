@@ -4,11 +4,22 @@ export interface DesignMdColorToken {
   role: string;
 }
 
+export interface DesignMdTypographyHierarchyEntry {
+  role: string;
+  sizePx: number;
+  weight: number;
+  lineHeight?: number;
+  letterSpacing?: string;
+  fontVariant?: string;
+  notes?: string;
+}
+
 export interface DesignMdTypographyToken {
   headlineFont: string;
   bodyFont: string;
   labelFont: string;
   notes: string[];
+  hierarchy?: DesignMdTypographyHierarchyEntry[];
 }
 
 export type DesignSystemVisualSectionId =
@@ -21,7 +32,9 @@ export type DesignSystemVisualSectionId =
   | "navigation"
   | "feedback-status"
   | "data-display"
-  | "iconography-imagery";
+  | "iconography-imagery"
+  | "dos-and-donts"
+  | "imagery-atmosphere";
 
 export type DesignSystemVisualBlockKind =
   | "chips"
@@ -32,7 +45,9 @@ export type DesignSystemVisualBlockKind =
   | "navigation-items"
   | "metric-cards"
   | "icons"
-  | "rules";
+  | "rules"
+  | "dos-donts"
+  | "prose";
 
 export interface DesignSystemVisualItem {
   label: string;
@@ -155,6 +170,9 @@ export interface DesignMdStructuredTokens {
   components: string[];
   dos: string[];
   donts: string[];
+  layout: string;
+  responsive: string;
+  imagery: string;
   styleProfile: StyleProfile;
   qualityReport: DesignSystemQualityReport;
   visualBoard: DesignSystemVisualBoard;

@@ -1,4 +1,5 @@
 import type { DevicePreset } from "@designer/shared";
+import { isMobilePreset } from "@designer/shared";
 
 export type FrameLayoutLike = {
   position: {
@@ -12,7 +13,16 @@ export type FrameLayoutLike = {
 };
 
 export function computeFrameSize(device: DevicePreset) {
-  if (device === "iphone") {
+  if (device === "iphone-15-pro-max") {
+    return { width: 430, height: 932 };
+  }
+  if (device === "iphone-15-pro") {
+    return { width: 393, height: 852 };
+  }
+  if (device === "iphone-15") {
+    return { width: 393, height: 852 };
+  }
+  if (isMobilePreset(device)) {
     return { width: 393, height: 852 };
   }
   return { width: 1240, height: 880 };

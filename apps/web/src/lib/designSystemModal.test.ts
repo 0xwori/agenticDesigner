@@ -20,6 +20,9 @@ describe("designSystemModal helpers", () => {
         components: [],
         dos: [],
         donts: [],
+        layout: "",
+        responsive: "",
+        imagery: "",
         styleProfile: {
           sourceType: "manual",
           foundations: {

@@ -73,6 +73,15 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
     response.json(frame);
   });
 
+  app.delete("/frames/:id", async (request, response) => {
+    const deleted = await deps.deleteFrame(request.params.id);
+    if (!deleted) {
+      sendApiError(response, 404, "Frame not found.", "not_found");
+      return;
+    }
+    response.json({ ok: true });
+  });
+
   app.get("/frames/:id/versions", async (request, response) => {
     const frame = await deps.getFrame(request.params.id);
     if (!frame) {

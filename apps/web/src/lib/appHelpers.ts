@@ -1,5 +1,6 @@
 import type { CSSProperties } from "react";
 import type { FrameVersion, PipelineEvent } from "@designer/shared";
+import { buildGoogleFontsLink, extractFontFamiliesFromCss } from "@designer/shared";
 import { DEFAULT_API_BASE, getApiBaseUrl } from "../api";
 import type { LocalPreferences } from "../types/ui";
 
@@ -107,8 +108,29 @@ export function parseDesignSystemCalibrationCommand(input: string): { updates: s
   return { updates };
 }
 
-export function buildPreviewDocument(frameId: string, version?: FrameVersion) {
+export function buildPreviewDocument(frameId: string, version?: FrameVersion, isBuilding?: boolean) {
   if (!version) {
+    if (isBuilding) {
+      return `<!doctype html><html><head><style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:ui-sans-serif,system-ui,sans-serif;display:grid;place-items:center;height:100vh;background:#faf8f4;overflow:hidden}
+.loader-wrap{display:flex;flex-direction:column;align-items:center;gap:18px}
+.gradient-ring{width:48px;height:48px;border-radius:999px;background:conic-gradient(from 0deg,#6366f1,#a855f7,#ec4899,#f97316,#eab308,#22c55e,#06b6d4,#6366f1);padding:3px;animation:ring-spin 1.8s linear infinite}
+.gradient-ring-inner{width:100%;height:100%;border-radius:999px;background:#faf8f4}
+@keyframes ring-spin{to{transform:rotate(360deg)}}
+.loader-label{font-size:13px;font-weight:600;color:#64748b;letter-spacing:0.01em}
+.loader-dots{display:inline-flex;gap:2px}
+.loader-dots span{animation:dot-blink 1.4s infinite both}
+.loader-dots span:nth-child(2){animation-delay:0.2s}
+.loader-dots span:nth-child(3){animation-delay:0.4s}
+@keyframes dot-blink{0%,80%,100%{opacity:0.2}40%{opacity:1}}
+</style></head><body>
+<div class="loader-wrap">
+<div class="gradient-ring"><div class="gradient-ring-inner"></div></div>
+<div class="loader-label">Designing your screen<span class="loader-dots"><span>.</span><span>.</span><span>.</span></span></div>
+</div>
+</body></html>`;
+    }
     return `<!doctype html><html><body style="font-family: ui-sans-serif,system-ui;display:grid;place-items:center;height:100vh;color:#5d6372;background:#faf8f4;">No content yet.</body></html>`;
   }
 
@@ -117,6 +139,7 @@ export function buildPreviewDocument(frameId: string, version?: FrameVersion) {
   const tailwindRuntime = version.tailwindEnabled ? `<script src="https://cdn.tailwindcss.com"></script>` : "";
   const safeFrameId = JSON.stringify(frameId);
   const safeVersionId = JSON.stringify(version.id);
+  const googleFontsTag = buildGoogleFontsLink(extractFontFamiliesFromCss(version.cssCode));
 
   return `
     <!doctype html>
@@ -124,6 +147,7 @@ export function buildPreviewDocument(frameId: string, version?: FrameVersion) {
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        ${googleFontsTag}
         <style>${safeCss}</style>
         ${tailwindRuntime}
       </head>
@@ -141,13 +165,22 @@ export function buildPreviewDocument(frameId: string, version?: FrameVersion) {
 
           const __postHeight = () => {
             const root = document.getElementById("root");
-            const nextHeight = Math.ceil(
-              Math.max(
-                document.body ? document.body.scrollHeight : 0,
-                document.documentElement ? document.documentElement.scrollHeight : 0,
-                root ? root.scrollHeight : 0
-              )
-            );
+            let nextHeight = 0;
+            if (root && root.children.length > 0) {
+              // Measure the bottom of the last rendered child for precision
+              const lastChild = root.children[root.children.length - 1];
+              const rect = lastChild.getBoundingClientRect();
+              nextHeight = Math.ceil(rect.bottom);
+            }
+            if (nextHeight < 120) {
+              // Fallback to scrollHeight
+              nextHeight = Math.ceil(
+                Math.max(
+                  root ? root.scrollHeight : 0,
+                  document.body ? document.body.scrollHeight : 0
+                )
+              );
+            }
             if (!Number.isFinite(nextHeight) || nextHeight < 120 || Math.abs(nextHeight - __lastReportedHeight) < 2) {
               return;
             }
@@ -200,6 +233,9 @@ export function buildPreviewDocument(frameId: string, version?: FrameVersion) {
               attributes: true,
               characterData: true
             });
+            if (typeof ResizeObserver !== "undefined") {
+              new ResizeObserver(() => __scheduleHeight()).observe(document.body);
+            }
           }
           window.addEventListener("load", __scheduleHeight);
           window.addEventListener("resize", __scheduleHeight);

@@ -1,35 +1,24 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
-  ComposerAttachment,
-  DesignMode,
   DesignSystemMode,
   DevicePreset,
   FrameVersion,
   PipelineEvent,
-  ProjectBundle,
   ProjectSettings,
   ReferenceSource,
   SurfaceTarget
 } from "@designer/shared";
+import { isMobilePreset } from "@designer/shared";
 import { select, type Selection } from "d3-selection";
 import { zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
 import {
-  addReferenceWithCredentials,
-  bootstrapProjectDesignSystem,
   calibrateProjectDesignSystem,
-  checkApiHealth,
   clearBoard,
   createManualFrame,
-  createProject,
+  deleteFrame,
   getApiBaseUrl,
   getProjectBundle,
-  getProjectDesignSystem,
-  regenerateProjectDesignSystem,
-  regenerateProjectDesignSystemFromReference,
-  resetAndRegenerateProjectDesignSystem,
-  openRunStream,
   resyncReference,
-  saveProjectDesignSystem,
   startEditRun,
   startGenerateRun,
   updateFrameLayout,
@@ -39,6 +28,7 @@ import { captureSelectorToFigmaClipboard, type CaptureLogEntry } from "./lib/fig
 import { ArtboardPane } from "./components/ArtboardPane";
 import { PromptPanel } from "./components/PromptPanel";
 import { WorkspaceSettingsModal } from "./components/WorkspaceSettingsModal";
+import { BrandPickerModal } from "./components/BrandPickerModal";
 import {
   ProjectDesignSystemModal,
   type DesignSystemReferenceItem
@@ -49,7 +39,6 @@ import {
   extractFrameSourceMeta,
   resolveReferenceForFrame
 } from "./lib/frameLinking";
-import { runSequentialQueue } from "./lib/designSystemModal";
 import {
   buildPreviewDocument,
   clampScale,
@@ -60,527 +49,228 @@ import {
   loadPreferences,
   parseDesignSystemCalibrationCommand,
   parseFigmaCredentialsCommand,
-  PROJECT_STORAGE_KEY,
   savePreferences,
   VIEWPORT_MAX_SCALE,
   VIEWPORT_MIN_SCALE,
   VIEWPORT_DEFAULT
 } from "./lib/appHelpers";
-import { annotateClientOrder, comparePipelineEvents } from "./lib/eventOrdering";
+import { comparePipelineEvents } from "./lib/eventOrdering";
 import { createSmoothPanController } from "./lib/viewportController";
-import type { CopyState, DebugLogEntry, DebugLogLevel, LocalPreferences, PromptEntry, RunMode } from "./types/ui";
+import { AppStoreContext, createStore, useInputState, useProjectState, useRunState, useUIState } from "./lib/store";
+import { usePipelineEvents } from "./hooks/usePipelineEvents";
+import { useDesignSystemWorkspace } from "./hooks/useDesignSystemWorkspace";
+import { useComposerAttachments } from "./hooks/useComposerAttachments";
+import type { AppState, CopyState, PromptEntry, RunMode } from "./types/ui";
 
-type InteractionState =
-  | {
-      type: "drag";
-      frameId: string;
-      originX: number;
-      originY: number;
-      startX: number;
-      startY: number;
-    }
-  | {
-      type: "resize";
-      frameId: string;
-      originWidth: number;
-      originHeight: number;
-      startX: number;
-      startY: number;
-    };
+type CopyStateMap = Record<string, { state: CopyState; logs: CaptureLogEntry[] }>;
 
-type CopyStateMap = Record<
-  string,
-  {
-    state: CopyState;
-    logs: CaptureLogEntry[];
-  }
->;
+// ---------------------------------------------------------------------------
+// Module-level store — created once, survives hot-reload
+// ---------------------------------------------------------------------------
 
-type PendingCanvasCard = {
-  id: string;
-  runId: string;
-  sourceType: "figma-reference" | "image-reference";
-  sourceRole: "reference-screen" | "design-system";
-  createdAfterMs: number;
-  name: string;
-  subtitle: string;
-  position: { x: number; y: number };
-  size: { width: number; height: number };
-};
+const _initialPrefs = loadPreferences();
+
+const appStore = createStore<AppState>({
+  run: {
+    chatEvents: [],
+    promptHistory: [],
+    copyStates: {},
+    debugLogs: [],
+    isCopyingLogs: false,
+    captureFrameId: null,
+  },
+  project: {
+    bundle: null,
+    loading: true,
+    error: "",
+  },
+  input: {
+    composerPrompt: "",
+    composerAttachments: [],
+    runMode: "new-frame",
+    selectedDevice: _initialPrefs.deviceDefault,
+    selectedMode: _initialPrefs.modeDefault,
+    selectedDesignSystemMode: "strict",
+    selectedSurfaceTarget: "web",
+    variation: 1,
+    tailwindOverride: _initialPrefs.tailwindDefault,
+  },
+  ui: {
+    preferences: _initialPrefs,
+    interaction: null,
+    isViewportPanning: false,
+    viewport: VIEWPORT_DEFAULT,
+    expandedHistoryFrameId: null,
+    isWorkspaceSettingsOpen: false,
+    isProjectDesignSystemOpen: false,
+    isBrandPickerOpen: false,
+    activeBrandName: null,
+    designSystemWarnings: [],
+    designSystemBusy: false,
+    designSystemBusyLabel: null,
+    designSystemRegeneratingReferenceId: null,
+    pendingFigmaAttachUrl: null,
+    isFrameInteractionUnlocked: false,
+    pendingCanvasCards: [],
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Root component — provides the store context
+// ---------------------------------------------------------------------------
 
 export default function App() {
-  const [preferences, setPreferences] = useState<LocalPreferences>(loadPreferences);
-  const [bundle, setBundle] = useState<ProjectBundle | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string>("");
-  const [composerPrompt, setComposerPrompt] = useState("");
-  const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
-  const [runMode, setRunMode] = useState<RunMode>("new-frame");
-  const [selectedDevice, setSelectedDevice] = useState<DevicePreset>(preferences.deviceDefault);
-  const [selectedMode, setSelectedMode] = useState<DesignMode>(preferences.modeDefault);
-  const [selectedDesignSystemMode, setSelectedDesignSystemMode] = useState<DesignSystemMode>("strict");
-  const [selectedSurfaceTarget, setSelectedSurfaceTarget] = useState<SurfaceTarget>("web");
-  const [variation, setVariation] = useState(1);
-  const [tailwindOverride, setTailwindOverride] = useState(preferences.tailwindDefault);
-  const [chatEvents, setChatEvents] = useState<PipelineEvent[]>([]);
-  const [promptHistory, setPromptHistory] = useState<PromptEntry[]>([]);
-  const [copyStates, setCopyStates] = useState<CopyStateMap>({});
-  const [debugLogs, setDebugLogs] = useState<DebugLogEntry[]>([]);
-  const [isCopyingLogs, setIsCopyingLogs] = useState(false);
-  const [captureFrameId, setCaptureFrameId] = useState<string | null>(null);
-  const [interaction, setInteraction] = useState<InteractionState | null>(null);
-  const [isViewportPanning, setViewportPanning] = useState(false);
-  const [viewport, setViewport] = useState(VIEWPORT_DEFAULT);
-  const [expandedHistoryFrameId, setExpandedHistoryFrameId] = useState<string | null>(null);
-  const [isWorkspaceSettingsOpen, setWorkspaceSettingsOpen] = useState(false);
-  const [isProjectDesignSystemOpen, setProjectDesignSystemOpen] = useState(false);
-  const [designSystemWarnings, setDesignSystemWarnings] = useState<string[]>([]);
-  const [designSystemBusy, setDesignSystemBusy] = useState(false);
-  const [designSystemBusyLabel, setDesignSystemBusyLabel] = useState<string | null>(null);
-  const [designSystemRegeneratingReferenceId, setDesignSystemRegeneratingReferenceId] = useState<string | null>(null);
-  const [pendingFigmaAttachUrl, setPendingFigmaAttachUrl] = useState<string | null>(null);
-  const [isFrameInteractionUnlocked, setFrameInteractionUnlocked] = useState(false);
-  const [pendingCanvasCards, setPendingCanvasCards] = useState<PendingCanvasCard[]>([]);
-  const runSockets = useRef<Map<string, WebSocket>>(new Map());
-  const runCompletionResolversRef = useRef<Map<string, { resolve: (success: boolean) => void; timeoutId: number }>>(
-    new Map()
+  return (
+    <AppStoreContext.Provider value={appStore}>
+      <AppContent />
+    </AppStoreContext.Provider>
   );
-  const revealDesignSystemRunsRef = useRef<Set<string>>(new Set());
-  const pendingRefresh = useRef<number | null>(null);
-  const bundleRef = useRef<ProjectBundle | null>(null);
+}
+
+// ---------------------------------------------------------------------------
+// App content — all existing logic using store hooks
+// ---------------------------------------------------------------------------
+
+function AppContent() {
+  // ---------------------------------------------------------------------------
+  // Store state — only what AppContent itself renders or mutates directly
+  // ---------------------------------------------------------------------------
+  const {
+    chatEvents, setChatEvents,
+    promptHistory, setPromptHistory,
+    copyStates, setCopyStates,
+    debugLogs, setDebugLogs,
+    isCopyingLogs, setIsCopyingLogs,
+    captureFrameId, setCaptureFrameId,
+  } = useRunState();
+
+  const { bundle, setBundle, loading, setLoading, error, setError } = useProjectState();
+
+  const {
+    composerPrompt, setComposerPrompt,
+    composerAttachments, setComposerAttachments,
+    runMode, setRunMode,
+    selectedDevice, setSelectedDevice,
+    selectedMode, setSelectedMode,
+    selectedDesignSystemMode, setSelectedDesignSystemMode,
+    selectedSurfaceTarget, setSelectedSurfaceTarget,
+    variation, setVariation,
+    tailwindOverride, setTailwindOverride,
+  } = useInputState();
+
+  const {
+    preferences, setPreferences,
+    interaction, setInteraction,
+    isViewportPanning, setViewportPanning,
+    viewport, setViewport,
+    expandedHistoryFrameId, setExpandedHistoryFrameId,
+    isWorkspaceSettingsOpen, setWorkspaceSettingsOpen,
+    isProjectDesignSystemOpen, setProjectDesignSystemOpen,
+    isBrandPickerOpen, setBrandPickerOpen,
+    activeBrandName, setActiveBrandName,
+    designSystemWarnings, setDesignSystemWarnings,
+    designSystemBusy, setDesignSystemBusy,
+    designSystemBusyLabel, setDesignSystemBusyLabel,
+    designSystemRegeneratingReferenceId, setDesignSystemRegeneratingReferenceId,
+    pendingFigmaAttachUrl, setPendingFigmaAttachUrl,
+    isFrameInteractionUnlocked, setFrameInteractionUnlocked,
+    pendingCanvasCards, setPendingCanvasCards,
+  } = useUIState();
+
+  const bundleRef = useRef(bundle);
+  bundleRef.current = bundle;
   const artboardViewportRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef(VIEWPORT_DEFAULT);
   const zoomBehaviorRef = useRef<ZoomBehavior<HTMLDivElement, unknown> | null>(null);
   const zoomSelectionRef = useRef<Selection<HTMLDivElement, unknown, null, undefined> | null>(null);
   const focusAnimationRef = useRef<number | null>(null);
   const lastFocusedFrameIdRef = useRef<string | null>(null);
-  const eventOrderRef = useRef(0);
   const autoFitAppliedVersionsRef = useRef<Set<string>>(new Set());
   const autoFitSuppressedVersionsRef = useRef<Set<string>>(new Set());
   const autoFitPendingVersionsRef = useRef<Set<string>>(new Set());
+  const contentHeightsRef = useRef<Map<string, number>>(new Map());
+  const frameHeightModeRef = useRef<Map<string, "standard" | "content">>(new Map());
+  const framePromptsRef = useRef<Map<string, string>>(new Map());
+  const [framePromptsVersion, setFramePromptsVersion] = useState(0);
+
+  // Stable ref for openProjectDesignSystem — written after dsWorkspace is created
+  const openProjectDesignSystemRef = useRef<() => Promise<void>>(async () => {});
 
   const projectId = bundle?.project.id ?? null;
 
-  const pushDebugLog = useCallback(
-    (
-      scope: string,
-      reason: unknown,
-      details?: Record<string, unknown>,
-      level: DebugLogLevel = reason instanceof Error ? "error" : "info"
-    ) => {
-      const message = reason instanceof Error ? reason.message : String(reason);
-      const payload = {
-        ...(details ?? {}),
-        ...(reason instanceof Error && reason.stack ? { stack: reason.stack } : {})
-      };
+  // ---------------------------------------------------------------------------
+  // Feature hooks
+  // ---------------------------------------------------------------------------
+  const pipelineEvents = usePipelineEvents(openProjectDesignSystemRef);
+  const {
+    pushDebugLog,
+    appendOrderedEvent,
+    appendPromptTurn,
+    appendChatEvent,
+    appendSystemEvent,
+    scheduleRefresh,
+    openRunSocket,
+    initializeProject,
+    revealDesignSystemRunsRef,
+    eventOrderRef
+  } = pipelineEvents;
 
-      setDebugLogs((current) => [
-        ...current,
-        {
-          id: `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          timestamp: new Date().toISOString(),
-          scope,
-          level,
-          message,
-          details: Object.keys(payload).length > 0 ? JSON.stringify(payload, null, 2) : undefined
-        }
-      ].slice(-400));
-    },
-    []
-  );
+  const dsWorkspace = useDesignSystemWorkspace(pipelineEvents);
+  const {
+    openProjectDesignSystem,
+    attachFigmaFromChat,
+    bootstrapProjectDesignSystemFromModal,
+    resetAndRegenerateDesignSystemFromModal,
+    saveProjectDesignSystemMarkdown,
+    regenerateDesignSystemFromReference,
+    regenerateDesignSystemFromAllReferences,
+    addFigmaReferenceFromDesignSystemModal,
+    addImageReferencesFromDesignSystemModal
+  } = dsWorkspace;
 
-  const appendOrderedEvent = useCallback((event: PipelineEvent) => {
-    eventOrderRef.current += 1;
-    const orderedEvent = annotateClientOrder(event, eventOrderRef.current);
-    setChatEvents((current) => [...current, orderedEvent].slice(-420));
+  // Keep the ref in sync so pipelineEvents can call openProjectDesignSystem without a circular dep
+  openProjectDesignSystemRef.current = openProjectDesignSystem;
+
+  const { removeComposerAttachment, addFigmaAttachment, addImageAttachment } = useComposerAttachments(appendSystemEvent);
+
+  // Toast state for artboard import guidance
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback((msg: string, durationMs = 5000) => {
+    setToastMessage(msg);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToastMessage(null), durationMs);
   }, []);
 
-  const appendPromptTurn = useCallback(
-    (input: { runId: string; prompt: string }) => {
-      setPromptHistory((current) => [
-        ...current,
-        {
-          runId: input.runId,
-          prompt: input.prompt,
-          submittedAt: new Date().toISOString(),
-          mode: runMode,
-          devicePreset: selectedDevice,
-          designMode: selectedMode
-        }
-      ]);
-    },
-    [runMode, selectedDevice, selectedMode]
-  );
-
-  const appendChatEvent = useCallback(
-    (input: {
-      runId: string;
-      stage: PipelineEvent["stage"];
-      status: PipelineEvent["status"];
-      kind: PipelineEvent["kind"];
-      message: string;
-      payload?: Record<string, unknown>;
-    }) => {
-      appendOrderedEvent({
-        runId: input.runId,
-        timestamp: new Date().toISOString(),
-        stage: input.stage,
-        status: input.status,
-        kind: input.kind,
-        message: input.message,
-        payload: input.payload
-      });
-    },
-    [appendOrderedEvent]
-  );
-
-  const appendSystemEvent = useCallback(
-    (input: {
-      status: PipelineEvent["status"];
-      message: string;
-      kind?: PipelineEvent["kind"];
-      payload?: Record<string, unknown>;
-      stage?: PipelineEvent["stage"];
-    }) => {
-      appendChatEvent({
-        runId: "composer-system",
-        stage: input.stage ?? "system",
-        status: input.status,
-        kind: input.kind ?? "summary",
-        message: input.message,
-        payload: input.payload
-      });
-    },
-    [appendChatEvent]
-  );
-
-  const resolveRunCompletion = useCallback((runId: string, success: boolean) => {
-    const entry = runCompletionResolversRef.current.get(runId);
-    if (!entry) {
-      return;
+  // Artboard Figma import handler
+  const handleImportFigmaScreen = useCallback(async (figmaUrl: string) => {
+    const runId = createLocalRunId("import-figma");
+    const success = await attachFigmaFromChat({ runId, figmaUrl });
+    if (success) {
+      showToast("Screen imported. Select it and describe changes to iterate.");
     }
-    window.clearTimeout(entry.timeoutId);
-    runCompletionResolversRef.current.delete(runId);
-    entry.resolve(success);
-  }, []);
+  }, [attachFigmaFromChat, showToast]);
 
-  const waitForRunCompletion = useCallback(
-    (runId: string, timeoutMs = 6 * 60 * 1000) =>
-      new Promise<boolean>((resolve) => {
-        const existing = runCompletionResolversRef.current.get(runId);
-        if (existing) {
-          window.clearTimeout(existing.timeoutId);
-          runCompletionResolversRef.current.delete(runId);
-        }
-
-        const timeoutId = window.setTimeout(() => {
-          runCompletionResolversRef.current.delete(runId);
-          resolve(false);
-        }, timeoutMs);
-
-        runCompletionResolversRef.current.set(runId, {
-          resolve,
-          timeoutId
-        });
-      }),
-    []
-  );
-
-  const removeComposerAttachment = useCallback(
-    (attachmentId: string) => {
-      setComposerAttachments((current) => current.filter((attachment) => attachment.id !== attachmentId));
-    },
-    []
-  );
-
-  const addFigmaAttachment = useCallback(
-    (rawUrl: string) => {
-      const figmaUrl = extractFigmaUrl(rawUrl);
-      if (!figmaUrl) {
-        appendSystemEvent({
-          status: "error",
-          kind: "action",
-          message: "Invalid Figma URL. Use a figma.com/design link."
-        });
-        return;
-      }
-
-      const attachment: ComposerAttachment = {
-        id: `figma-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        type: "figma-link",
-        url: figmaUrl,
-        status: "uploaded",
-        name: "Figma reference"
-      };
-
-      setComposerAttachments((current) => {
-        const withoutExisting = current.filter((item) => item.type !== "figma-link");
-        return [...withoutExisting, attachment];
-      });
-
-      appendSystemEvent({
-        status: "success",
-        kind: "action",
-        message: "Figma link attached to composer.",
-        payload: { url: figmaUrl }
-      });
-    },
-    [appendSystemEvent]
-  );
-
-  const addImageAttachment = useCallback(
-    async (file: File) => {
-      const allowedMime = new Set(["image/png", "image/jpg", "image/jpeg", "image/webp", "image/svg+xml"]);
-      if (!allowedMime.has(file.type)) {
-        appendSystemEvent({
-          status: "error",
-          kind: "action",
-          message: "Unsupported image type. Use png, jpg, jpeg, webp, or svg."
-        });
-        return;
-      }
-
-      if (file.size > 8 * 1024 * 1024) {
-        appendSystemEvent({
-          status: "error",
-          kind: "action",
-          message: "Image is too large. Max supported size is 8 MB."
-        });
-        return;
-      }
-
-      if (composerAttachments.some((attachment) => attachment.type === "image" && attachment.status !== "failed")) {
-        appendSystemEvent({
-          status: "error",
-          kind: "action",
-          message: "Only one image attachment is supported per message."
-        });
-        return;
-      }
-
-      const provisionalId = `image-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      setComposerAttachments((current) => [
-        ...current.filter((attachment) => !(attachment.type === "image" && attachment.status === "failed")),
-        {
-          id: provisionalId,
-          type: "image",
-          status: "pending",
-          name: file.name,
-          mimeType: file.type
-        }
-      ]);
-
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          if (typeof reader.result === "string") {
-            resolve(reader.result);
-          } else {
-            reject(new Error("File reader did not return a data URL."));
-          }
-        };
-        reader.onerror = () => reject(reader.error ?? new Error("Failed to read image attachment."));
-        reader.readAsDataURL(file);
-      }).catch((reason) => {
-        appendSystemEvent({
-          status: "error",
-          kind: "action",
-          message: reason instanceof Error ? reason.message : String(reason)
-        });
-        return null;
-      });
-
-      if (!dataUrl) {
-        setComposerAttachments((current) =>
-          current.map((attachment) => {
-            if (attachment.id !== provisionalId) {
-              return attachment;
-            }
-            return {
-              ...attachment,
-              status: "failed"
-            };
-          })
-        );
-        return;
-      }
-
-      setComposerAttachments((current) =>
-        current.map((attachment) => {
-          if (attachment.id !== provisionalId) {
-            return attachment;
-          }
-          return {
-            ...attachment,
-            status: "uploaded",
-            dataUrl
-          };
-        })
-      );
-
-      appendSystemEvent({
-        status: "success",
-        kind: "action",
-        message: "Image attached. I can rebuild it into editable React UI on send.",
-        payload: { name: file.name }
-      });
-    },
-    [appendSystemEvent, composerAttachments]
-  );
-
-  const selectedFrame = useMemo(() => {
-    if (!bundle?.frames.length) {
-      return null;
+  // Brand picker: apply from references handler
+  const handleBrandApplyFromReferences = useCallback(async (refs: {
+    figmaUrls: string[];
+    imageFiles: File[];
+    imageUrls: string[];
+    styleNotes: string;
+  }) => {
+    // Process Figma links
+    for (const url of refs.figmaUrls) {
+      await addFigmaReferenceFromDesignSystemModal(url);
     }
-    return bundle.frames.find((frame) => frame.selected) ?? null;
-  }, [bundle]);
-
-  const captureFrame = useMemo(() => {
-    if (!bundle || !captureFrameId) {
-      return null;
+    // Process image files
+    if (refs.imageFiles.length > 0) {
+      await addImageReferencesFromDesignSystemModal(refs.imageFiles);
     }
-    return bundle.frames.find((frame) => frame.id === captureFrameId) ?? null;
-  }, [bundle, captureFrameId]);
-
-  const scheduleRefresh = useCallback(
-    (delayMs = 420) => {
-      if (pendingRefresh.current) {
-        window.clearTimeout(pendingRefresh.current);
-      }
-
-      pendingRefresh.current = window.setTimeout(async () => {
-        if (!projectId) {
-          return;
-        }
-        try {
-          const data = await getProjectBundle(getApiBaseUrl(preferences.apiBaseUrl), projectId);
-          setBundle(data);
-          setPendingCanvasCards((current) =>
-            current.filter((pending) => {
-              const hasMaterializedFrame = data.frames.some((frame) => {
-                const meta = extractFrameSourceMeta(frame);
-                if (!meta) {
-                  return false;
-                }
-                if (meta.sourceType !== pending.sourceType || meta.sourceRole !== pending.sourceRole) {
-                  return false;
-                }
-                const updatedAtMs = new Date(frame.updatedAt).getTime();
-                const createdAtMs = new Date(frame.createdAt).getTime();
-                return (
-                  (Number.isFinite(updatedAtMs) && updatedAtMs >= pending.createdAfterMs - 1000) ||
-                  (Number.isFinite(createdAtMs) && createdAtMs >= pending.createdAfterMs - 1000)
-                );
-              });
-              return !hasMaterializedFrame;
-            })
-          );
-        } catch (reason) {
-          pushDebugLog("refresh-project", reason, { projectId }, "warn");
-        }
-      }, delayMs);
-    },
-    [preferences.apiBaseUrl, projectId, pushDebugLog]
-  );
-
-  const openRunSocket = useCallback(
-    (runId: string) => {
-      const socket = openRunStream(getApiBaseUrl(preferences.apiBaseUrl), runId, {
-        onEvent: (event) => {
-          appendOrderedEvent(event);
-          const step = typeof event.payload?.step === "string" ? event.payload.step : null;
-          if (step === "run-complete") {
-            resolveRunCompletion(runId, true);
-          } else if (step === "run-failed") {
-            resolveRunCompletion(runId, false);
-          } else if (event.status === "error" && event.stage === "system") {
-            resolveRunCompletion(runId, false);
-          }
-          if (event.status === "error") {
-            setPendingCanvasCards((current) => current.filter((pending) => pending.runId !== runId));
-            revealDesignSystemRunsRef.current.delete(runId);
-          }
-          if (
-            event.status === "success" &&
-            revealDesignSystemRunsRef.current.has(runId) &&
-            event.payload?.step === "run-complete"
-          ) {
-            revealDesignSystemRunsRef.current.delete(runId);
-            window.setTimeout(() => {
-              void openProjectDesignSystem();
-            }, 420);
-          }
-          if (event.payload?.frameId || event.status === "success" || event.status === "error") {
-            scheduleRefresh(320);
-          }
-        },
-        onClose: () => {
-          runSockets.current.delete(runId);
-          resolveRunCompletion(runId, false);
-          pushDebugLog("run-stream", "WebSocket stream closed", { runId }, "debug");
-          scheduleRefresh(520);
-        },
-        onError: (event) => {
-          pushDebugLog("run-stream", "WebSocket stream error", {
-            runId,
-            type: event.type
-          }, "warn");
-          setError("Live run stream disconnected. Open logs for details.");
-        }
-      });
-
-      runSockets.current.set(runId, socket);
-    },
-    [appendOrderedEvent, preferences.apiBaseUrl, pushDebugLog, resolveRunCompletion, scheduleRefresh]
-  );
-
-  const initializeProject = useCallback(async () => {
-    setLoading(true);
-    setError("");
-
-    try {
-      const apiBase = getApiBaseUrl(preferences.apiBaseUrl);
-      const isHealthy = await checkApiHealth(apiBase);
-      if (!isHealthy) {
-        throw new Error(`API unreachable at ${apiBase}. Start the backend and verify the API base URL.`);
-      }
-      const storedProjectId = window.localStorage.getItem(PROJECT_STORAGE_KEY);
-      let data: ProjectBundle | null = null;
-
-      if (storedProjectId) {
-        data = await getProjectBundle(apiBase, storedProjectId).catch(() => null);
-      }
-
-      if (!data) {
-        data = await createProject(apiBase, "Conversational UI Designer");
-        window.localStorage.setItem(PROJECT_STORAGE_KEY, data.project.id);
-        pushDebugLog("initialize-project", "Created new project", { projectId: data.project.id }, "info");
-      }
-
-      setBundle(data);
-      setPendingCanvasCards([]);
-      revealDesignSystemRunsRef.current.clear();
-      setSelectedDevice(data.project.settings.deviceDefault);
-      setSelectedMode(data.project.settings.modeDefault);
-      setSelectedDesignSystemMode(data.project.settings.designSystemModeDefault);
-      setSelectedSurfaceTarget(data.project.settings.surfaceDefault);
-      setTailwindOverride(data.project.settings.tailwindDefault);
-      setPreferences((current) => ({
-        ...current,
-        provider: data.project.settings.provider,
-        model: data.project.settings.model,
-        tailwindDefault: data.project.settings.tailwindDefault,
-        deviceDefault: data.project.settings.deviceDefault,
-        modeDefault: data.project.settings.modeDefault
-      }));
-      pushDebugLog("initialize-project", "Workspace initialized", { projectId: data.project.id, frameCount: data.frames.length }, "info");
-    } catch (reason) {
-      pushDebugLog("initialize-project", reason, { apiBaseUrl: getApiBaseUrl(preferences.apiBaseUrl) }, "error");
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setLoading(false);
-    }
-  }, [preferences.apiBaseUrl, pushDebugLog]);
+    // After all references attached, regenerate DS from all
+    await regenerateDesignSystemFromAllReferences();
+    setActiveBrandName("Custom (Reference)");
+    setBrandPickerOpen(false);
+  }, [addFigmaReferenceFromDesignSystemModal, addImageReferencesFromDesignSystemModal, regenerateDesignSystemFromAllReferences, setActiveBrandName, setBrandPickerOpen]);
 
   useEffect(() => {
     void initializeProject();
@@ -594,9 +284,15 @@ export default function App() {
     viewportRef.current = viewport;
   }, [viewport]);
 
-  useEffect(() => {
-    bundleRef.current = bundle;
+  const selectedFrame = useMemo(() => {
+    if (!bundle?.frames.length) return null;
+    return bundle.frames.find((frame) => frame.selected) ?? null;
   }, [bundle]);
+
+  const captureFrame = useMemo(() => {
+    if (!bundle || !captureFrameId) return null;
+    return bundle.frames.find((frame) => frame.id === captureFrameId) ?? null;
+  }, [bundle, captureFrameId]);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
@@ -633,17 +329,19 @@ export default function App() {
         return;
       }
 
+      const chromeOffset = 84;
+      const computedContentHeight = Math.max(260, Math.ceil(contentHeight + chromeOffset));
+      contentHeightsRef.current.set(frameId, computedContentHeight);
+
       const versionKey = `${frameId}:${versionId}`;
       if (
-        autoFitAppliedVersionsRef.current.has(versionKey) ||
         autoFitSuppressedVersionsRef.current.has(versionKey) ||
         autoFitPendingVersionsRef.current.has(versionKey)
       ) {
         return;
       }
 
-      const chromeOffset = 84;
-      const nextHeight = Math.max(260, Math.min(3600, Math.ceil(contentHeight + chromeOffset)));
+      const nextHeight = computedContentHeight;
       const currentHeight = frame.size.height;
       autoFitAppliedVersionsRef.current.add(versionKey);
 
@@ -710,16 +408,61 @@ export default function App() {
     };
   }, []);
 
+  // Track which prompt was used for each frame (via pipeline events carrying frameId)
+  useEffect(() => {
+    const promptByRunId = new Map(promptHistory.map((entry) => [entry.runId, entry.prompt]));
+    let changed = false;
+    for (const event of chatEvents) {
+      const frameId = typeof event.payload?.frameId === "string" ? event.payload.frameId : null;
+      if (frameId && promptByRunId.has(event.runId) && !framePromptsRef.current.has(frameId)) {
+        framePromptsRef.current.set(frameId, promptByRunId.get(event.runId)!);
+        changed = true;
+      }
+    }
+    if (changed) {
+      setFramePromptsVersion((v) => v + 1);
+    }
+  }, [chatEvents, promptHistory]);
+
+  // Delete/Backspace to remove selected frame (except design-system frames)
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Delete" && event.key !== "Backspace") return;
+      // Don't intercept when user is typing in an input/textarea
+      const tag = (event.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
+      const currentBundle = bundleRef.current;
+      if (!currentBundle) return;
+      const selected = currentBundle.frames.find((f) => f.selected);
+      if (!selected) return;
+
+      // Protect design-system frames from deletion
+      const meta = extractFrameSourceMeta(selected);
+      if (meta?.sourceRole === "design-system") return;
+
+      event.preventDefault();
+      // Optimistically remove from local state
+      setBundle((current) => {
+        if (!current) return current;
+        return { ...current, frames: current.frames.filter((f) => f.id !== selected.id) };
+      });
+      setRunMode("new-frame");
+      showToast("Frame deleted", 2500);
+
+      void deleteFrame(getApiBaseUrl(preferences.apiBaseUrl), selected.id).catch((reason) => {
+        pushDebugLog("delete-frame", reason, { frameId: selected.id }, "warn");
+        // Re-fetch bundle to restore if the delete failed
+        const pid = bundleRef.current?.project.id;
+        if (pid) void getProjectBundle(getApiBaseUrl(preferences.apiBaseUrl), pid).then(setBundle);
+      });
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [preferences.apiBaseUrl, pushDebugLog, showToast]);
+
   useEffect(() => {
     return () => {
-      for (const socket of runSockets.current.values()) {
-        socket.close();
-      }
-      for (const resolver of runCompletionResolversRef.current.values()) {
-        window.clearTimeout(resolver.timeoutId);
-        resolver.resolve(false);
-      }
-      runCompletionResolversRef.current.clear();
       if (focusAnimationRef.current) {
         window.cancelAnimationFrame(focusAnimationRef.current);
       }
@@ -766,8 +509,8 @@ export default function App() {
               return {
                 ...frame,
                 position: {
-                  x: Math.max(0, interaction.originX + scaledDeltaX),
-                  y: Math.max(0, interaction.originY + scaledDeltaY)
+                  x: interaction.originX + scaledDeltaX,
+                  y: interaction.originY + scaledDeltaY
                 }
               };
             }
@@ -775,7 +518,9 @@ export default function App() {
             return {
               ...frame,
               size: {
-                width: Math.max(220, interaction.originWidth + scaledDeltaX),
+                width: isMobilePreset(frame.devicePreset)
+                  ? frame.size.width
+                  : Math.max(220, interaction.originWidth + scaledDeltaX),
                 height: Math.max(260, interaction.originHeight + scaledDeltaY)
               }
             };
@@ -863,110 +608,6 @@ export default function App() {
     },
     [persistProjectSettings, pushDebugLog]
   );
-
-  async function attachFigmaFromChat(input: { runId: string; figmaUrl: string }) {
-    if (!projectId) {
-      return false;
-    }
-
-    setError("");
-    appendChatEvent({
-      runId: input.runId,
-      stage: "system",
-      status: "info",
-      kind: "summary",
-      message: "Detected a Figma link in chat. Starting reference attach via MCP get_design_context."
-    });
-
-    try {
-      const result = await addReferenceWithCredentials(getApiBaseUrl(preferences.apiBaseUrl), projectId, {
-        figmaUrl: input.figmaUrl.trim(),
-        figmaClientId: preferences.figmaClientId.trim() || undefined,
-        figmaClientSecret: preferences.figmaClientSecret.trim() || undefined
-      });
-
-      const payload =
-        typeof result === "object" && result !== null
-          ? (result as {
-              error?: string;
-              warning?: string;
-              fallback?: {
-                mode?: string;
-                requiredClientCredentials?: boolean;
-                retryPrompt?: string;
-              };
-            })
-          : null;
-
-      const fallback = payload?.fallback;
-      const errorMessage = payload?.error;
-      const warningMessage = payload?.warning;
-
-      if (errorMessage) {
-        appendChatEvent({
-          runId: input.runId,
-          stage: "system",
-          status: "error",
-          kind: "summary",
-          message: errorMessage
-        });
-      }
-
-      if (fallback?.requiredClientCredentials) {
-        setPendingFigmaAttachUrl(input.figmaUrl);
-        appendChatEvent({
-          runId: input.runId,
-          stage: "system",
-          status: "info",
-          kind: "action",
-          message:
-            fallback.retryPrompt ??
-            "MCP failed. Send `/figma-credentials <clientId> <clientSecret>` in chat, then resend your Figma link."
-        });
-        return false;
-      } else if (!errorMessage) {
-        appendChatEvent({
-          runId: input.runId,
-          stage: "system",
-          status: "success",
-          kind: "summary",
-          message: warningMessage
-            ? `Reference attached with fallback mode (${fallback?.mode ?? "public-link-style-context"}).`
-            : "Reference attached and frames were created from the Figma link."
-        });
-
-        if (warningMessage) {
-          appendChatEvent({
-            runId: input.runId,
-            stage: "system",
-            status: "info",
-            kind: "action",
-            message: warningMessage
-          });
-        }
-        setPendingFigmaAttachUrl(null);
-      } else {
-        return false;
-      }
-
-      const refreshed = await getProjectBundle(getApiBaseUrl(preferences.apiBaseUrl), projectId);
-      setBundle(refreshed);
-      pushDebugLog("add-reference", "Reference attach completed", { figmaUrl: input.figmaUrl, referenceCount: refreshed.references.length }, "info");
-      return true;
-    } catch (reason) {
-      pushDebugLog("add-reference", reason, {
-        figmaUrl: input.figmaUrl
-      }, "error");
-      appendChatEvent({
-        runId: input.runId,
-        stage: "system",
-        status: "error",
-        kind: "summary",
-        message: reason instanceof Error ? reason.message : String(reason)
-      });
-      return false;
-    }
-  }
 
   async function handleResyncReference(reference: ReferenceSource) {
     const runId = createLocalRunId("resync");
@@ -1107,577 +748,6 @@ export default function App() {
     } catch (reason) {
       pushDebugLog("clear-board", reason, { projectId }, "error");
       setError(reason instanceof Error ? reason.message : String(reason));
-    }
-  }
-
-  async function openProjectDesignSystem() {
-    if (!projectId) {
-      return;
-    }
-    setProjectDesignSystemOpen(true);
-    try {
-      const response = await getProjectDesignSystem(getApiBaseUrl(preferences.apiBaseUrl), projectId);
-      setBundle((current) =>
-        current
-          ? {
-              ...current,
-              designSystem: response.designSystem
-            }
-          : current
-      );
-    } catch (reason) {
-      pushDebugLog("design-system", reason, { projectId }, "warn");
-    }
-  }
-
-  const emitDesignSystemQualitySummary = useCallback(
-    (input: { designSystem: NonNullable<ProjectBundle["designSystem"]>; reason: string }) => {
-      const report = input.designSystem.structuredTokens.qualityReport;
-      appendSystemEvent({
-        status: report.referenceQuality === "poor" ? "error" : "info",
-        kind: "summary",
-        message: `${input.reason}: reference quality ${report.referenceQuality} (${Math.round(
-          report.globalConfidence * 100
-        )}% confidence).`,
-        payload: {
-          step: "design-system-quality",
-          referenceQuality: report.referenceQuality,
-          confidence: report.globalConfidence,
-          fidelityScore: report.fidelityScore,
-          detectionCoverage: report.detectionCoverage,
-          qualityReasons: report.qualityReasons
-        }
-      });
-
-      if (report.referenceQuality !== "good") {
-        const guidance =
-          report.qualityReasons[0] ??
-          report.recommendations[0] ??
-          "Attach clearer references or calibrate in chat, then regenerate.";
-        appendSystemEvent({
-          status: report.referenceQuality === "poor" ? "error" : "info",
-          kind: "action",
-          message: `Quality note: ${guidance}`
-        });
-      }
-    },
-    [appendSystemEvent]
-  );
-
-  async function addFigmaReferenceFromDesignSystemModal(rawUrl: string) {
-    const figmaUrl = extractFigmaUrl(rawUrl);
-    if (!figmaUrl) {
-      appendSystemEvent({
-        status: "error",
-        kind: "action",
-        message: "Invalid Figma URL. Use a figma.com/design link."
-      });
-      return;
-    }
-
-    const runId = createLocalRunId("ds-reference");
-    appendChatEvent({
-      runId,
-      stage: "system",
-      status: "info",
-      kind: "summary",
-      message: "Adding Figma reference from the design system workspace."
-    });
-
-    const attached = await attachFigmaFromChat({
-      runId,
-      figmaUrl
-    });
-
-    if (attached) {
-      setProjectDesignSystemOpen(false);
-      await bootstrapProjectDesignSystemFromModal("reference");
-    }
-  }
-
-  function getPendingAnchorPosition() {
-    if (selectedFrame) {
-      return {
-        x: selectedFrame.position.x + selectedFrame.size.width + 72,
-        y: selectedFrame.position.y + 12
-      };
-    }
-    const lastFrame = bundle?.frames?.[bundle.frames.length - 1];
-    if (lastFrame) {
-      return {
-        x: lastFrame.position.x + lastFrame.size.width + 72,
-        y: lastFrame.position.y + 12
-      };
-    }
-    return { x: 320, y: 220 };
-  }
-
-  async function startImageReferenceRunFromModal(
-    imageAttachment: ComposerAttachment,
-    options?: { waitForCompletion?: boolean; keepModalOpen?: boolean }
-  ) {
-    if (!projectId) {
-      return false;
-    }
-
-    const runPrompt = "Rebuild the attached image into an editable screen and refresh the canonical design-system board.";
-    const payload = {
-      prompt: runPrompt,
-      provider: preferences.provider,
-      model: preferences.model,
-      apiKey: preferences.apiKey.trim() || undefined,
-      devicePreset: selectedDevice,
-      mode: selectedMode,
-      surfaceTarget: selectedSurfaceTarget,
-      designSystemMode: selectedDesignSystemMode,
-      variation: 1,
-      tailwindEnabled: tailwindOverride,
-      attachments: [imageAttachment]
-    };
-
-    const run = await startGenerateRun(getApiBaseUrl(preferences.apiBaseUrl), projectId, payload);
-    const runId = run.runId;
-    const completionPromise = options?.waitForCompletion ? waitForRunCompletion(runId) : null;
-    revealDesignSystemRunsRef.current.add(runId);
-    const createdAfterMs = Date.now();
-    const anchor = getPendingAnchorPosition();
-
-    setPendingCanvasCards((current) => [
-      ...current,
-      {
-        id: `pending-image-screen-${runId}`,
-        runId,
-        sourceType: "image-reference",
-        sourceRole: "reference-screen",
-        createdAfterMs,
-        name: "Reference Screen (building)",
-        subtitle: "Rebuilding attached image into editable React/HTML",
-        position: anchor,
-        size: { width: 1080, height: 720 }
-      },
-      {
-        id: `pending-image-ds-${runId}`,
-        runId,
-        sourceType: "image-reference",
-        sourceRole: "design-system",
-        createdAfterMs,
-        name: "Design System (building)",
-        subtitle: "Refreshing the canonical visual DS board from the rebuilt screen",
-        position: { x: anchor.x + 1140, y: anchor.y + 28 },
-        size: { width: 920, height: 620 }
-      }
-    ]);
-
-    appendOrderedEvent({
-      runId,
-      timestamp: new Date().toISOString(),
-      stage: "system",
-      status: "info",
-      kind: "summary",
-      message: "Starting image-aware pipeline (analyze -> rebuild screen -> canonical design-system refresh)."
-    });
-    appendPromptTurn({
-      runId,
-      prompt: "Generate from image reference (Design System modal)."
-    });
-    openRunSocket(runId);
-    if (!options?.keepModalOpen) {
-      setProjectDesignSystemOpen(false);
-    }
-    setComposerAttachments([]);
-    setComposerPrompt("");
-    pushDebugLog(
-      "start-run",
-      "Image reference run started from Design System modal",
-      {
-        runId,
-        provider: preferences.provider,
-        model: preferences.model,
-        devicePreset: selectedDevice,
-        designMode: selectedMode,
-        surfaceTarget: selectedSurfaceTarget,
-        designSystemMode: selectedDesignSystemMode,
-        attachmentCount: 1
-      },
-      "info"
-    );
-    if (completionPromise) {
-      return completionPromise;
-    }
-    return true;
-  }
-
-  function validateImageReferenceFile(file: File) {
-    const allowedMime = new Set(["image/png", "image/jpg", "image/jpeg", "image/webp", "image/svg+xml"]);
-    if (!allowedMime.has(file.type)) {
-      return "Unsupported image type. Use png, jpg, jpeg, webp, or svg.";
-    }
-
-    if (file.size > 8 * 1024 * 1024) {
-      return "Image is too large. Max supported size is 8 MB.";
-    }
-
-    return null;
-  }
-
-  async function fileToImageAttachment(file: File) {
-    const validationError = validateImageReferenceFile(file);
-    if (validationError) {
-      appendSystemEvent({
-        status: "error",
-        kind: "action",
-        message: validationError
-      });
-      return null;
-    }
-
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        if (typeof reader.result === "string") {
-          resolve(reader.result);
-        } else {
-          reject(new Error("File reader did not return a data URL."));
-        }
-      };
-      reader.onerror = () => reject(reader.error ?? new Error("Failed to read image attachment."));
-      reader.readAsDataURL(file);
-    }).catch((reason) => {
-      appendSystemEvent({
-        status: "error",
-        kind: "summary",
-        message: reason instanceof Error ? reason.message : String(reason)
-      });
-      return null;
-    });
-
-    if (!dataUrl) {
-      return null;
-    }
-
-    return {
-      id: `image-modal-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      type: "image",
-      status: "uploaded",
-      name: file.name,
-      mimeType: file.type,
-      dataUrl
-    } as ComposerAttachment;
-  }
-
-  async function addImageReferencesFromDesignSystemModal(files: File[]) {
-    if (files.length === 0) {
-      return;
-    }
-
-    try {
-      setDesignSystemBusy(true);
-      setDesignSystemBusyLabel(`Processing image references (0/${files.length})...`);
-      setDesignSystemRegeneratingReferenceId(null);
-      const queueResult = await runSequentialQueue(files, async (file, index) => {
-        setDesignSystemBusyLabel(`Processing image references (${index + 1}/${files.length})...`);
-        const attachment = await fileToImageAttachment(file);
-        if (!attachment) {
-          return false;
-        }
-
-        appendSystemEvent({
-          status: "info",
-          kind: "summary",
-          message: `Processing image reference ${index + 1}/${files.length}: ${file.name}`
-        });
-
-        const success = await startImageReferenceRunFromModal(attachment, {
-          waitForCompletion: true,
-          keepModalOpen: true
-        });
-        return success;
-      });
-
-      if (queueResult.successful > 0) {
-        setDesignSystemBusyLabel("Merging all references into one design system...");
-        await regenerateDesignSystemFromAllReferences();
-      } else {
-        appendSystemEvent({
-          status: "error",
-          kind: "summary",
-          message: "No valid image references completed. Design system was not regenerated."
-        });
-      }
-    } catch (reason) {
-      pushDebugLog("start-run", reason, {
-        provider: preferences.provider,
-        model: preferences.model,
-        apiBaseUrl: getApiBaseUrl(preferences.apiBaseUrl),
-        source: "design-system-modal-images"
-      }, "error");
-      appendSystemEvent({
-        status: "error",
-        kind: "summary",
-        message: reason instanceof Error ? reason.message : String(reason)
-      });
-    } finally {
-      setDesignSystemBusy(false);
-      setDesignSystemBusyLabel(null);
-    }
-  }
-
-  async function bootstrapProjectDesignSystemFromModal(mode: "manual" | "reference") {
-    if (!projectId) {
-      return;
-    }
-    setDesignSystemBusy(true);
-    setDesignSystemBusyLabel(
-      mode === "reference"
-        ? "Reviewing connected references and refreshing visual components..."
-        : "Creating a manual design system workspace..."
-    );
-    setDesignSystemRegeneratingReferenceId(null);
-    try {
-      const result = await bootstrapProjectDesignSystem(getApiBaseUrl(preferences.apiBaseUrl), projectId, mode);
-      setBundle((current) =>
-        current
-          ? {
-              ...current,
-              designSystem: result.designSystem
-            }
-          : current
-      );
-      setDesignSystemWarnings(result.warnings ?? []);
-      emitDesignSystemQualitySummary({
-        designSystem: result.designSystem,
-        reason: mode === "manual" ? "Manual DESIGN.md bootstrap completed" : "Reference bootstrap completed"
-      });
-      appendSystemEvent({
-        status: "success",
-        kind: "summary",
-        message:
-          mode === "manual"
-            ? "Design system seeded from manual template. Open design.md to refine it."
-            : "Design system bootstrapped from the latest synced reference."
-      });
-    } catch (reason) {
-      const message = reason instanceof Error ? reason.message : String(reason);
-      appendSystemEvent({
-        status: "error",
-        kind: "summary",
-        message
-      });
-      pushDebugLog("design-system-bootstrap", reason, { mode, projectId }, "error");
-    } finally {
-      setDesignSystemBusy(false);
-      setDesignSystemBusyLabel(null);
-    }
-  }
-
-  async function resetAndRegenerateDesignSystemFromModal() {
-    if (!projectId) {
-      return;
-    }
-    setDesignSystemBusy(true);
-    setDesignSystemBusyLabel("Resetting design system and rebuilding from all references...");
-    setDesignSystemRegeneratingReferenceId(null);
-    try {
-      const result = await resetAndRegenerateProjectDesignSystem(getApiBaseUrl(preferences.apiBaseUrl), projectId);
-      setBundle((current) =>
-        current
-          ? {
-              ...current,
-              designSystem: result.designSystem
-            }
-          : current
-      );
-      setDesignSystemWarnings(result.warnings ?? []);
-      emitDesignSystemQualitySummary({
-        designSystem: result.designSystem,
-        reason: "Full reset and regeneration completed"
-      });
-      appendSystemEvent({
-        status: "success",
-        kind: "summary",
-        message: "Design system reset completed. Metadata was cleared and system rebuilt from current references."
-      });
-    } catch (reason) {
-      const message = reason instanceof Error ? reason.message : String(reason);
-      appendSystemEvent({
-        status: "error",
-        kind: "summary",
-        message
-      });
-      pushDebugLog("design-system-reset-regenerate", reason, { projectId }, "error");
-    } finally {
-      setDesignSystemBusy(false);
-      setDesignSystemBusyLabel(null);
-      setDesignSystemRegeneratingReferenceId(null);
-    }
-  }
-
-  async function saveProjectDesignSystemMarkdown(markdown: string) {
-    if (!projectId) {
-      return;
-    }
-    setDesignSystemBusy(true);
-    setDesignSystemBusyLabel("Saving design.md and refreshing visual components...");
-    setDesignSystemRegeneratingReferenceId(null);
-    try {
-      const result = await saveProjectDesignSystem(getApiBaseUrl(preferences.apiBaseUrl), projectId, {
-        markdown,
-        status: "draft",
-        sourceType: bundle?.designSystem?.sourceType ?? "manual",
-        sourceReferenceId: bundle?.designSystem?.sourceReferenceId ?? null
-      });
-      setBundle((current) =>
-        current
-          ? {
-              ...current,
-              designSystem: result.designSystem
-            }
-          : current
-      );
-      setDesignSystemWarnings(result.warnings ?? []);
-      appendSystemEvent({
-        status: "success",
-        kind: "action",
-        message: "Saved design.md and refreshed the visual system."
-      });
-    } catch (reason) {
-      const message = reason instanceof Error ? reason.message : String(reason);
-      appendSystemEvent({
-        status: "error",
-        kind: "summary",
-        message
-      });
-      pushDebugLog("design-system-save", reason, { projectId }, "error");
-    } finally {
-      setDesignSystemBusy(false);
-      setDesignSystemBusyLabel(null);
-    }
-  }
-
-  async function regenerateDesignSystemFromReference(item: DesignSystemReferenceItem) {
-    if (!projectId) {
-      return;
-    }
-
-    if (item.sourceType === "image-reference" && !item.frameId) {
-      appendSystemEvent({
-        status: "error",
-        kind: "summary",
-        message: "Cannot regenerate from this image reference yet because its frame mapping is missing."
-      });
-      return;
-    }
-
-    setDesignSystemBusy(true);
-    setDesignSystemBusyLabel(`Reviewing ${item.previewLabel.toLowerCase()} and updating the visual design system...`);
-    setDesignSystemRegeneratingReferenceId(item.id);
-    appendSystemEvent({
-      status: "info",
-      kind: "summary",
-      message: `Regenerating design system from ${item.title}.`
-    });
-
-    try {
-      const result =
-        item.sourceType === "figma-reference"
-          ? await regenerateProjectDesignSystemFromReference(getApiBaseUrl(preferences.apiBaseUrl), projectId, {
-              sourceType: "figma-reference",
-              referenceSourceId: item.referenceSourceId ?? ""
-            })
-          : await regenerateProjectDesignSystemFromReference(getApiBaseUrl(preferences.apiBaseUrl), projectId, {
-              sourceType: "image-reference",
-              frameId: item.frameId ?? ""
-            });
-
-      setBundle((current) =>
-        current
-          ? {
-              ...current,
-              designSystem: result.designSystem
-            }
-          : current
-      );
-      setDesignSystemWarnings(result.warnings ?? []);
-      emitDesignSystemQualitySummary({
-        designSystem: result.designSystem,
-        reason: `Regeneration completed from ${item.title}`
-      });
-      appendSystemEvent({
-        status: "success",
-        kind: "summary",
-        message: `Design system regenerated from ${item.title}.`
-      });
-    } catch (reason) {
-      const message = reason instanceof Error ? reason.message : String(reason);
-      appendSystemEvent({
-        status: "error",
-        kind: "summary",
-        message
-      });
-      pushDebugLog(
-        "design-system-regenerate",
-        reason,
-        {
-          projectId,
-          sourceType: item.sourceType,
-          referenceSourceId: item.referenceSourceId,
-          frameId: item.frameId
-        },
-        "error"
-      );
-    } finally {
-      setDesignSystemBusy(false);
-      setDesignSystemBusyLabel(null);
-      setDesignSystemRegeneratingReferenceId(null);
-    }
-  }
-
-  async function regenerateDesignSystemFromAllReferences() {
-    if (!projectId) {
-      return;
-    }
-
-    setDesignSystemBusy(true);
-    setDesignSystemBusyLabel("Re-analyzing all references and rebuilding component recipes...");
-    setDesignSystemRegeneratingReferenceId(null);
-    appendSystemEvent({
-      status: "info",
-      kind: "summary",
-      message: "Regenerating design system from all available references."
-    });
-
-    try {
-      const result = await regenerateProjectDesignSystem(getApiBaseUrl(preferences.apiBaseUrl), projectId);
-      setBundle((current) =>
-        current
-          ? {
-              ...current,
-              designSystem: result.designSystem
-            }
-          : current
-      );
-      setDesignSystemWarnings(result.warnings ?? []);
-      emitDesignSystemQualitySummary({
-        designSystem: result.designSystem,
-        reason: "Regeneration completed from all references"
-      });
-      appendSystemEvent({
-        status: "success",
-        kind: "summary",
-        message: "Design system regenerated from all references."
-      });
-    } catch (reason) {
-      const message = reason instanceof Error ? reason.message : String(reason);
-      appendSystemEvent({
-        status: "error",
-        kind: "summary",
-        message
-      });
-      pushDebugLog("design-system-regenerate", reason, { projectId, scope: "all-references" }, "error");
-    } finally {
-      setDesignSystemBusy(false);
-      setDesignSystemBusyLabel(null);
-      setDesignSystemRegeneratingReferenceId(null);
     }
   }
 
@@ -2023,6 +1093,63 @@ export default function App() {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Regenerate a frame using its original prompt
+  // -------------------------------------------------------------------------
+  async function handleRegenerate(frameId: string) {
+    const prompt = framePromptsRef.current.get(frameId);
+    if (!prompt || !projectId) return;
+
+    const frame = bundle?.frames.find((f) => f.id === frameId);
+    if (!frame) return;
+
+    const payload = {
+      prompt,
+      provider: preferences.provider,
+      model: preferences.model,
+      apiKey: preferences.apiKey.trim() || undefined,
+      devicePreset: frame.devicePreset,
+      mode: frame.mode,
+      surfaceTarget: selectedSurfaceTarget,
+      designSystemMode: selectedDesignSystemMode,
+      variation: 1,
+      tailwindEnabled: tailwindOverride,
+    } as const;
+
+    try {
+      const { variation: _ignoredVariation, ...editPayload } = payload;
+      const run = await startEditRun(getApiBaseUrl(preferences.apiBaseUrl), frameId, {
+        ...editPayload
+      });
+      const runId = run.runId;
+
+      appendOrderedEvent({
+        runId,
+        timestamp: new Date().toISOString(),
+        stage: "system",
+        status: "info",
+        kind: "summary",
+        message: "Regenerating frame with original prompt."
+      });
+      setPromptHistory((current) => [
+        ...current,
+        {
+          runId,
+          prompt,
+          submittedAt: new Date().toISOString(),
+          mode: "edit-selected",
+          devicePreset: frame.devicePreset,
+          designMode: frame.mode
+        }
+      ]);
+      openRunSocket(runId);
+      pushDebugLog("regenerate-frame", "Regenerate started", { runId, frameId }, "info");
+    } catch (reason) {
+      pushDebugLog("regenerate-frame", reason, { frameId }, "error");
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
   const applyViewportTransform = useCallback((next: { x: number; y: number; scale: number }) => {
     viewportRef.current = next;
     const selection = zoomSelectionRef.current;
@@ -2052,7 +1179,7 @@ export default function App() {
         const sourceEvent = event as Event;
         const eventType = sourceEvent.type;
         const target = event.target as HTMLElement | null;
-        if (target?.closest(".canvas-floating-controls")) {
+        if (target?.closest(".canvas-floating-controls, .artboard-empty-state")) {
           return false;
         }
         if (eventType === "wheel") {
@@ -2067,13 +1194,12 @@ export default function App() {
         }
         return true;
       })
-      .on("start", (event: D3ZoomEvent<HTMLDivElement, unknown>) => {
-        const sourceType = (event.sourceEvent as Event | undefined)?.type;
-        if (sourceType === "mousedown" || sourceType === "touchstart") {
-          setViewportPanning(true);
-        }
+      .on("start", (_event: D3ZoomEvent<HTMLDivElement, unknown>) => {
+        // Don't set panning=true here; wait for actual movement in the zoom handler
+        // to avoid blocking background-click deselection on simple clicks.
       })
       .on("zoom", (event: D3ZoomEvent<HTMLDivElement, unknown>) => {
+        setViewportPanning(true);
         const next = {
           x: event.transform.x,
           y: event.transform.y,
@@ -2089,7 +1215,7 @@ export default function App() {
     const panController = createSmoothPanController({
       readViewport: () => viewportRef.current,
       applyViewport: applyViewportTransform,
-      damping: 0.78,
+      damping: 0.45,
       isPanAllowed: (event) => {
         if (event.ctrlKey || event.metaKey) {
           return false;
@@ -2244,6 +1370,7 @@ export default function App() {
   }
 
   function beginDrag(event: React.PointerEvent, frameId: string) {
+    event.preventDefault();
     event.stopPropagation();
     const target = event.target as HTMLElement;
     if (target.closest("button, input, select, textarea, summary, details")) {
@@ -2278,6 +1405,58 @@ export default function App() {
       startX: event.clientX,
       startY: event.clientY
     });
+  }
+
+  function toggleFrameHeight(frameId: string) {
+    const currentBundle = bundleRef.current;
+    if (!currentBundle) return;
+    const frame = currentBundle.frames.find((item) => item.id === frameId);
+    if (!frame) return;
+
+    const standardHeight = isMobilePreset(frame.devicePreset) ? 852 : 880;
+    const currentMode = frameHeightModeRef.current.get(frameId) ?? "content";
+    const contentHeight = contentHeightsRef.current.get(frameId);
+
+    let nextHeight: number;
+    let nextMode: "standard" | "content";
+
+    if (currentMode === "content") {
+      nextHeight = standardHeight;
+      nextMode = "standard";
+    } else {
+      nextHeight = contentHeight ?? frame.size.height;
+      nextMode = "content";
+    }
+
+    frameHeightModeRef.current.set(frameId, nextMode);
+
+    // Suppress auto-fit in standard mode so it sticks
+    const latestVersion = frame.versions[frame.versions.length - 1];
+    if (latestVersion) {
+      const versionKey = `${frameId}:${latestVersion.id}`;
+      if (nextMode === "standard") {
+        autoFitSuppressedVersionsRef.current.add(versionKey);
+      } else {
+        autoFitSuppressedVersionsRef.current.delete(versionKey);
+        autoFitAppliedVersionsRef.current.delete(versionKey);
+      }
+    }
+
+    setBundle((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        frames: current.frames.map((item) =>
+          item.id === frameId
+            ? { ...item, size: { ...item.size, height: nextHeight } }
+            : item
+        )
+      };
+    });
+
+    void updateFrameLayout(getApiBaseUrl(preferences.apiBaseUrl), frameId, {
+      size: { width: frame.size.width, height: nextHeight }
+    }).catch(() => {});
   }
 
   async function selectFrame(frameId: string) {
@@ -2398,6 +1577,7 @@ export default function App() {
 
     lastFocusedFrameIdRef.current = null;
     setRunMode("new-frame");
+    showToast("Deselected — next prompt creates a new screen", 3000);
     setBundle((current) => {
       if (!current) {
         return current;
@@ -2418,7 +1598,7 @@ export default function App() {
     await updateFrameLayout(getApiBaseUrl(preferences.apiBaseUrl), selected.id, { selected: false }).catch((reason) => {
       pushDebugLog("select-frame", reason, { frameId: selected.id, mode: "deselect" }, "warn");
     });
-  }, [preferences.apiBaseUrl, pushDebugLog]);
+  }, [preferences.apiBaseUrl, pushDebugLog, showToast]);
 
   const frameLookup = useMemo(() => {
     if (!bundle) {
@@ -2426,6 +1606,9 @@ export default function App() {
     }
     return new Map(bundle.frames.map((frame) => [frame.id, frame.versions[frame.versions.length - 1]]));
   }, [bundle]);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- framePromptsVersion triggers re-snapshot
+  const framePromptsSnapshot = useMemo(() => new Map(framePromptsRef.current), [framePromptsVersion]);
 
   const frameMetaById = useMemo(() => buildFrameMetaMap(bundle?.frames ?? []), [bundle?.frames]);
   const designSystemReferenceItems = useMemo<DesignSystemReferenceItem[]>(() => {
@@ -2627,6 +1810,7 @@ export default function App() {
         formatThoughtDuration={formatThoughtDuration}
         canSubmit={canSubmit}
         selectedFrameContextLabel={selectedFrameContextLabel}
+        eventCapReached={chatEvents.length >= 420}
       />
 
       <WorkspaceSettingsModal
@@ -2654,6 +1838,32 @@ export default function App() {
         isCopyingLogs={isCopyingLogs}
         error={error}
         onClose={() => setWorkspaceSettingsOpen(false)}
+        onOpenBrandPicker={() => {
+          setWorkspaceSettingsOpen(false);
+          setBrandPickerOpen(true);
+        }}
+        onOpenVisualBoard={() => {
+          setWorkspaceSettingsOpen(false);
+          void openProjectDesignSystem();
+        }}
+        activeBrandName={activeBrandName}
+      />
+
+      <BrandPickerModal
+        open={isBrandPickerOpen}
+        onClose={() => setBrandPickerOpen(false)}
+        onApply={(markdown, brandName) => {
+          void saveProjectDesignSystemMarkdown(markdown);
+          setActiveBrandName(brandName);
+          setBrandPickerOpen(false);
+        }}
+        currentBrandId={null}
+        hasExistingDesignSystem={!!bundle?.designSystem?.markdown}
+        onApplyFromReferences={handleBrandApplyFromReferences}
+        onOpenVisualBoard={() => {
+          setBrandPickerOpen(false);
+          void openProjectDesignSystem();
+        }}
       />
 
       <ProjectDesignSystemModal
@@ -2700,6 +1910,12 @@ export default function App() {
         }}
         allowFrameInteraction={isFrameInteractionUnlocked}
         pendingCanvasCards={pendingCanvasCards}
+        onImportFigmaScreen={handleImportFigmaScreen}
+        hasDesignSystem={!!bundle?.designSystem?.markdown}
+        onOpenBrandPicker={() => setBrandPickerOpen(true)}
+        toggleFrameHeight={toggleFrameHeight}
+        onRegenerate={(fId) => void handleRegenerate(fId)}
+        framePrompts={framePromptsSnapshot}
       />
 
       {captureFrame ? (
@@ -2717,6 +1933,8 @@ export default function App() {
           </div>
         </div>
       ) : null}
+
+      {toastMessage ? <div className="artboard-toast">{toastMessage}</div> : null}
     </div>
   );
 }

@@ -9,7 +9,7 @@ import type {
   ProviderId,
   SurfaceTarget
 } from "@designer/shared";
-import { Copy, RefreshCw, Settings2, X } from "lucide-react";
+import { Copy, Palette, RefreshCw, Settings2, X } from "lucide-react";
 import type { DebugLogEntry, LocalPreferences } from "../types/ui";
 
 type WorkspaceSettingsModalProps = {
@@ -31,6 +31,9 @@ type WorkspaceSettingsModalProps = {
   isCopyingLogs: boolean;
   error: string;
   onClose: () => void;
+  onOpenBrandPicker: () => void;
+  onOpenVisualBoard: () => void;
+  activeBrandName: string | null;
 };
 
 type SettingsFieldProps = {
@@ -66,7 +69,10 @@ export function WorkspaceSettingsModal(props: WorkspaceSettingsModalProps) {
     debugLogs,
     isCopyingLogs,
     error,
-    onClose
+    onClose,
+    onOpenBrandPicker,
+    onOpenVisualBoard,
+    activeBrandName
   } = props;
 
   if (!open) {
@@ -95,6 +101,31 @@ export function WorkspaceSettingsModal(props: WorkspaceSettingsModalProps) {
         </header>
 
         <div className="workspace-modal__body">
+          <section className="workspace-modal__section">
+            <h3>Design System</h3>
+            <p className="workspace-modal__hint">
+              Start from a curated design system or create your own brand identity.
+            </p>
+            <div className="workspace-brand-row">
+              {activeBrandName ? (
+                <span className="workspace-brand-active">
+                  <Palette size={12} />
+                  {activeBrandName}
+                </span>
+              ) : (
+                <span className="workspace-modal__muted">No brand selected</span>
+              )}
+              <button className="workspace-brand-pick-btn" onClick={onOpenBrandPicker}>
+                {activeBrandName ? "Change brand" : "Choose brand template"}
+              </button>
+              {activeBrandName ? (
+                <button className="workspace-brand-pick-btn" onClick={onOpenVisualBoard}>
+                  Preview Visual Board
+                </button>
+              ) : null}
+            </div>
+          </section>
+
           <section className="workspace-modal__section">
             <h3>Provider and API</h3>
             <div className="workspace-modal__grid">

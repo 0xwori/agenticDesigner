@@ -16,7 +16,6 @@ import {
   Link2,
   LoaderCircle,
   Monitor,
-  Palette,
   Plus,
   RefreshCw,
   SendHorizontal,
@@ -26,7 +25,7 @@ import {
   X
 } from "lucide-react";
 import type { LocalPreferences, PromptEntry, RunMode } from "../types/ui";
-import { EventStageIcon, stageLabel } from "./pipelineVisuals";
+import { ErrorHint, EventStageIcon, stageLabel } from "./pipelineVisuals";
 import { sortPipelineEvents } from "../lib/eventOrdering";
 
 type PromptPanelProps = {
@@ -63,6 +62,7 @@ type PromptPanelProps = {
   formatThoughtDuration: (startedAt: string, events: PipelineEvent[]) => string;
   canSubmit: boolean;
   selectedFrameContextLabel: string | null;
+  eventCapReached: boolean;
 };
 
 function toDisplayUrl(value: string) {
@@ -75,36 +75,6 @@ function toDisplayUrl(value: string) {
   }
 }
 
-function describeActionEvent(event: PipelineEvent) {
-  const detailParts: string[] = [];
-  const step = typeof event.payload?.step === "string" ? event.payload.step : null;
-  const target = typeof event.payload?.target === "string" ? event.payload.target : null;
-  const artifact = typeof event.payload?.artifact === "string" ? event.payload.artifact : null;
-  const statusDetail = typeof event.payload?.statusDetail === "string" ? event.payload.statusDetail : null;
-  const attempt = typeof event.payload?.attempt === "number" ? event.payload.attempt : null;
-  const nextStep = typeof event.payload?.nextStep === "string" ? event.payload.nextStep : null;
-
-  if (step) {
-    detailParts.push(step.replaceAll("-", " "));
-  }
-  if (attempt !== null) {
-    detailParts.push(`attempt ${attempt}`);
-  }
-  if (target) {
-    detailParts.push(target);
-  }
-  if (artifact) {
-    detailParts.push(artifact);
-  }
-  if (statusDetail) {
-    detailParts.push(statusDetail);
-  }
-  if (nextStep) {
-    detailParts.push(`next: ${nextStep.replaceAll("-", " ")}`);
-  }
-
-  return detailParts.join(" • ");
-}
 
 type RunActivity = {
   state: "running" | "done" | "failed";
@@ -186,8 +156,30 @@ export function PromptPanel(props: PromptPanelProps) {
     openProjectDesignSystem,
     formatThoughtDuration,
     canSubmit,
-    selectedFrameContextLabel
+    selectedFrameContextLabel,
+    eventCapReached
   } = props;
+
+  // -------------------------------------------------------------------------
+  // Sorted timeline: interleaves prompt turns and system events chronologically
+  // -------------------------------------------------------------------------
+  type TurnTimelineItem = { kind: "turn"; entry: PromptEntry; sortKey: number };
+  type SystemTimelineItem = { kind: "system"; event: PipelineEvent; sortKey: number };
+  type TimelineItem = TurnTimelineItem | SystemTimelineItem;
+
+  const sortedTimeline = useMemo<TimelineItem[]>(() => {
+    const turns: TurnTimelineItem[] = promptHistory.map((entry) => ({
+      kind: "turn",
+      entry,
+      sortKey: new Date(entry.submittedAt).getTime()
+    }));
+    const systemItems: SystemTimelineItem[] = orphanEvents.map((event) => ({
+      kind: "system",
+      event,
+      sortKey: new Date(event.timestamp).getTime()
+    }));
+    return [...turns, ...systemItems].sort((a, b) => a.sortKey - b.sortKey);
+  }, [promptHistory, orphanEvents]);
 
   const [isAttachMenuOpen, setAttachMenuOpen] = useState(false);
   const [isFigmaInputOpen, setFigmaInputOpen] = useState(false);
@@ -196,14 +188,29 @@ export function PromptPanel(props: PromptPanelProps) {
   const [, setTicker] = useState(0);
   const attachMenuRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const chatFeedRef = useRef<HTMLElement | null>(null);
+  const chatFeedEndRef = useRef<HTMLDivElement | null>(null);
+  const isUserScrolledUpRef = useRef(false);
 
-  const formatAgentLabel = (event: PipelineEvent) => {
-    const agent = typeof event.payload?.agent === "string" ? event.payload.agent : null;
-    if (!agent) {
-      return stageLabel(event.stage);
-    }
-    return `${agent} • ${stageLabel(event.stage)}`;
-  };
+  // ---------------------------------------------------------------------------
+  // Auto-scroll: follow new events unless user scrolled up
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    const feed = chatFeedRef.current;
+    if (!feed) return;
+    const onScroll = () => {
+      const distanceFromBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight;
+      isUserScrolledUpRef.current = distanceFromBottom > 100;
+    };
+    feed.addEventListener("scroll", onScroll, { passive: true });
+    return () => feed.removeEventListener("scroll", onScroll);
+  }, []);
+
+  useEffect(() => {
+    if (isUserScrolledUpRef.current) return;
+    chatFeedEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [sortedTimeline.length]);
+
 
   useEffect(() => {
     if (!isAttachMenuOpen) {
@@ -277,9 +284,6 @@ export function PromptPanel(props: PromptPanelProps) {
           </div>
         </div>
         <div className="chat-pane__header-actions">
-          <button onClick={openProjectDesignSystem} aria-label="Open project design system">
-            <Palette size={13} />
-          </button>
           <button onClick={openWorkspaceSettings} aria-label="Open workspace settings">
             <Settings2 size={13} />
           </button>
@@ -304,14 +308,37 @@ export function PromptPanel(props: PromptPanelProps) {
         </span>
       </section>
 
-      <section className="chat-feed">
-        {promptHistory.length === 0 ? (
+      <section className="chat-feed" ref={chatFeedRef}>
+        {eventCapReached ? (
+          <div className="chat-cap-notice">
+            <AlertCircle size={11} />
+            <span>Older events not shown — session history capped at 420 events.</span>
+          </div>
+        ) : null}
+
+        {promptHistory.length === 0 && orphanEvents.length === 0 ? (
           <div className="chat-empty-state">
             <p>Ask a design question or request a screen. The intent router will answer or take action automatically.</p>
           </div>
         ) : null}
 
-        {promptHistory.map((entry) => {
+        {sortedTimeline.map((item, itemIndex) => {
+          if (item.kind === "system") {
+            const event = item.event;
+            return (
+              <article key={`system-${event.timestamp}-${itemIndex}`} className={`timeline-item timeline-item--${event.status}`}>
+                <span className="timeline-icon">
+                  <EventStageIcon stage={event.stage} />
+                </span>
+                <div>
+                  <p className="timeline-message">{event.message}</p>
+                  <p className="timeline-meta">{stageLabel(event.stage)}</p>
+                </div>
+              </article>
+            );
+          }
+
+          const entry = item.entry;
           const runEvents = sortPipelineEvents(eventsByRun.get(entry.runId) ?? []);
           const summaryEvent = [...runEvents].reverse().find((event) => event.kind === "summary") ?? runEvents[0];
           const actionEvents = runEvents.filter((event) => event.kind !== "summary");
@@ -373,13 +400,51 @@ export function PromptPanel(props: PromptPanelProps) {
                               <span>{runActivity.statusDetail ?? `Elapsed ${runElapsed}`}</span>
                             </div>
                           </div>
+                          {runActivity.state === "failed" ? (() => {
+                            const errorEvent = [...runEvents].reverse().find((e) => e.status === "error");
+                            const errorCode = typeof errorEvent?.payload?.errorCode === "string" ? errorEvent.payload.errorCode : null;
+                            const passOutputs = errorEvent?.payload?.passOutputs as Record<string, unknown> | undefined;
+                            const enhanceTitle = typeof passOutputs?.enhance === "object" && passOutputs?.enhance !== null
+                              ? (passOutputs.enhance as Record<string, unknown>).title
+                              : null;
+                            const planName = typeof passOutputs?.plan === "object" && passOutputs?.plan !== null
+                              ? (passOutputs.plan as Record<string, unknown>).frameName
+                              : null;
+                            return (
+                              <>
+                                {errorCode ? <ErrorHint errorCode={errorCode} /> : null}
+                                {(enhanceTitle || planName) ? (
+                                  <details className="planned-output">
+                                    <summary>What was planned before failure</summary>
+                                    {enhanceTitle ? <p><strong>Brief:</strong> {String(enhanceTitle)}</p> : null}
+                                    {planName ? <p><strong>Frame:</strong> {String(planName)}</p> : null}
+                                  </details>
+                                ) : null}
+                              </>
+                            );
+                          })() : null}
+                          {runActivity.state === "done" ? (
+                            <div className="suggestion-chips">
+                              {["Refine the colors", "Add dark mode variant", "Make it responsive", "Add hover states", "Simplify the layout"].map((suggestion) => (
+                                <button
+                                  key={suggestion}
+                                  type="button"
+                                  className="suggestion-chip"
+                                  onClick={() => setComposerPrompt(suggestion)}
+                                >
+                                  {suggestion}
+                                </button>
+                              ))}
+                            </div>
+                          ) : null}
                         </div>
                       </div>
 
+                      <details className="thought-timeline-toggle">
+                        <summary>Show details</summary>
                       <div className="thought-timeline" role="list">
                         {actionEvents.length > 0 ? (
                           actionEvents.map((event, index) => {
-                            const detail = describeActionEvent(event);
                             const calibrationOptions = Array.isArray(event.payload?.calibrationOptions)
                               ? event.payload.calibrationOptions.filter(
                                   (entry): entry is string => typeof entry === "string" && entry.trim().length > 0
@@ -396,8 +461,6 @@ export function PromptPanel(props: PromptPanelProps) {
                                 </span>
                                 <div className="timeline-action-card__body">
                                   <p>{event.message}</p>
-                                  <span>{formatAgentLabel(event)}</span>
-                                  {detail ? <span className="timeline-action-card__detail">{detail}</span> : null}
                                   {calibrationOptions.length > 0 ? (
                                     <div className="timeline-action-card__calibration">
                                       {calibrationOptions.map((option) => (
@@ -429,29 +492,16 @@ export function PromptPanel(props: PromptPanelProps) {
                           ) : null
                         )}
                       </div>
+                      </details>
                     </article>
                   </div>
                 </div>
               ) : null}
+
             </section>
           );
         })}
-
-        {orphanEvents.length > 0 ? (
-          <section className="system-feed">
-            {orphanEvents.map((event, index) => (
-              <article key={`${event.runId}-${event.timestamp}-${index}`} className={`timeline-item timeline-item--${event.status}`}>
-                <span className="timeline-icon">
-                  <EventStageIcon stage={event.stage} />
-                </span>
-                <div>
-                  <p className="timeline-message">{event.message}</p>
-                  <p className="timeline-meta">{stageLabel(event.stage)}</p>
-                </div>
-              </article>
-            ))}
-          </section>
-        ) : null}
+        <div ref={chatFeedEndRef} />
       </section>
 
       <form className="composer" onSubmit={(event) => void handleRun(event)}>
@@ -558,8 +608,9 @@ export function PromptPanel(props: PromptPanelProps) {
 
         {selectedFrameContextLabel ? (
           <div className="composer-selection-chip">
-            <span>Selected frame</span>
+            <span>{runMode === "edit-selected" ? "Editing:" : "Variant of:"}</span>
             <strong>{selectedFrameContextLabel}</strong>
+            <span className="composer-selection-chip__hint">Click canvas to deselect</span>
           </div>
         ) : null}
 
@@ -571,12 +622,24 @@ export function PromptPanel(props: PromptPanelProps) {
         />
         <div className="composer-toolbar">
           <div className="composer-toolbar__left">
-            <label>
-              <select value={runMode} onChange={(event) => setRunMode(event.target.value as RunMode)}>
-                <option value="new-frame">New frame</option>
-                <option value="edit-selected">Edit selected</option>
-              </select>
-            </label>
+            {selectedFrameContextLabel ? (
+              <div className="composer-mode-toggle">
+                <button
+                  type="button"
+                  className={`composer-mode-toggle__btn${runMode === "edit-selected" ? " is-active" : ""}`}
+                  onClick={() => setRunMode("edit-selected")}
+                >
+                  Edit
+                </button>
+                <button
+                  type="button"
+                  className={`composer-mode-toggle__btn${runMode === "new-frame" ? " is-active" : ""}`}
+                  onClick={() => setRunMode("new-frame")}
+                >
+                  Variant
+                </button>
+              </div>
+            ) : null}
             <label>
               <select
                 value={selectedSurfaceTarget}
@@ -594,6 +657,9 @@ export function PromptPanel(props: PromptPanelProps) {
               <select value={selectedDevice} onChange={(event) => setSelectedDevice(event.target.value as DevicePreset)}>
                 <option value="desktop">Desktop</option>
                 <option value="iphone">iPhone</option>
+                <option value="iphone-15">iPhone 15</option>
+                <option value="iphone-15-pro">iPhone 15 Pro</option>
+                <option value="iphone-15-pro-max">iPhone 15 Pro Max</option>
               </select>
             </label>
             <label>

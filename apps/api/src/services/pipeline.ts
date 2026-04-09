@@ -12,6 +12,7 @@ import {
   PIPELINE_STAGES,
   type DesignMode,
   type DevicePreset,
+  isMobilePreset,
   type PipelineEvent,
   type PipelineStage,
   type PromptIntentType,
@@ -22,6 +23,7 @@ import {
   type SurfaceTarget,
   type RunStatus
 } from "@designer/shared";
+import { backoffDelay, isRetriableError } from "../lib/backoff.js";
 import {
   appendChatMessage,
   appendPipelineEvent,
@@ -30,12 +32,14 @@ import {
   getFrame,
   getLatestSyncedReference,
   getLatestFrameVersion,
+  getRunPassOutputs,
   upsertProjectDesignSystem,
   getProjectBundle,
   getProjectStyleContexts,
   updateFrameStatus,
   updatePipelineRun,
-  updateReferenceSource
+  updateReferenceSource,
+  updateRunPassOutputs
 } from "../db.js";
 import {
   buildDesignSystemChecklistFromStyleContext,
@@ -50,6 +54,7 @@ import {
 import { buildDesignSystemComponentsArtifacts as buildDesignSystemComponentsArtifactsFromProfile } from "./designSystemArtifacts.js";
 import { requestCompletion } from "./llmProviders.js";
 import type { RunHub } from "./runHub.js";
+import { selectImagesForPlan, buildImageContextBlock } from "./unsplash.js";
 import {
   classifyPromptIntent as classifyPromptIntentViaRouter,
   detectIntentHeuristic as detectIntentHeuristicViaRouter
@@ -66,6 +71,8 @@ import {
   validateArtifactsForDevice as validateArtifactsForDeviceViaValidators,
   validateDesignSystemAdherence as validateDesignSystemAdherenceViaValidators
 } from "./pipeline/validators.js";
+import { WEB_DESIGN_SKILL } from "./pipeline/skills-web.js";
+import { MOBILE_DESIGN_SKILL } from "./pipeline/skills-mobile.js";
 import { deriveStyleContextFromArtifacts } from "./styleContextArtifacts.js";
 
 type PipelineInput = {
@@ -86,6 +93,83 @@ type PipelineInput = {
   frameId?: string;
   editing: boolean;
 };
+
+// ---------------------------------------------------------------------------
+// Smart model routing — pick lighter models for simple tasks
+// ---------------------------------------------------------------------------
+type PipelinePass = "enhance-plan" | "generate" | "repair" | "intent" | "diff-repair";
+type EditComplexity = "trivial" | "moderate" | "complex";
+
+const FAST_MODELS: Record<ProviderId, string> = {
+  openai: "gpt-5.4-nano",
+  anthropic: "claude-sonnet-4-20250514",
+  google: "gemini-2.0-flash",
+};
+
+function classifyEditComplexity(prompt: string): EditComplexity {
+  const lower = prompt.toLowerCase().trim();
+  const wordCount = lower.split(/\s+/).length;
+
+  // Trivial: very short prompts with simple verbs
+  const trivialPattern = /^(delete|remove|hide|show|change|rename|swap|replace|update|move|toggle|set|make)\b/;
+  const singlePropertyChange = /\b(color|text|font|size|padding|margin|background|border|title|label|name|icon|image)\b/;
+
+  if (wordCount <= 8 && trivialPattern.test(lower)) {
+    return "trivial";
+  }
+  if (wordCount <= 12 && singlePropertyChange.test(lower) && !lower.includes(" and ")) {
+    return "trivial";
+  }
+
+  // Moderate: targeted multi-property edits or section changes
+  if (wordCount <= 25) {
+    return "moderate";
+  }
+
+  return "complex";
+}
+
+function resolveModelForPass(
+  input: PipelineInput,
+  pass: PipelinePass
+): { model: string; reason?: string } {
+  const userModel = input.model;
+
+  // Intent classification always uses a fast model
+  if (pass === "intent") {
+    return { model: FAST_MODELS[input.provider] ?? userModel, reason: "intent-fast" };
+  }
+
+  // For new generation (not editing), use the user's chosen model for generate, fast for planning
+  if (!input.editing) {
+    if (pass === "enhance-plan") {
+      return { model: FAST_MODELS[input.provider] ?? userModel, reason: "plan-fast" };
+    }
+    return { model: userModel };
+  }
+
+  // Editing: route based on complexity
+  const complexity = classifyEditComplexity(input.prompt);
+
+  if (complexity === "trivial") {
+    // Trivial edits: fast model for everything
+    return { model: FAST_MODELS[input.provider] ?? userModel, reason: `edit-trivial` };
+  }
+
+  if (complexity === "moderate") {
+    // Moderate edits: fast for plan, user model for generate
+    if (pass === "enhance-plan" || pass === "repair" || pass === "diff-repair") {
+      return { model: FAST_MODELS[input.provider] ?? userModel, reason: `edit-moderate-fast` };
+    }
+    return { model: userModel };
+  }
+
+  // Complex: user model for generate, fast for planning
+  if (pass === "enhance-plan") {
+    return { model: FAST_MODELS[input.provider] ?? userModel, reason: `edit-complex-plan-fast` };
+  }
+  return { model: userModel };
+}
 
 type PipelineContext = {
   hub: RunHub;
@@ -384,11 +468,19 @@ function pickDesignSystemColorToken(
   matchers: string[],
   fallback: string
 ) {
-  const color = designSystem.structuredTokens.colors.find((token) => {
+  // Check token name first
+  const byName = designSystem.structuredTokens.colors.find((token) => {
     const name = token.name.toLowerCase();
     return matchers.some((matcher) => name.includes(matcher));
   });
-  return color?.hex ?? fallback;
+  if (byName) return byName.hex;
+
+  // Check token role description (e.g. role "Primary brand color" matches "primary")
+  const byRole = designSystem.structuredTokens.colors.find((token) => {
+    const role = token.role.toLowerCase();
+    return matchers.some((matcher) => role.includes(matcher));
+  });
+  return byRole?.hex ?? fallback;
 }
 
 function buildStyleContextFromProjectDesignSystem(designSystem: ProjectDesignSystem | null): ReferenceStyleContext | null {
@@ -397,14 +489,43 @@ function buildStyleContextFromProjectDesignSystem(designSystem: ProjectDesignSys
   }
 
   const fallback = buildFallbackStyleContext();
+  const colors = designSystem.structuredTokens.colors;
+
+  // Positional fallback: use first parsed colors when name/role search misses
+  const positionalHexes = colors.map((c) => c.hex);
+  const usedPositional = new Set<string>();
+  function nextPositional() {
+    for (const hex of positionalHexes) {
+      if (!usedPositional.has(hex)) {
+        usedPositional.add(hex);
+        return hex;
+      }
+    }
+    return "";
+  }
+
+  const rawPrimary = pickDesignSystemColorToken(designSystem, ["primary", "brand"], "");
+  const finalPrimary = rawPrimary || nextPositional() || fallback.palette.primary;
+  usedPositional.add(finalPrimary);
+
+  const rawSecondary = pickDesignSystemColorToken(designSystem, ["secondary", "support"], "");
+  const finalSecondary = rawSecondary || nextPositional() || fallback.palette.secondary;
+  usedPositional.add(finalSecondary);
+
+  const rawAccent = pickDesignSystemColorToken(designSystem, ["accent", "tertiary"], "");
+  const finalAccent = rawAccent || nextPositional() || fallback.palette.accent;
+
+  const finalSurface = pickDesignSystemColorToken(designSystem, ["surface", "neutral", "background", "page"], fallback.palette.surface);
+  const finalText = pickDesignSystemColorToken(designSystem, ["text", "on-", "ink", "heading"], fallback.palette.text);
+
   return {
     source: designSystem.sourceType === "figma-reference" ? "figma-public-link" : "heuristic",
     palette: {
-      primary: pickDesignSystemColorToken(designSystem, ["primary"], fallback.palette.primary),
-      secondary: pickDesignSystemColorToken(designSystem, ["secondary"], fallback.palette.secondary),
-      accent: pickDesignSystemColorToken(designSystem, ["tertiary", "accent"], fallback.palette.accent),
-      surface: pickDesignSystemColorToken(designSystem, ["neutral", "surface"], fallback.palette.surface),
-      text: pickDesignSystemColorToken(designSystem, ["text", "on-", "ink"], fallback.palette.text)
+      primary: finalPrimary,
+      secondary: finalSecondary,
+      accent: finalAccent,
+      surface: finalSurface,
+      text: finalText
     },
     typography: {
       headingFamily: designSystem.structuredTokens.typography.headlineFont || fallback.typography.headingFamily,
@@ -435,7 +556,7 @@ function buildStyleContextFromProjectDesignSystem(designSystem: ProjectDesignSys
 }
 
 function getPrimaryAgentForDevice(devicePreset: DevicePreset): AgentRole {
-  return devicePreset === "iphone" ? "app-designer" : "web-designer";
+  return isMobilePreset(devicePreset) ? "app-designer" : "web-designer";
 }
 
 function normalizeChecklistItems(input: unknown): string[] {
@@ -467,10 +588,11 @@ async function classifyPromptIntent(
   styleContext: ReferenceStyleContext,
   hasSyncedReference: boolean
 ): Promise<PromptIntent> {
+  const { model: intentModel } = resolveModelForPass(input, "intent");
   return classifyPromptIntentViaRouter({
     prompt: input.prompt,
     provider: input.provider,
-    model: input.model,
+    model: intentModel,
     apiKey: input.apiKey,
     editing: input.editing,
     styleContext,
@@ -850,6 +972,32 @@ async function emit(context: PipelineContext, event: PipelineEvent) {
   context.hub.broadcast(event.runId, persisted);
 }
 
+import type { PipelineErrorCode } from "../lib/backoff.js";
+
+function classifyPipelineError(error: unknown): PipelineErrorCode {
+  const message = error instanceof Error ? error.message : String(error);
+  const lower = message.toLowerCase();
+  const status = (error as { status?: number; statusCode?: number }).status
+    ?? (error as { status?: number; statusCode?: number }).statusCode;
+
+  if (status === 401 || status === 403 || lower.includes("api key") || lower.includes("authentication") || lower.includes("unauthorized") || lower.includes("invalid key")) {
+    return "auth-error";
+  }
+  if (status === 429 || lower.includes("rate limit") || lower.includes("quota") || lower.includes("too many requests")) {
+    return "rate-limit";
+  }
+  if (status === 408 || status === 504 || lower.includes("timeout") || lower.includes("timed out") || lower.includes("deadline") || lower.includes("aborted")) {
+    return "llm-timeout";
+  }
+  if (lower.includes("validation") || lower.includes("parse") || lower.includes("invalid json") || lower.includes("schema")) {
+    return "validation-failure";
+  }
+  if (lower.includes("network") || lower.includes("econnrefused") || lower.includes("enotfound") || lower.includes("socket")) {
+    return "network-error";
+  }
+  return "unknown";
+}
+
 async function emitAgentEvent(
   context: PipelineContext,
   input: {
@@ -897,21 +1045,30 @@ async function setPassStatus(
 
 async function enhancePrompt(
   input: PipelineInput,
-  styleContext: ReferenceStyleContext
+  styleContext: ReferenceStyleContext,
+  previousSourceCode?: string
 ): Promise<EnhanceResult> {
+  const isEdit = input.editing && previousSourceCode && previousSourceCode.length > 0;
   const fallback: EnhanceResult = {
-    title: "Generated Product Screen",
+    title: isEdit ? "Edit Existing Screen" : "Generated Product Screen",
     intent: input.prompt,
     audience: "Design team",
-    uxGoals: ["Clarify information hierarchy", "Preserve brand tone", "Keep interactions intuitive"],
+    uxGoals: isEdit
+      ? ["Apply only the requested changes", "Preserve existing layout and styling", "Keep interactions intuitive"]
+      : ["Clarify information hierarchy", "Preserve brand tone", "Keep interactions intuitive"],
     constraints: [
       `Device target: ${input.devicePreset}`,
       `Design mode: ${input.mode}`,
-      `Surface target: ${input.surfaceTarget ?? (input.devicePreset === "iphone" ? "mobile" : "web")}`,
+      `Surface target: ${input.surfaceTarget ?? (isMobilePreset(input.devicePreset) ? "mobile" : "web")}`,
       `Design-system mode: ${input.designSystemMode ?? "strict"}`,
-      input.tailwindEnabled ? "Tailwind utility classes enabled" : "React + CSS variable output"
+      input.tailwindEnabled ? "Tailwind utility classes enabled" : "React + CSS variable output",
+      ...(isEdit ? ["EDIT MODE: Only describe changes to the existing screen. Do not redesign from scratch."] : [])
     ]
   };
+
+  const editContext = isEdit
+    ? `\n\nEDIT MODE: The user is making a targeted edit to an existing screen. Frame the brief as a modification, NOT a new build. Describe only what changes.\nExisting code summary (first 1500 chars):\n${previousSourceCode.slice(0, 1500)}`
+    : "";
 
   const completion = await requestCompletion({
     provider: input.provider,
@@ -919,14 +1076,16 @@ async function enhancePrompt(
     apiKey: input.apiKey,
     allowMock: false,
     jsonMode: true,
-    system:
-      "You are a senior product designer. Return JSON with keys: title, intent, audience, uxGoals (array), constraints (array).",
+    timeoutMs: 30_000,
+    system: isEdit
+      ? "You are a senior product designer. The user is editing an existing screen. Return JSON with keys: title, intent, audience, uxGoals (array), constraints (array). Frame goals and constraints as targeted modifications, not a full redesign."
+      : "You are a senior product designer. Return JSON with keys: title, intent, audience, uxGoals (array), constraints (array).",
     prompt: `User prompt: ${input.prompt}
-Surface target: ${input.surfaceTarget ?? (input.devicePreset === "iphone" ? "mobile" : "web")}
+Surface target: ${input.surfaceTarget ?? (isMobilePreset(input.devicePreset) ? "mobile" : "web")}
 Design-system mode: ${input.designSystemMode ?? "strict"}
 Selected frame context:
 ${formatSelectedFrameContext(input.selectedFrameContext)}
-Style palette: ${JSON.stringify(styleContext.palette)}
+Style palette: ${JSON.stringify(styleContext.palette)}${editContext}
 Return strict JSON.`
   });
 
@@ -943,18 +1102,28 @@ Return strict JSON.`
 async function createPlan(
   input: PipelineInput,
   enhanced: EnhanceResult,
-  styleContext: ReferenceStyleContext
+  styleContext: ReferenceStyleContext,
+  previousSourceCode?: string
 ): Promise<PlanResult> {
+  const isEdit = input.editing && previousSourceCode && previousSourceCode.length > 0;
   const fallback: PlanResult = {
     frameName: enhanced.title,
-    subtitle: "Built with reference-aware style constraints and progressive refinement.",
-    sections: [
-      { title: "Hero Summary", description: "Immediate understanding of purpose and primary action." },
-      { title: "Core Metrics", description: "Visual cards highlighting key outcomes and current status." },
-      { title: "Execution Queue", description: "Actionable items with clear ownership and next steps." }
-    ],
+    subtitle: isEdit
+      ? "Targeted edit of existing screen — preserving unchanged sections."
+      : "Built with reference-aware style constraints and progressive refinement.",
+    sections: isEdit
+      ? [{ title: "CHANGE", description: enhanced.intent }, { title: "KEEP AS-IS", description: "All other sections remain identical to the previous version." }]
+      : [
+          { title: "Hero Summary", description: "Immediate understanding of purpose and primary action." },
+          { title: "Core Metrics", description: "Visual cards highlighting key outcomes and current status." },
+          { title: "Execution Queue", description: "Actionable items with clear ownership and next steps." }
+        ],
     keyActions: ["Primary CTA", "Secondary exploration", "Contextual edit affordance"]
   };
+
+  const editContext = isEdit
+    ? `\n\nEDIT MODE: This is a targeted edit. The plan must describe ONLY the sections that change. Mark all unchanged sections as "KEEP AS-IS". Do not plan a full screen rebuild.\nExisting code summary (first 1500 chars):\n${previousSourceCode.slice(0, 1500)}`
+    : "";
 
   const completion = await requestCompletion({
     provider: input.provider,
@@ -962,14 +1131,16 @@ async function createPlan(
     apiKey: input.apiKey,
     allowMock: false,
     jsonMode: true,
-    system:
-      "You output concise planning JSON. Keys: frameName, subtitle, sections[{title,description}], keyActions[]. No markdown.",
+    timeoutMs: 45_000,
+    system: isEdit
+      ? "You output concise planning JSON for a TARGETED EDIT of an existing screen. Keys: frameName, subtitle, sections[{title,description}], keyActions[]. Each section must be labeled CHANGE or KEEP AS-IS. Only sections that change should have detailed descriptions. No markdown."
+      : "You output concise planning JSON. Keys: frameName, subtitle, sections[{title,description}], keyActions[]. No markdown.",
     prompt: `Enhanced brief: ${JSON.stringify(enhanced)}
-Surface target: ${input.surfaceTarget ?? (input.devicePreset === "iphone" ? "mobile" : "web")}
+Surface target: ${input.surfaceTarget ?? (isMobilePreset(input.devicePreset) ? "mobile" : "web")}
 Design-system mode: ${input.designSystemMode ?? "strict"}
 Selected frame context:
 ${formatSelectedFrameContext(input.selectedFrameContext)}
-Style motifs: ${styleContext.layoutMotifs.join(", ")}`
+Style motifs: ${styleContext.layoutMotifs.join(", ")}${editContext}`
   });
 
   const parsed = asJsonObject<PlanResult>(completion.content, fallback);
@@ -981,6 +1152,98 @@ Style motifs: ${styleContext.layoutMotifs.join(", ")}`
   };
 }
 
+/**
+ * Combined enhance + plan in a single LLM call to cut latency in half.
+ * Falls back to the two-step approach if the combined call fails.
+ */
+async function enhanceAndPlan(
+  input: PipelineInput,
+  styleContext: ReferenceStyleContext,
+  previousSourceCode?: string
+): Promise<{ enhanced: EnhanceResult; plan: PlanResult }> {
+  const isEdit = input.editing && previousSourceCode && previousSourceCode.length > 0;
+
+  const enhanceFallback: EnhanceResult = {
+    title: isEdit ? "Edit Existing Screen" : "Generated Product Screen",
+    intent: input.prompt,
+    audience: "Design team",
+    uxGoals: isEdit
+      ? ["Apply only the requested changes", "Preserve existing layout and styling", "Keep interactions intuitive"]
+      : ["Clarify information hierarchy", "Preserve brand tone", "Keep interactions intuitive"],
+    constraints: [
+      `Device target: ${input.devicePreset}`,
+      `Design mode: ${input.mode}`,
+      `Surface target: ${input.surfaceTarget ?? (isMobilePreset(input.devicePreset) ? "mobile" : "web")}`,
+      `Design-system mode: ${input.designSystemMode ?? "strict"}`,
+      input.tailwindEnabled ? "Tailwind utility classes enabled" : "React + CSS variable output",
+      ...(isEdit ? ["EDIT MODE: Only describe changes to the existing screen."] : [])
+    ]
+  };
+
+  const planFallback: PlanResult = {
+    frameName: enhanceFallback.title,
+    subtitle: isEdit
+      ? "Targeted edit of existing screen."
+      : "Built with reference-aware style constraints.",
+    sections: isEdit
+      ? [{ title: "CHANGE", description: enhanceFallback.intent }, { title: "KEEP AS-IS", description: "All other sections remain identical." }]
+      : [
+          { title: "Hero Summary", description: "Immediate understanding of purpose and primary action." },
+          { title: "Core Content", description: "Key information and actions." },
+          { title: "Supporting Context", description: "Secondary details and navigation." }
+        ],
+    keyActions: ["Primary CTA", "Secondary exploration", "Contextual edit affordance"]
+  };
+
+  const editContext = isEdit
+    ? `\n\nEDIT MODE: Frame this as a targeted modification.\nExisting code summary (first 1500 chars):\n${previousSourceCode!.slice(0, 1500)}`
+    : "";
+
+  try {
+    const { model: planModel } = resolveModelForPass(input, "enhance-plan");
+    const completion = await requestCompletion({
+      provider: input.provider,
+      model: planModel,
+      apiKey: input.apiKey,
+      allowMock: false,
+      jsonMode: true,
+      timeoutMs: 55_000,
+      system: `You are a senior product designer. Return a single JSON object with two keys:
+"enhance": { title (string), intent (string), audience (string), uxGoals (string[]), constraints (string[]) }
+"plan": { frameName (string), subtitle (string), sections (array of {title, description}), keyActions (string[]) }
+${isEdit ? "This is a TARGETED EDIT. The enhance should frame goals as modifications. The plan should mark sections as CHANGE or KEEP AS-IS." : "The enhance should capture what the user wants. The plan should describe the screen layout sections."}
+Return strict JSON only.`,
+      prompt: `User prompt: ${input.prompt}
+Surface target: ${input.surfaceTarget ?? (isMobilePreset(input.devicePreset) ? "mobile" : "web")}
+Design-system mode: ${input.designSystemMode ?? "strict"}
+Selected frame context:
+${formatSelectedFrameContext(input.selectedFrameContext)}
+Style palette: ${JSON.stringify(styleContext.palette)}
+Style motifs: ${styleContext.layoutMotifs.join(", ")}${editContext}`
+    });
+
+    const parsed = asJsonObject<{ enhance?: EnhanceResult; plan?: PlanResult }>(completion.content, {});
+    const enhanced: EnhanceResult = {
+      ...enhanceFallback,
+      ...(parsed.enhance ?? {}),
+      uxGoals: Array.isArray(parsed.enhance?.uxGoals) && parsed.enhance!.uxGoals.length > 0 ? parsed.enhance!.uxGoals : enhanceFallback.uxGoals,
+      constraints: Array.isArray(parsed.enhance?.constraints) && parsed.enhance!.constraints.length > 0 ? parsed.enhance!.constraints : enhanceFallback.constraints
+    };
+    const plan: PlanResult = {
+      ...planFallback,
+      ...(parsed.plan ?? {}),
+      sections: Array.isArray(parsed.plan?.sections) && parsed.plan!.sections.length > 0 ? parsed.plan!.sections : planFallback.sections,
+      keyActions: Array.isArray(parsed.plan?.keyActions) && parsed.plan!.keyActions.length > 0 ? parsed.plan!.keyActions : planFallback.keyActions
+    };
+    return { enhanced, plan };
+  } catch {
+    // Fallback to sequential calls
+    const enhanced = await enhancePrompt(input, styleContext, previousSourceCode);
+    const plan = await createPlan(input, enhanced, styleContext, previousSourceCode);
+    return { enhanced, plan };
+  }
+}
+
 async function answerDesignQuestion(input: PipelineInput, styleContext: ReferenceStyleContext): Promise<string> {
   const fallback =
     "Here is the short answer: keep one primary action, reduce visual density, and anchor spacing/typography to your design-system tokens before generating new screens.";
@@ -990,6 +1253,7 @@ async function answerDesignQuestion(input: PipelineInput, styleContext: Referenc
     model: input.model,
     apiKey: input.apiKey,
     allowMock: false,
+    timeoutMs: 30_000,
     system:
       "You are a product design assistant. The user asked a question and does not want generation. Reply in concise plain text with practical guidance.",
     prompt: `User question: ${input.prompt}
@@ -1014,6 +1278,7 @@ async function refineDesignSystemChecklist(args: {
     apiKey: args.input.apiKey,
     allowMock: false,
     jsonMode: true,
+    timeoutMs: 45_000,
     system:
       "You are a design-system designer. Return STRICT JSON only with key 'sections'. sections must be an array of {section:string, items:string[]}. Keep scope minimal but complete. No prose outside checklist.",
     prompt: `Current checklist JSON:
@@ -1217,6 +1482,7 @@ async function extractImageRebuildSpec(args: {
     apiKey: args.input.apiKey,
     allowMock: false,
     jsonMode: true,
+    timeoutMs: 45_000,
     attachments: [args.attachment],
     system:
       `You are a senior UI/UX designer specializing in exact visual reconstruction.
@@ -1372,6 +1638,12 @@ async function runImageReferenceRoute(args: {
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     attemptCount = attempt;
+
+    if (attempt > 1) {
+      const delay = backoffDelay(attempt);
+      await sleep(delay);
+    }
+
     await emitAgentEvent(args.context, {
       runId: args.input.runId,
       stage: "generate",
@@ -1397,26 +1669,45 @@ async function runImageReferenceRoute(args: {
             issues: lastIssues,
             spec: imageSpec,
             designSystemMode: args.input.designSystemMode ?? "strict",
-            surfaceTarget: args.input.surfaceTarget ?? (args.input.devicePreset === "iphone" ? "mobile" : "web")
+            surfaceTarget: args.input.surfaceTarget ?? (isMobilePreset(args.input.devicePreset) ? "mobile" : "web")
           })}`;
 
-    generation = await generateScreenArtifacts({
-      input: {
-        ...args.input,
-        prompt: `${attemptPrompt}
+    let caught: unknown = null;
+    try {
+      generation = await generateScreenArtifacts({
+        input: {
+          ...args.input,
+          prompt: `${attemptPrompt}
 
 Image reconstruction spec:
 ${JSON.stringify(imageSpec, null, 2)}
 `.trim()
-      },
-      styleContext: imageStyleContext,
-      enhanced,
-      plan,
-      iterationLabel: "",
-      previousSourceCode: "",
-      previousCssCode: "",
-      previousExportHtml: ""
-    });
+        },
+        styleContext: imageStyleContext,
+        enhanced,
+        plan,
+        iterationLabel: "",
+        previousSourceCode: "",
+        previousCssCode: "",
+        previousExportHtml: ""
+      });
+    } catch (genError) {
+      caught = genError;
+      const errorCode = classifyPipelineError(genError);
+      if (!isRetriableError(errorCode) || attempt >= 3) {
+        throw genError;
+      }
+      await emitAgentEvent(args.context, {
+        runId: args.input.runId,
+        stage: "generate",
+        status: "info",
+        kind: "action",
+        agent: "orchestrator",
+        message: `Generation failed (${errorCode}) on attempt ${attempt}. Will retry with backoff.`,
+        payload: { step: "transient-error", attempt, errorCode }
+      });
+      continue;
+    }
 
     lastDeviceValidation = validateArtifactsForDevice(generation.artifacts, {
       devicePreset: args.input.devicePreset,
@@ -1821,7 +2112,7 @@ function buildArtifacts(args: {
       border-radius: calc(var(--tw-radius) + 8px);
       background: linear-gradient(180deg, #ffffff 0%, color-mix(in srgb, var(--tw-surface) 85%, white) 100%);
       box-shadow: 0 18px 44px rgba(24, 28, 40, 0.08);
-      min-height: ${args.devicePreset === "iphone" ? "820px" : "680px"};
+      min-height: ${isMobilePreset(args.devicePreset) ? "820px" : "680px"};
       padding: 26px;
       display: grid;
       gap: 18px;
@@ -1831,7 +2122,7 @@ function buildArtifacts(args: {
     .tw-hero h1 {
       margin: 6px 0 6px;
       font-family: ${styleContext.typography.headingFamily};
-      font-size: ${args.devicePreset === "iphone" ? "30px" : "36px"};
+      font-size: ${isMobilePreset(args.devicePreset) ? "30px" : "36px"};
       letter-spacing: -0.03em;
       line-height: 1.08;
     }
@@ -1856,7 +2147,7 @@ function buildArtifacts(args: {
     .tw-grid {
       display: grid;
       gap: 12px;
-      grid-template-columns: repeat(auto-fit, minmax(${args.devicePreset === "iphone" ? "240px" : "280px"}, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(${isMobilePreset(args.devicePreset) ? "240px" : "280px"}, 1fr));
     }
 
     .tw-card {
@@ -1961,7 +2252,7 @@ function buildPromptAwareFallbackArtifacts(args: {
     : args.styleContext.palette;
   const frameName = `${args.enhanced.title} ${args.iterationLabel}`.trim();
   const subtitle = args.plan.subtitle || args.enhanced.intent;
-  const mobile = args.devicePreset === "iphone";
+  const mobile = isMobilePreset(args.devicePreset);
 
   let bodyHtml = "";
   let bodyJsx = "";
@@ -2324,17 +2615,21 @@ async function generateScreenArtifacts(args: {
   previousSourceCode: string;
   previousCssCode?: string;
   previousExportHtml?: string;
+  designSystemMarkdown?: string;
+  imageContext?: string;
 }): Promise<GenerateArtifactsResult> {
-  const isIphone = args.input.devicePreset === "iphone";
+  const isIphone = isMobilePreset(args.input.devicePreset);
   const surfaceTarget = args.input.surfaceTarget ?? (isIphone ? "mobile" : "web");
+  const { model: generateModel } = resolveModelForPass(args.input, "generate");
   const designSystemMode = args.input.designSystemMode ?? "strict";
 
   const completion = await requestCompletion({
     provider: args.input.provider,
-    model: args.input.model,
+    model: generateModel,
     apiKey: args.input.apiKey,
     allowMock: false,
     jsonMode: true,
+    timeoutMs: 120_000,
     attachments: args.input.attachments,
     system: `You are a senior UI engineer and product designer.
 Return STRICT JSON only with keys:
@@ -2348,13 +2643,28 @@ Hard constraints:
 - Never return a generic template card layout.
 - sourceCode must run in browser Babel with global React and ReactDOM; no imports/exports.
 - sourceCode must call ReactDOM.createRoot(document.getElementById("root")).render(...)
-- cssCode must be valid CSS.
+- cssCode must be valid CSS. Always include a body or :root font-family declaration with the design system fonts (e.g. font-family: "Inter", sans-serif) so fonts can be loaded.
 - exportHtml must be static HTML for the same initial UI state and must not contain <script> tags.
 - Keep output production-like and brand-aligned using provided style context.
-- If device preset is iphone or surfaceTarget is mobile: output native app-like IA (safe-area aware top area, mobile sections, touch-friendly controls), no desktop marketing hero patterns.
+- If a full DESIGN.md is provided, use its exact colors, typography hierarchy (font families, sizes, weights), component styling rules, spacing scale, radius scale, elevation system, and imagery directions.
+- Apply the do's and avoid the don'ts from the design system strictly.
+- Use the correct font families, sizes, and weights from the typography hierarchy table — do not default to generic sizes.
 - In strict mode, prefer style-context tokens (color, fonts, radius) and avoid unexplained drift.
 - In creative mode, keep recognizable brand cues while allowing broader visual exploration.
-- Return JSON only.`,
+- Return JSON only.
+
+${isIphone ? MOBILE_DESIGN_SKILL : WEB_DESIGN_SKILL}${args.input.editing ? `
+
+EDIT MODE — CRITICAL:
+- You are editing an EXISTING screen, NOT building from scratch.
+- Make ONLY the changes described in the user's prompt.
+- Keep ALL other elements, components, styling, layout, and structure IDENTICAL to the previous version.
+- COPY the existing sourceCode, cssCode, and exportHtml verbatim, then apply ONLY the specific changes.
+- Do NOT reorganize, rename, refactor, or restyle any component the user did not ask to change.
+- The frameName should remain the same unless the user explicitly renamed it.
+- If the user says "delete X" or "remove X", remove only that element and leave everything else intact.
+- If the user says "change X to Y", find X in the existing code and replace it with Y. Do not touch other code.
+- Preserve all variable names, component names, className strings, and structure from the existing source.${args.input.selectedFrameContext?.sourceType === "figma-reference" ? "\n- This frame was imported from Figma. Preserve its original design integrity while making the requested changes." : ""}` : ""}`,
     prompt: `User prompt:
 ${args.input.prompt}
 
@@ -2378,14 +2688,18 @@ ${formatSelectedFrameContext(args.input.selectedFrameContext)}
 Style context:
 ${JSON.stringify(args.styleContext, null, 2)}
 
-Existing frame source (for edit runs, patch/replace with improved version):
-${args.previousSourceCode.slice(0, 8500)}
+${args.designSystemMarkdown ? `Full design system specification (DESIGN.md) — follow this closely for colors, typography, component styling, layout, spacing, imagery, and do's/don'ts:
+${args.designSystemMarkdown.slice(0, 6000)}` : ""}
+
+${args.imageContext ? `\n${args.imageContext}\n` : ""}
+Existing frame source (for edit runs, copy unchanged code verbatim and only patch the requested changes):
+${args.input.editing ? args.previousSourceCode : args.previousSourceCode.slice(0, 8500)}
 
 Existing frame css:
-${(args.previousCssCode ?? "").slice(0, 3500)}
+${args.input.editing ? (args.previousCssCode ?? "") : (args.previousCssCode ?? "").slice(0, 3500)}
 
 Existing frame html:
-${(args.previousExportHtml ?? "").slice(0, 3500)}`
+${args.input.editing ? (args.previousExportHtml ?? "") : (args.previousExportHtml ?? "").slice(0, 3500)}`
   });
 
   const parsed = asJsonObject<Record<string, unknown>>(completion.content, {});
@@ -2393,19 +2707,6 @@ ${(args.previousExportHtml ?? "").slice(0, 3500)}`
 
   if (!candidate) {
     throw new Error("Model response was missing required frame artifact fields (frameName/sourceCode/cssCode/exportHtml).");
-  }
-
-  if (isIphone) {
-    const withSafeAreaCss = candidate.cssCode.includes("safe-area-inset")
-      ? candidate.cssCode
-      : `${candidate.cssCode}
-
-.tw-screen {
-  padding-top: calc(20px + env(safe-area-inset-top));
-  padding-bottom: calc(18px + env(safe-area-inset-bottom));
-}
-`;
-    candidate.cssCode = withSafeAreaCss;
   }
 
   return {
@@ -2441,7 +2742,7 @@ function repairArtifacts(input: FrameArtifacts): FrameArtifacts {
   };
 }
 
-function applyDiffRepair(input: FrameArtifacts, editPrompt?: string): FrameArtifacts {
+function applyDiffRepair(input: FrameArtifacts, editPrompt?: string, previousSourceCode?: string): FrameArtifacts {
   if (!editPrompt) {
     return input;
   }
@@ -2459,6 +2760,30 @@ function applyDiffRepair(input: FrameArtifacts, editPrompt?: string): FrameArtif
   if (lowered.includes("minimal")) {
     exportHtml = exportHtml.replace(/<section class=\"tw-grid\">[\s\S]*?<\/section>/, "<section class=\"tw-grid\"></section>");
     sourceCode = sourceCode.replace(/<section className=\"tw-grid\">[\s\S]*?<\/section>/, "<section className=\"tw-grid\"></section>");
+  }
+
+  // Structural similarity check: if the generated code is too different from
+  // the previous version, this likely means the model regenerated from scratch
+  // rather than making targeted edits. Log this for observability.
+  if (previousSourceCode && previousSourceCode.length > 100) {
+    const prevLines = previousSourceCode.split("\n").map((l) => l.trim()).filter(Boolean);
+    const newLines = sourceCode.split("\n").map((l) => l.trim()).filter(Boolean);
+    const prevSet = new Set(prevLines);
+    let retained = 0;
+    for (const line of newLines) {
+      if (prevSet.has(line)) retained++;
+    }
+    const similarity = prevLines.length > 0 ? retained / prevLines.length : 1;
+    // If less than 25% of original lines are retained, the model likely
+    // over-generated. We annotate the frameName to flag it for debugging.
+    if (similarity < 0.25 && prevLines.length > 10) {
+      // Future: could trigger a re-merge pass here.
+      // For now, add metadata note for observability.
+      console.warn(
+        `[diff-repair] Low structural similarity (${Math.round(similarity * 100)}%) after edit. ` +
+        `Model may have regenerated instead of patching. Previous: ${prevLines.length} lines, retained: ${retained}.`
+      );
+    }
   }
 
   return { ...input, cssCode, exportHtml, sourceCode };
@@ -2692,7 +3017,7 @@ export async function createReferenceStarterFrames(input: {
   }
 
   const baseCount = bundle.frames.length;
-  const preferredDevice: DevicePreset = bundle.project.settings.deviceDefault === "iphone" ? "iphone" : "desktop";
+  const preferredDevice: DevicePreset = isMobilePreset(bundle.project.settings.deviceDefault) ? bundle.project.settings.deviceDefault : "desktop";
   const preferredMode: DesignMode = bundle.project.settings.modeDefault === "wireframe" ? "wireframe" : "high-fidelity";
   const screenSize = computeFrameSize(preferredDevice);
   const screenPosition = computeNextFramePosition(bundle.frames, screenSize);
@@ -2854,7 +3179,7 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
       model: input.model,
       variationCount,
       designSystemMode: input.designSystemMode ?? "strict",
-      surfaceTarget: input.surfaceTarget ?? (input.devicePreset === "iphone" ? "mobile" : "web"),
+      surfaceTarget: input.surfaceTarget ?? (isMobilePreset(input.devicePreset) ? "mobile" : "web"),
       selectedFrameContext: input.selectedFrameContext ?? null
     }
   });
@@ -3036,44 +3361,82 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
       const previousExportHtml = previousVersion?.exportHtml ?? "";
 
       await setPassStatus(input.runId, passStatusMap, "enhance", "running");
-      await emitAgentEvent(context, {
-        runId: input.runId,
-        stage: "enhance",
-        status: "info",
-        kind: "summary",
-        agent: "orchestrator",
-        message: "I’m refining your prompt into a concrete brief with goals and constraints.",
-        payload: {
-          step: "enhance-brief"
-        }
-      });
-      const enhanced = await enhancePrompt(input, styleContext);
+
+      // For trivial edits, skip the LLM enhance+plan and use fast fallbacks
+      const editComplexity = input.editing ? classifyEditComplexity(input.prompt) : null;
+      let enhanced: EnhanceResult;
+      let plan: PlanResult;
+
+      if (editComplexity === "trivial") {
+        enhanced = {
+          title: "Edit Existing Screen",
+          intent: input.prompt,
+          audience: "Design team",
+          uxGoals: ["Apply only the requested changes", "Preserve existing layout and styling"],
+          constraints: [
+            `Device target: ${input.devicePreset}`,
+            `Design mode: ${input.mode}`,
+            "EDIT MODE: Minimal targeted change only."
+          ]
+        };
+        plan = {
+          frameName: frame?.name ?? "Edited Screen",
+          subtitle: "Trivial edit — single targeted change.",
+          sections: [{ title: "CHANGE", description: input.prompt }, { title: "KEEP AS-IS", description: "Everything else." }],
+          keyActions: []
+        };
+
+        await emitAgentEvent(context, {
+          runId: input.runId,
+          stage: "enhance",
+          status: "info",
+          kind: "summary",
+          agent: "orchestrator",
+          message: "Trivial edit detected — skipping planning, going straight to code.",
+          payload: { step: "enhance-brief", editComplexity: "trivial" }
+        });
+      } else {
+        await emitAgentEvent(context, {
+          runId: input.runId,
+          stage: "enhance",
+          status: "info",
+          kind: "summary",
+          agent: "orchestrator",
+          message: "Refining prompt and mapping layout in a single pass for speed.",
+          payload: { step: "enhance-brief", editComplexity: editComplexity ?? "new" }
+        });
+
+        // Combined enhance+plan in a single LLM call for speed
+        ({ enhanced, plan } = await enhanceAndPlan(input, styleContext, previousSource));
+      }
+
       await setPassStatus(input.runId, passStatusMap, "enhance", "completed");
+      await updateRunPassOutputs(input.runId, "enhance", enhanced).catch(() => {});
       await appendChatMessage({
         projectId: input.projectId,
         runId: input.runId,
         role: "agent",
         content: `Enhanced brief: ${enhanced.title}`
       });
-
-      await setPassStatus(input.runId, passStatusMap, "plan", "running");
-      await emitAgentEvent(context, {
-        runId: input.runId,
-        stage: "plan",
-        status: "info",
-        kind: "summary",
-        agent: primaryDesigner,
-        message:
-          primaryDesigner === "app-designer"
-            ? "App designer is mapping mobile-first layout, hierarchy, and interaction flow."
-            : "Web designer is mapping layout structure, component hierarchy, and visual rhythm.",
-        payload: {
-          step: "layout-plan",
-          target: primaryDesigner
-        }
-      });
-      const plan = await createPlan(input, enhanced, styleContext);
       await setPassStatus(input.runId, passStatusMap, "plan", "completed");
+      await updateRunPassOutputs(input.runId, "plan", plan).catch(() => {});
+
+      // Select images for the planned sections (non-blocking; falls back to placeholders)
+      let imageContext = "";
+      if (!input.editing) {
+        try {
+          const slots = plan.sections
+            .filter((s) => s.title && s.description)
+            .slice(0, 4)
+            .map((s, i) => ({ slot: i === 0 ? "hero" : `section-${i}`, query: `${s.title} ${s.description}`.slice(0, 80) }));
+          if (slots.length > 0) {
+            const images = await selectImagesForPlan(slots);
+            imageContext = buildImageContextBlock(images);
+          }
+        } catch {
+          // Non-fatal: continue without images
+        }
+      }
 
       await setPassStatus(input.runId, passStatusMap, "generate", "running");
       let generation: GenerateArtifactsResult | null = null;
@@ -3092,6 +3455,12 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
 
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         attemptCount = attempt;
+
+        if (attempt > 1) {
+          const delay = backoffDelay(attempt);
+          await sleep(delay);
+        }
+
         await emitAgentEvent(context, {
           runId: input.runId,
           stage: "generate",
@@ -3116,22 +3485,41 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
                 attempt,
                 issues: retryIssues,
                 designSystemMode: input.designSystemMode ?? "strict",
-                surfaceTarget: input.surfaceTarget ?? (input.devicePreset === "iphone" ? "mobile" : "web")
+                surfaceTarget: input.surfaceTarget ?? (isMobilePreset(input.devicePreset) ? "mobile" : "web")
               })}`;
 
-        generation = await generateScreenArtifacts({
-          input: {
-            ...input,
-            prompt: attemptPrompt
-          },
-          styleContext,
-          enhanced,
-          plan,
-          iterationLabel: variationCount > 1 ? `V${variationIndex + 1}` : "",
-          previousSourceCode: previousSource,
-          previousCssCode: previousCss,
-          previousExportHtml
-        });
+        try {
+          generation = await generateScreenArtifacts({
+            input: {
+              ...input,
+              prompt: attemptPrompt
+            },
+            styleContext,
+            enhanced,
+            plan,
+            iterationLabel: variationCount > 1 ? `V${variationIndex + 1}` : "",
+            previousSourceCode: previousSource,
+            previousCssCode: previousCss,
+            previousExportHtml,
+            designSystemMarkdown: projectBundle.designSystem?.markdown,
+            imageContext
+          });
+        } catch (genError) {
+          const errorCode = classifyPipelineError(genError);
+          if (!isRetriableError(errorCode) || attempt >= 3) {
+            throw genError;
+          }
+          await emitAgentEvent(context, {
+            runId: input.runId,
+            stage: "generate",
+            status: "info",
+            kind: "action",
+            agent: "orchestrator",
+            message: `Generation failed (${errorCode}) on attempt ${attempt}. Will retry with backoff.`,
+            payload: { step: "transient-error", attempt, errorCode }
+          });
+          continue;
+        }
 
         validation = validateArtifactsForDevice(generation.artifacts, {
           devicePreset: input.devicePreset,
@@ -3187,7 +3575,7 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
             mobileQualityChecks: validation.checks,
             designSystemChecks: designSystemValidation.checks,
             designSystemMode: input.designSystemMode ?? "strict",
-            surfaceTarget: input.surfaceTarget ?? (input.devicePreset === "iphone" ? "mobile" : "web"),
+            surfaceTarget: input.surfaceTarget ?? (isMobilePreset(input.devicePreset) ? "mobile" : "web"),
             selectedFrameContext: input.selectedFrameContext ?? null
           }
         });
@@ -3208,8 +3596,6 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
           attempt: attemptCount
         }
       });
-
-      await sleep(260);
 
       await setPassStatus(input.runId, passStatusMap, "repair", "running");
       await emitAgentEvent(context, {
@@ -3274,8 +3660,6 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
         }
       });
 
-      await sleep(220);
-
       await setPassStatus(input.runId, passStatusMap, "diff-repair", "running");
       await emitAgentEvent(context, {
         runId: input.runId,
@@ -3288,7 +3672,7 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
           step: "diff-repair-pass"
         }
       });
-      const diffRepaired = applyDiffRepair(strictAdjusted, input.editing ? input.prompt : undefined);
+      const diffRepaired = applyDiffRepair(strictAdjusted, input.editing ? input.prompt : undefined, input.editing ? previousSource : undefined);
       const versionDiffRepair = await persistVersion({
         frameId: frame.id,
         previousSourceCode: versionRepair.sourceCode,
@@ -3345,6 +3729,16 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
       finished: true
     });
 
+    const errorCode = classifyPipelineError(error);
+
+    // Fetch whatever pass outputs were saved before the failure
+    let savedPassOutputs: Record<string, unknown> = {};
+    try {
+      savedPassOutputs = await getRunPassOutputs(input.runId);
+    } catch {
+      // Non-fatal
+    }
+
     await emitAgentEvent(context, {
       runId: input.runId,
       stage: "system",
@@ -3356,7 +3750,9 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
         step: "run-failed",
         error: error instanceof Error ? error.message : String(error),
         statusDetail: error instanceof Error ? error.message : String(error),
-        nextStep: "Check provider, model, key, and prompt constraints before retrying."
+        nextStep: "Check provider, model, key, and prompt constraints before retrying.",
+        errorCode,
+        passOutputs: savedPassOutputs
       }
     });
   }

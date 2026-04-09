@@ -6,6 +6,7 @@ import type {
   ReferenceStyleContext,
   StyleProfile
 } from "@designer/shared";
+import { buildGoogleFontsLink } from "@designer/shared";
 import { buildStyleProfileFromStyleContext } from "./designSystemProfile.js";
 import { buildDesignSystemVisualBoard } from "./designSystemVisualBoard.js";
 
@@ -149,6 +150,21 @@ function renderBlockHtml(block: DesignSystemVisualBlock) {
       .join("")}</div>`;
   }
 
+  if (block.kind === "dos-donts") {
+    const isDo = block.title === "Do";
+    const cls = isDo ? "ds-do" : "ds-dont";
+    const prefix = isDo ? "✓" : "✗";
+    return `<div class="ds-dos-donts-list ${cls}"><h3 class="ds-dos-donts-label">${escapeHtml(block.title ?? (isDo ? "Do" : "Don't"))}</h3><ul>${block.items
+      .map((item) => `<li><span class="ds-dos-donts-icon">${prefix}</span>${escapeHtml(item.label)}</li>`)
+      .join("")}</ul></div>`;
+  }
+
+  if (block.kind === "prose") {
+    return `<div class="ds-prose">${block.items
+      .map((item) => `<p>${escapeHtml(item.label)}</p>`)
+      .join("")}</div>`;
+  }
+
   return renderRulesHtml(block.items);
 }
 
@@ -220,6 +236,21 @@ function renderBlockJsx(block: DesignSystemVisualBlock) {
       .join("\n")}</div>`;
   }
 
+  if (block.kind === "dos-donts") {
+    const isDo = block.title === "Do";
+    const cls = isDo ? "ds-do" : "ds-dont";
+    const prefix = isDo ? "✓" : "✗";
+    return `<div className=${JSON.stringify(`ds-dos-donts-list ${cls}`)}><h3 className="ds-dos-donts-label">${JSON.stringify(block.title ?? (isDo ? "Do" : "Don't"))}</h3><ul>${block.items
+      .map((item) => `<li><span className="ds-dos-donts-icon">${prefix}</span>${item.label}</li>`)
+      .join("\n")}</ul></div>`;
+  }
+
+  if (block.kind === "prose") {
+    return `<div className="ds-prose">${block.items
+      .map((item) => `<p>${item.label}</p>`)
+      .join("\n")}</div>`;
+  }
+
   return `<div className="ds-rule-grid">${block.items
     .map((item) => `<article className="ds-rule-chip"><span>${item.label}</span>${item.value ? `<b>${item.value}</b>` : ""}</article>`)
     .join("\n")}</div>`;
@@ -281,8 +312,10 @@ export function buildDesignSystemComponentsArtifacts(args: BuildDesignSystemArti
   const surface = styleProfile.tokens.colors.find((token) => token.name.toLowerCase().includes("surface"))?.hex ?? "#f3f4f6";
   const text = styleProfile.tokens.colors.find((token) => token.name.toLowerCase().includes("text"))?.hex ?? "#1f2430";
   const radius = Math.max(8, styleProfile.tokens.radiusScale[0] ?? 12);
+  const googleFontsTag = buildGoogleFontsLink([typography.headlineFont, typography.bodyFont, typography.labelFont].filter(Boolean));
 
   const exportHtml = `
+    ${googleFontsTag}
     <div class="ds-kit">
       <header class="ds-header">
         <p class="ds-kicker">${escapeHtml(sourceLabel)} • ${escapeHtml(args.scope.toUpperCase())}</p>
@@ -555,6 +588,69 @@ export function buildDesignSystemComponentsArtifacts(args: BuildDesignSystemArti
       font-size: 11px;
       font-weight: 700;
       color: color-mix(in srgb, var(--ds-text) 80%, white);
+    }
+
+    .ds-dos-donts-list {
+      display: grid;
+      gap: 4px;
+    }
+
+    .ds-dos-donts-label {
+      margin: 0;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .ds-dos-donts-list.ds-do .ds-dos-donts-label {
+      color: #1a7a3a;
+    }
+
+    .ds-dos-donts-list.ds-dont .ds-dos-donts-label {
+      color: #b43a3a;
+    }
+
+    .ds-dos-donts-list ul {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      display: grid;
+      gap: 3px;
+    }
+
+    .ds-dos-donts-list li {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      font-size: 10px;
+      line-height: 1.4;
+      color: color-mix(in srgb, var(--ds-text) 80%, white);
+    }
+
+    .ds-dos-donts-icon {
+      flex-shrink: 0;
+      font-weight: 700;
+    }
+
+    .ds-do .ds-dos-donts-icon {
+      color: #1a7a3a;
+    }
+
+    .ds-dont .ds-dos-donts-icon {
+      color: #b43a3a;
+    }
+
+    .ds-prose {
+      padding: 2px 0;
+    }
+
+    .ds-prose p {
+      margin: 0;
+      font-size: 11px;
+      line-height: 1.5;
+      color: color-mix(in srgb, var(--ds-text) 72%, white);
+      font-style: italic;
     }
   `.trim();
 

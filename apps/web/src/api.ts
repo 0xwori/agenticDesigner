@@ -322,6 +322,12 @@ export function createManualFrame(
   });
 }
 
+export function deleteFrame(apiBaseUrl: string, frameId: string) {
+  return request<{ ok: boolean }>(apiBaseUrl, `/frames/${encodeURIComponent(frameId)}`, {
+    method: "DELETE"
+  });
+}
+
 export function updateFrameLayout(
   apiBaseUrl: string,
   frameId: string,
@@ -364,22 +370,64 @@ export function openRunStream(
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.pathname = `/runs/${encodeURIComponent(runId)}/stream`;
   url.search = "";
+  const wsUrl = url.toString();
 
-  const socket = new WebSocket(url.toString());
-  socket.onmessage = (event) => {
-    try {
-      const parsed = JSON.parse(event.data) as PipelineEvent;
-      handlers.onEvent(parsed);
-    } catch {
-      // ignore malformed stream payload
+  const seenEventIds = new Set<number>();
+  let reconnectAttempt = 0;
+  const MAX_RECONNECT = 5;
+  let disposed = false;
+  let activeSocket: WebSocket | null = null;
+
+  function connect() {
+    const socket = new WebSocket(wsUrl);
+    activeSocket = socket;
+
+    socket.onmessage = (event) => {
+      try {
+        const parsed = JSON.parse(event.data) as PipelineEvent;
+        // Deduplicate events on reconnect (server replays backlog)
+        if (typeof parsed.id === "number") {
+          if (seenEventIds.has(parsed.id)) return;
+          seenEventIds.add(parsed.id);
+        }
+        handlers.onEvent(parsed);
+      } catch {
+        // ignore malformed stream payload
+      }
+    };
+
+    socket.onerror = (event) => {
+      // Only surface errors to callers if we've exhausted reconnect attempts
+      if (reconnectAttempt >= MAX_RECONNECT || disposed) {
+        handlers.onError?.(event);
+      }
+    };
+
+    socket.onclose = () => {
+      if (disposed) {
+        handlers.onClose?.();
+        return;
+      }
+      if (reconnectAttempt < MAX_RECONNECT) {
+        reconnectAttempt += 1;
+        const delay = Math.min(1000 * Math.pow(2, reconnectAttempt - 1), 16_000);
+        setTimeout(connect, delay);
+      } else {
+        handlers.onClose?.();
+      }
+    };
+  }
+
+  connect();
+
+  // Return a proxy object so callers can close the stream
+  return {
+    close() {
+      disposed = true;
+      activeSocket?.close();
+    },
+    get readyState() {
+      return activeSocket?.readyState ?? WebSocket.CLOSED;
     }
   };
-  socket.onerror = (event) => {
-    handlers.onError?.(event);
-  };
-  socket.onclose = () => {
-    handlers.onClose?.();
-  };
-
-  return socket;
 }

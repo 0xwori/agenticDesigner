@@ -23,8 +23,13 @@ export function parseOptionalProvider(value: unknown): ProviderId | undefined {
   return undefined;
 }
 
+const VALID_DEVICE_PRESETS = new Set<string>(["desktop", "iphone", "iphone-15", "iphone-15-pro", "iphone-15-pro-max"]);
+
 export function parseDevicePreset(value: unknown): DevicePreset {
-  return value === "iphone" ? "iphone" : "desktop";
+  if (typeof value === "string" && VALID_DEVICE_PRESETS.has(value)) {
+    return value as DevicePreset;
+  }
+  return "desktop";
 }
 
 export function parseMode(value: unknown): DesignMode {
@@ -130,7 +135,7 @@ export function parseSelectedFrameContext(value: unknown): SelectedFrameContext 
   if (
     typeof record.frameId !== "string" ||
     typeof record.name !== "string" ||
-    (record.devicePreset !== "desktop" && record.devicePreset !== "iphone") ||
+    !VALID_DEVICE_PRESETS.has(record.devicePreset as string) ||
     (record.mode !== "wireframe" && record.mode !== "high-fidelity") ||
     typeof record.size !== "object" ||
     record.size === null
@@ -146,7 +151,7 @@ export function parseSelectedFrameContext(value: unknown): SelectedFrameContext 
   return {
     frameId: record.frameId,
     name: record.name,
-    devicePreset: record.devicePreset,
+    devicePreset: record.devicePreset as DevicePreset,
     mode: record.mode,
     size: {
       width: size.width,

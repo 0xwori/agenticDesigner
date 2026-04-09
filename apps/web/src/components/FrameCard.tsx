@@ -3,6 +3,7 @@ import type { CaptureLogEntry } from "../lib/figmaCapture";
 import type { CopyState } from "../types/ui";
 import type { FrameVersion, FrameWithVersions } from "@designer/shared";
 import type { FrameSourceMeta } from "../lib/frameLinking";
+import { Palette, RotateCcw } from "lucide-react";
 
 type FrameCardProps = {
   frame: FrameWithVersions;
@@ -13,7 +14,7 @@ type FrameCardProps = {
     logs: CaptureLogEntry[];
   };
   expandedHistoryFrameId: string | null;
-  buildPreviewDocument: (frameId: string, version?: FrameVersion) => string;
+  buildPreviewDocument: (frameId: string, version?: FrameVersion, isBuilding?: boolean) => string;
   beginDrag: (event: PointerEvent, frameId: string) => void;
   beginResize: (event: PointerEvent, frameId: string) => void;
   selectFrame: (frameId: string) => Promise<void>;
@@ -23,6 +24,11 @@ type FrameCardProps = {
   allowFrameInteraction: boolean;
   openProjectDesignSystem: () => void;
   setExpandedHistoryFrameId: Dispatch<SetStateAction<string | null>>;
+  toggleFrameHeight: (frameId: string) => void;
+  hasDesignSystem: boolean;
+  onOpenBrandPicker?: () => void;
+  onRegenerate?: (frameId: string) => void;
+  framePrompt?: string;
 };
 
 export function FrameCard(props: FrameCardProps) {
@@ -41,12 +47,20 @@ export function FrameCard(props: FrameCardProps) {
     canResyncReference,
     allowFrameInteraction,
     openProjectDesignSystem,
-    setExpandedHistoryFrameId
+    setExpandedHistoryFrameId,
+    toggleFrameHeight,
+    hasDesignSystem,
+    onOpenBrandPicker,
+    onRegenerate,
+    framePrompt
   } = props;
+
+  const isBuilding = frame.status === "building";
 
   const className = [
     "frame-card",
     frame.selected ? "is-selected" : "",
+    isBuilding ? "frame-card--building" : "",
     sourceMeta?.sourceType === "figma-reference" ? "frame-card--special-figma" : "",
     sourceMeta?.sourceType === "image-reference" ? "frame-card--special-image" : "",
     sourceMeta?.sourceRole === "reference-screen" ? "frame-card--special-reference-screen" : "",
@@ -73,7 +87,10 @@ export function FrameCard(props: FrameCardProps) {
         void selectFrame(frame.id);
       }}
     >
-      <header className="frame-card__header" onPointerDown={(event) => beginDrag(event, frame.id)}>
+      <div className="frame-card__title-label" onPointerDown={(event) => beginDrag(event, frame.id)}>
+        {frame.name}
+      </div>
+      <header className="frame-card__header" onPointerDown={(event) => beginDrag(event, frame.id)} onDoubleClick={() => toggleFrameHeight(frame.id)}>
         <div>
           <h3>{frame.name}</h3>
           <p>
@@ -84,6 +101,15 @@ export function FrameCard(props: FrameCardProps) {
           {canResyncReference ? <button onClick={() => void resyncFrameReference(frame.id)}>Resync</button> : null}
           {sourceMeta?.sourceRole === "design-system" ? (
             <button onClick={openProjectDesignSystem}>Open DS</button>
+          ) : null}
+          {onRegenerate && framePrompt && !isBuilding ? (
+            <button
+              className="frame-card__action-regenerate"
+              onClick={() => onRegenerate(frame.id)}
+              title={`Regenerate: ${framePrompt}`}
+            >
+              <RotateCcw size={11} /> Regenerate
+            </button>
           ) : null}
           <button onClick={() => void selectFrame(frame.id)}>Select</button>
           <button onClick={() => setExpandedHistoryFrameId((current) => (current === frame.id ? null : frame.id))}>Versions</button>
@@ -100,17 +126,33 @@ export function FrameCard(props: FrameCardProps) {
       </header>
 
       <div className="frame-card__preview">
-        <iframe
-          srcDoc={buildPreviewDocument(frame.id, version)}
-          title={frame.name}
-          sandbox="allow-scripts"
-          style={{ pointerEvents: allowFrameInteraction ? "auto" : "none" }}
-        />
-        {!allowFrameInteraction ? (
-          <div className="frame-card__preview-shield">
-            Hold <kbd>Option</kbd> to interact with this preview
+        {sourceMeta?.sourceRole === "design-system" && !hasDesignSystem ? (
+          <div className="frame-card__ds-placeholder">
+            <Palette size={20} />
+            <h4>No design system selected</h4>
+            <p>Choose a brand template to see the visual board here.</p>
+            {onOpenBrandPicker ? (
+              <button className="frame-card__ds-placeholder-btn" onClick={onOpenBrandPicker}>
+                Choose Design System
+              </button>
+            ) : null}
           </div>
-        ) : null}
+        ) : (
+          <>
+            <iframe
+              key={version?.id ?? frame.id}
+              srcDoc={buildPreviewDocument(frame.id, version, isBuilding)}
+              title={frame.name}
+              sandbox="allow-scripts"
+              style={{ pointerEvents: allowFrameInteraction ? "auto" : "none" }}
+            />
+            {!allowFrameInteraction ? (
+              <div className="frame-card__preview-shield">
+                Hold <kbd>Option</kbd> to interact with this preview
+              </div>
+            ) : null}
+          </>
+        )}
       </div>
 
       {expandedHistoryFrameId === frame.id ? (

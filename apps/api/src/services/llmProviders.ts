@@ -1,4 +1,5 @@
 import type { ComposerAttachment, ProviderId } from "@designer/shared";
+import { providerCircuit } from "../lib/circuitBreaker.js";
 
 type CompletionInput = {
   provider: ProviderId;
@@ -9,6 +10,7 @@ type CompletionInput = {
   jsonMode?: boolean;
   attachments?: ComposerAttachment[];
   allowMock?: boolean;
+  timeoutMs?: number;
 };
 
 type CompletionResult = {
@@ -32,7 +34,7 @@ class OpenAIHttpError extends Error {
   }
 }
 
-const OPENAI_MODEL_FALLBACKS = ["gpt-5.4-mini", "gpt-4.1-mini", "gpt-4o-mini"] as const;
+const OPENAI_MODEL_FALLBACKS = ["gpt-5.4-mini", "gpt-5.4-nano"] as const;
 
 function resolveOpenAIModelCandidates(requestedModel: string) {
   const requested = requestedModel.trim();
@@ -136,7 +138,7 @@ async function callOpenAIModel(input: CompletionInput, model: string) {
         { role: "user", content: userContent }
       ]
     })
-  });
+  }, input.timeoutMs);
 
   if (!response.ok) {
     const payload = (await response.json().catch(() => null)) as
@@ -235,10 +237,12 @@ async function callAnthropic(input: CompletionInput) {
         }
       ]
     })
-  });
+  }, input.timeoutMs);
 
   if (!response.ok) {
-    throw new Error(`Anthropic request failed (${response.status})`);
+    const err = new Error(`Anthropic request failed (${response.status})`);
+    (err as Error & { status: number }).status = response.status;
+    throw err;
   }
 
   const data = (await response.json()) as {
@@ -276,10 +280,12 @@ async function callGoogle(input: CompletionInput) {
         temperature: 0.4
       }
     })
-  });
+  }, input.timeoutMs);
 
   if (!response.ok) {
-    throw new Error(`Google request failed (${response.status})`);
+    const err = new Error(`Google request failed (${response.status})`);
+    (err as Error & { status: number }).status = response.status;
+    throw err;
   }
 
   const data = (await response.json()) as {
@@ -319,36 +325,62 @@ export async function requestCompletion(input: CompletionInput): Promise<Complet
     };
   }
 
-  try {
-    if (input.provider === "openai") {
-      const result = await callOpenAI(input);
-      return {
-        content: result.content,
-        usedProvider: "openai",
-        usedModel: result.usedModel,
-        fallbackModelFrom: result.fallbackModelFrom
-      };
+  if (providerCircuit.isOpen(input.provider)) {
+    const circuitErr = new Error(
+      `Provider "${input.provider}" circuit breaker is open — too many consecutive failures. Wait ~60 s and retry.`
+    );
+    (circuitErr as Error & { status: number }).status = 503;
+    if (!allowMock || hasImageAttachments) {
+      throw circuitErr;
     }
+    return {
+      content: mockResponse(input),
+      usedProvider: "mock",
+      usedModel: "mock"
+    };
+  }
 
-    if (input.provider === "anthropic") {
-      return {
+  try {
+    let result: CompletionResult;
+
+    if (input.provider === "openai") {
+      const openAIResult = await callOpenAI(input);
+      result = {
+        content: openAIResult.content,
+        usedProvider: "openai",
+        usedModel: openAIResult.usedModel,
+        fallbackModelFrom: openAIResult.fallbackModelFrom
+      };
+    } else if (input.provider === "anthropic") {
+      result = {
         content: await callAnthropic(input),
         usedProvider: "anthropic",
         usedModel: input.model
       };
+    } else {
+      result = {
+        content: await callGoogle(input),
+        usedProvider: "google",
+        usedModel: input.model
+      };
     }
 
-    return {
-      content: await callGoogle(input),
-      usedProvider: "google",
-      usedModel: input.model
-    };
+    providerCircuit.recordSuccess(input.provider);
+    return result;
   } catch (error) {
+    providerCircuit.recordFailure(input.provider);
+
     if (!allowMock || hasImageAttachments) {
       const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(
+      const wrapped = new Error(
         `Provider request failed (${input.provider}/${input.model}). ${detail}. Verify key/model/provider configuration and retry.`
       );
+      // Preserve HTTP status for downstream classifyPipelineError()
+      const status = (error as { status?: number }).status;
+      if (status) {
+        (wrapped as Error & { status: number }).status = status;
+      }
+      throw wrapped;
     }
     return {
       content: mockResponse(input),

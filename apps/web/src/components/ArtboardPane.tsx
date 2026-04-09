@@ -1,10 +1,12 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import type { CSSProperties, Dispatch, PointerEvent, RefObject, SetStateAction } from "react";
 import type { FrameVersion, FrameWithVersions } from "@designer/shared";
 import type { CaptureLogEntry } from "../lib/figmaCapture";
 import type { FramePairLink, FrameSourceMeta } from "../lib/frameLinking";
 import type { CopyState } from "../types/ui";
 import { FrameCard } from "./FrameCard";
+import { FigmaImportPopover } from "./FigmaImportPopover";
+import { Palette, Link2, Wand2 } from "lucide-react";
 
 type PendingCanvasCard = {
   id: string;
@@ -29,7 +31,7 @@ type ArtboardPaneProps = {
   expandedHistoryFrameId: string | null;
   setExpandedHistoryFrameId: Dispatch<SetStateAction<string | null>>;
   zoomBy: (factor: number) => void;
-  buildPreviewDocument: (frameId: string, version?: FrameVersion) => string;
+  buildPreviewDocument: (frameId: string, version?: FrameVersion, isBuilding?: boolean) => string;
   beginDrag: (event: PointerEvent, frameId: string) => void;
   beginResize: (event: PointerEvent, frameId: string) => void;
   selectFrame: (frameId: string) => Promise<void>;
@@ -39,6 +41,12 @@ type ArtboardPaneProps = {
   openProjectDesignSystem: () => void;
   allowFrameInteraction: boolean;
   pendingCanvasCards: PendingCanvasCard[];
+  onImportFigmaScreen?: (figmaUrl: string) => Promise<void>;
+  hasDesignSystem?: boolean;
+  onOpenBrandPicker?: () => void;
+  toggleFrameHeight: (frameId: string) => void;
+  onRegenerate?: (frameId: string) => void;
+  framePrompts?: Map<string, string>;
 };
 
 export function ArtboardPane(props: ArtboardPaneProps) {
@@ -64,9 +72,16 @@ export function ArtboardPane(props: ArtboardPaneProps) {
     resyncFrameReference,
     openProjectDesignSystem,
     allowFrameInteraction,
-    pendingCanvasCards
+    pendingCanvasCards,
+    onImportFigmaScreen,
+    hasDesignSystem,
+    onOpenBrandPicker,
+    toggleFrameHeight,
+    onRegenerate,
+    framePrompts
   } = props;
 
+  const [showImportPopover, setShowImportPopover] = useState(false);
   const backgroundPointerRef = useRef<{
     pointerId: number;
     startX: number;
@@ -78,12 +93,12 @@ export function ArtboardPane(props: ArtboardPaneProps) {
   return (
     <main className="canvas-pane">
       <div
-        className={`artboard-viewport ${interactionType === "pan" ? "is-panning" : ""}`}
+        className={`artboard-viewport ${interactionType === "pan" ? "is-panning" : interactionType === "drag" ? "is-dragging" : ""}`}
         ref={viewportRef}
         style={artboardBackgroundStyle}
         onPointerDown={(event) => {
           const target = event.target as HTMLElement;
-          if (target.closest(".frame-card, .canvas-floating-controls")) {
+          if (target.closest(".frame-card, .canvas-floating-controls, .artboard-empty-state")) {
             backgroundPointerRef.current = null;
             return;
           }
@@ -126,7 +141,55 @@ export function ArtboardPane(props: ArtboardPaneProps) {
           <button onClick={() => zoomBy(1.12)} aria-label="Zoom in">
             +
           </button>
+          {onImportFigmaScreen ? (
+            <button onClick={() => setShowImportPopover(true)} aria-label="Import Figma screen" className="canvas-ds-btn">
+              <Link2 size={13} />
+            </button>
+          ) : null}
+          {onOpenBrandPicker ? (
+            <button onClick={onOpenBrandPicker} aria-label="Brand templates" className="canvas-ds-btn">
+              <Palette size={13} />
+            </button>
+          ) : null}
         </div>
+
+        {/* Figma import popover */}
+        {showImportPopover && onImportFigmaScreen ? (
+          <FigmaImportPopover
+            onImport={async (url) => {
+              await onImportFigmaScreen(url);
+              setShowImportPopover(false);
+            }}
+            onClose={() => setShowImportPopover(false)}
+          />
+        ) : null}
+
+        {/* Empty state */}
+        {frames.length === 0 && pendingCanvasCards.length === 0 && !showImportPopover ? (
+          <div className="artboard-empty-state">
+            {!hasDesignSystem ? (
+              <>
+                <div className="artboard-empty-state__ds-hint">
+                  <Wand2 size={20} />
+                  <h3>No design system selected</h3>
+                  <p>Choose a brand template or create a custom design system to get started.</p>
+                  {onOpenBrandPicker ? (
+                    <button className="artboard-empty-state__btn artboard-empty-state__btn--primary" onClick={onOpenBrandPicker}>
+                      <Palette size={13} /> Choose Design System
+                    </button>
+                  ) : null}
+                </div>
+                <div className="artboard-empty-state__divider">or</div>
+              </>
+            ) : null}
+            <p>Start by typing a prompt{hasDesignSystem ? "" : " after selecting a design system"}, or import an existing screen.</p>
+            {onImportFigmaScreen ? (
+              <button className="artboard-empty-state__btn" onClick={() => setShowImportPopover(true)}>
+                <Link2 size={13} /> Import from Figma
+              </button>
+            ) : null}
+          </div>
+        ) : null}
 
         <div className="artboard-world" style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}>
           <div className="artboard-surface">
@@ -188,6 +251,11 @@ export function ArtboardPane(props: ArtboardPaneProps) {
                   canResyncReference={canResyncReference}
                   openProjectDesignSystem={openProjectDesignSystem}
                   allowFrameInteraction={allowFrameInteraction}
+                  toggleFrameHeight={toggleFrameHeight}
+                  hasDesignSystem={hasDesignSystem ?? false}
+                  onOpenBrandPicker={onOpenBrandPicker}
+                  onRegenerate={onRegenerate}
+                  framePrompt={framePrompts?.get(frame.id)}
                 />
               );
             })}

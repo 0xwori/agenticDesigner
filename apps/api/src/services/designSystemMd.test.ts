@@ -49,6 +49,46 @@ Flat.
     expect(parsed.structuredTokens.colors).toEqual([]);
   });
 
+  it("parses colors from numbered section headings (brand templates)", () => {
+    const markdown = `# Design System Inspiration of Tesla
+
+## 1. Visual Theme & Atmosphere
+Minimal, cinematic, photography-first.
+
+## 2. Color Palette & Roles
+
+### Primary
+- **Electric Blue** (\`#3E6AE1\`): Primary CTA button background
+- **Pure White** (\`#FFFFFF\`): Dominant background for all surfaces
+
+### Secondary & Accent
+- **Promo Blue** (\`#3E6AE1\`): Promotional text over hero imagery
+
+### Neutrals & Text
+- **Carbon Dark** (\`#171A20\`): Primary heading and navigation text
+- **Graphite** (\`#393C41\`): Body text and secondary content
+
+## 3. Typography Rules
+- **Headline Font**: Universal Sans Display
+- **Body Font**: Universal Sans Text
+- **Label Font**: Universal Sans Text
+
+## 4. Component Stylings
+- Buttons: pill form, rounded.
+
+## 5. Do's and Don'ts
+- Do keep imagery full-bleed.
+- Don't introduce off-brand colors.
+`;
+
+    const parsed = parseDesignMarkdown(markdown, CONTEXT);
+    // Must find colors despite numbered headings like "## 2. Color Palette & Roles"
+    expect(parsed.structuredTokens.colors.length).toBeGreaterThanOrEqual(4);
+    const names = parsed.structuredTokens.colors.map((c) => c.name);
+    expect(names).toContain("Electric Blue");
+    expect(names).toContain("Carbon Dark");
+  });
+
   it("preserves family-specific recipe morphology from generated component lines", () => {
     const profileBundle = buildStyleProfileFromStyleContext({
       styleContext: CONTEXT,

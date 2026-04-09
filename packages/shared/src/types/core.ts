@@ -1,8 +1,12 @@
 export type ProviderId = "openai" | "anthropic" | "google";
 export type DesignMode = "wireframe" | "high-fidelity";
-export type DevicePreset = "desktop" | "iphone";
+export type DevicePreset = "desktop" | "iphone" | "iphone-15" | "iphone-15-pro" | "iphone-15-pro-max";
 export type DesignSystemMode = "strict" | "creative";
 export type SurfaceTarget = "web" | "mobile";
+
+export function isMobilePreset(device: DevicePreset): boolean {
+  return device !== "desktop";
+}
 
 export type RunStatus = "queued" | "running" | "completed" | "failed";
 export type PipelineStage = "system" | "enhance" | "plan" | "generate" | "repair" | "diff-repair";

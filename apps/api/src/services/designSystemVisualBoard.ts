@@ -5,6 +5,7 @@ import type {
   DesignSystemQualityReport,
   DesignSystemVisualBoard,
   DesignSystemVisualItem,
+  DesignSystemVisualSection,
   StyleProfile
 } from "@designer/shared";
 
@@ -15,7 +16,9 @@ const CORE_SECTION_IDS = [
   "spacing-layout",
   "shape-visual-rules",
   "core-components",
-  "navigation"
+  "navigation",
+  "dos-and-donts",
+  "imagery-atmosphere"
 ] as const;
 
 const OPTIONAL_CONFIDENCE_THRESHOLD = 0.62;
@@ -99,40 +102,55 @@ export function buildDesignSystemVisualBoard(input: {
     blocks: swatches.length > 0 ? [{ kind: "swatches", items: swatches }] : []
   });
 
-  const typeSamples: DesignSystemVisualItem[] = [
-    {
-      label: "Display",
-      value: "Display",
-      fontFamily: typography.headlineFont,
-      sizePx: 28,
-      weight: 700,
-      family: "typography"
-    },
-    {
-      label: "Heading",
-      value: "Heading",
-      fontFamily: typography.headlineFont,
-      sizePx: 22,
-      weight: 650,
-      family: "typography"
-    },
-    {
-      label: "Body",
-      value: "Body copy",
-      fontFamily: typography.bodyFont,
-      sizePx: 14,
-      weight: 500,
-      family: "typography"
-    },
-    {
-      label: "Label",
-      value: "Label",
-      fontFamily: typography.labelFont,
-      sizePx: 11,
-      weight: 700,
-      family: "typography"
-    }
-  ];
+  // Use real hierarchy from markdown if available, otherwise fall back to defaults
+  const typeSamples: DesignSystemVisualItem[] =
+    typography.hierarchy && typography.hierarchy.length > 0
+      ? typography.hierarchy.slice(0, 8).map((entry) => {
+          const isDisplay = /hero|display/i.test(entry.role);
+          const isHeading = /heading|title|product|promo/i.test(entry.role);
+          return {
+            label: entry.role,
+            value: `${entry.sizePx}px / ${entry.weight}`,
+            fontFamily: isDisplay || isHeading ? typography.headlineFont : typography.bodyFont,
+            sizePx: entry.sizePx,
+            weight: entry.weight,
+            family: "typography" as const
+          };
+        })
+      : [
+          {
+            label: "Display",
+            value: "Display",
+            fontFamily: typography.headlineFont,
+            sizePx: 28,
+            weight: 700,
+            family: "typography" as const
+          },
+          {
+            label: "Heading",
+            value: "Heading",
+            fontFamily: typography.headlineFont,
+            sizePx: 22,
+            weight: 650,
+            family: "typography" as const
+          },
+          {
+            label: "Body",
+            value: "Body copy",
+            fontFamily: typography.bodyFont,
+            sizePx: 14,
+            weight: 500,
+            family: "typography" as const
+          },
+          {
+            label: "Label",
+            value: "Label",
+            fontFamily: typography.labelFont,
+            sizePx: 11,
+            weight: 700,
+            family: "typography" as const
+          }
+        ];
   sections.push({
     id: "typography-system",
     label: "Typography System",
@@ -308,6 +326,42 @@ export function buildDesignSystemVisualBoard(input: {
           ]
         }
       ]
+    });
+  }
+
+  // Do's and Don'ts section
+  const dosItems: DesignSystemVisualItem[] = input.dos.slice(0, 6).map((line) => ({
+    label: line.replace(/^do\s+/i, "").replace(/\.$/, ""),
+    value: "do",
+    family: "brand" as const
+  }));
+  const dontsItems: DesignSystemVisualItem[] = input.donts.slice(0, 6).map((line) => ({
+    label: line.replace(/^don'?t\s+/i, "").replace(/\.$/, ""),
+    value: "dont",
+    family: "brand" as const
+  }));
+  const dosdontsBlocks = [];
+  if (dosItems.length > 0) dosdontsBlocks.push({ kind: "dos-donts" as const, title: "Do", items: dosItems });
+  if (dontsItems.length > 0) dosdontsBlocks.push({ kind: "dos-donts" as const, title: "Don't", items: dontsItems });
+  if (dosdontsBlocks.length > 0) {
+    sections.push({
+      id: "dos-and-donts",
+      label: "Do's & Don'ts",
+      required: true,
+      blocks: dosdontsBlocks
+    });
+  }
+
+  // Imagery & Atmosphere section (overview excerpt)
+  const overviewText = input.overview.trim();
+  if (overviewText.length > 0 && overviewText !== "A calm, modern interface with strong hierarchy, brand consistency, and clear interaction affordances.") {
+    // Extract key sentences (first 2-3 sentences as prose)
+    const sentences = overviewText.split(/(?<=[.!?])\s+/).slice(0, 3).join(" ");
+    sections.push({
+      id: "imagery-atmosphere",
+      label: "Imagery & Atmosphere",
+      required: true,
+      blocks: [{ kind: "prose" as const, items: [{ label: sentences, family: "brand" as const }] }]
     });
   }
 

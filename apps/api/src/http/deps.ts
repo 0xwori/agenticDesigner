@@ -4,6 +4,7 @@ import {
   createPipelineRun,
   createProject,
   createReferenceSource,
+  deleteFrame,
   getFrame,
   getFrameVersions,
   getFrameWithVersions,
@@ -64,6 +65,7 @@ export type ApiDeps = {
   createManualFrame: typeof createManualFrame;
   getFrameWithVersions: typeof getFrameWithVersions;
   updateFrameLayout: typeof updateFrameLayout;
+  deleteFrame: typeof deleteFrame;
   getFrame: typeof getFrame;
   getFrameVersions: typeof getFrameVersions;
   createPipelineRun: typeof createPipelineRun;
@@ -96,6 +98,7 @@ export const defaultApiDeps: ApiDeps = {
   createReferenceStarterFrames,
   syncProjectDesignSystemFrame,
   createManualFrame,
+  deleteFrame,
   getFrameWithVersions,
   updateFrameLayout,
   getFrame,

@@ -3,6 +3,7 @@ import type {
   DesignMdColorToken,
   DesignMdStructuredTokens,
   DesignMdTypographyToken,
+  DesignMdTypographyHierarchyEntry,
   DesignSystemQualityReport,
   ReferenceStyleContext,
   StyleProfile
@@ -14,7 +15,35 @@ import {
 } from "./designSystemProfile.js";
 import { buildDesignSystemVisualBoard } from "./designSystemVisualBoard.js";
 
-const SECTION_ORDER = ["overview", "colors", "typography", "elevation", "components", "do's and don'ts"] as const;
+const SECTION_ORDER = [
+  "visual theme & atmosphere", "color palette & roles", "typography rules",
+  "component stylings", "layout principles", "depth & elevation",
+  "do's and don'ts", "responsive behavior", "agent prompt guide",
+  // Legacy aliases for backward compat:
+  "overview", "colors", "typography", "elevation", "components",
+] as const;
+
+/**
+ * Map aliased heading names to canonical keys.
+ * This lets us parse both old-format ("## Colors") and new-format ("## Color Palette & Roles").
+ */
+const HEADING_ALIASES: Record<string, string> = {
+  overview: "visual theme & atmosphere",
+  colors: "color palette & roles",
+  "color palette & roles": "color palette & roles",
+  typography: "typography rules",
+  "typography rules": "typography rules",
+  elevation: "depth & elevation",
+  "depth & elevation": "depth & elevation",
+  components: "component stylings",
+  "component stylings": "component stylings",
+  "layout principles": "layout principles",
+  "responsive behavior": "responsive behavior",
+  "agent prompt guide": "agent prompt guide",
+  "visual theme & atmosphere": "visual theme & atmosphere",
+  "do's and don'ts": "do's and don'ts",
+  "dos and don'ts": "do's and don'ts",
+};
 
 const DEFAULT_OVERVIEW =
   "A calm, modern interface with strong hierarchy, brand consistency, and clear interaction affordances.";
@@ -51,7 +80,7 @@ const FALLBACK_STYLE_CONTEXT: ReferenceStyleContext = {
 };
 
 function normalizeHeading(input: string) {
-  return input.trim().toLowerCase();
+  return input.trim().toLowerCase().replace(/^\d+\.\s*/, "");
 }
 
 function buildSectionMap(markdown: string) {
@@ -64,11 +93,14 @@ function buildSectionMap(markdown: string) {
   for (let index = 0; index < matches.length; index += 1) {
     const current = matches[index];
     const next = matches[index + 1];
-    const heading = normalizeHeading(current[1] ?? "");
+    const rawHeading = normalizeHeading(current[1] ?? "");
+    const heading = HEADING_ALIASES[rawHeading] ?? rawHeading;
     const start = current.index! + current[0].length;
     const end = next?.index ?? markdown.length;
     const body = markdown.slice(start, end).trim();
-    sections.set(heading, body);
+    if (!sections.has(heading)) {
+      sections.set(heading, body);
+    }
   }
 
   return sections;
@@ -83,12 +115,150 @@ function extractBulletLines(sectionBody: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Parse a typography hierarchy table from a markdown section.
+ * Supports tables like:
+ *   | Role | Size | Weight | Line Height | ...
+ *   |------|------|--------|-------------|
+ *   | Hero Title | 40px (2.50rem) | 500 | 48px (1.20) | ...
+ */
+function parseTypographyHierarchy(sectionBody: string): DesignMdTypographyHierarchyEntry[] {
+  const lines = sectionBody.split("\n").map((l) => l.trim());
+  const entries: DesignMdTypographyHierarchyEntry[] = [];
+
+  // Find the table header row (must contain "Role" and "Size" or "Weight")
+  let headerIndex = -1;
+  let colMap: Record<string, number> = {};
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.startsWith("|")) continue;
+    const cells = line.split("|").map((c) => c.trim().toLowerCase()).filter(Boolean);
+    if (cells.includes("role") && (cells.includes("size") || cells.includes("weight"))) {
+      headerIndex = i;
+      for (let ci = 0; ci < cells.length; ci++) {
+        colMap[cells[ci]] = ci;
+      }
+      break;
+    }
+  }
+  if (headerIndex < 0) return entries;
+
+  // Skip separator row (|---|---|...)
+  const startRow = headerIndex + 2;
+  for (let i = startRow; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.startsWith("|")) break;
+    const cells = line.split("|").map((c) => c.trim()).filter(Boolean);
+    if (cells.length < 2) continue;
+
+    const role = cells[colMap["role"] ?? 0] ?? "";
+    if (!role || /^-+$/.test(role)) continue;
+
+    const sizeRaw = cells[colMap["size"] ?? 1] ?? "";
+    const sizeMatch = sizeRaw.match(/(\d+(?:\.\d+)?)\s*px/i);
+    const sizePx = sizeMatch ? parseFloat(sizeMatch[1]) : 14;
+
+    const weightRaw = cells[colMap["weight"] ?? 2] ?? "";
+    const weightMatch = weightRaw.match(/(\d{3})/);
+    const weight = weightMatch ? parseInt(weightMatch[1], 10) : 400;
+
+    const lhRaw = cells[colMap["line height"] ?? colMap["lineheight"] ?? -1] ?? "";
+    const lhMatch = lhRaw.match(/(\d+(?:\.\d+)?)\s*px/i);
+    const lineHeight = lhMatch ? parseFloat(lhMatch[1]) : undefined;
+
+    const lsRaw = cells[colMap["letter spacing"] ?? colMap["letterspacing"] ?? -1] ?? "";
+    const letterSpacing = lsRaw && lsRaw !== "—" ? lsRaw : undefined;
+
+    const notesRaw = cells[colMap["notes"] ?? -1] ?? "";
+    const notes = notesRaw && notesRaw !== "—" ? notesRaw : undefined;
+
+    const fontVariantRaw = cells[colMap["font"] ?? colMap["font variant"] ?? -1] ?? "";
+    const fontVariant = fontVariantRaw && fontVariantRaw !== "—" ? fontVariantRaw : undefined;
+
+    entries.push({
+      role,
+      sizePx,
+      weight,
+      ...(lineHeight !== undefined && { lineHeight }),
+      ...(letterSpacing !== undefined && { letterSpacing }),
+      ...(fontVariant !== undefined && { fontVariant }),
+      ...(notes !== undefined && { notes })
+    });
+  }
+  return entries;
+}
+
+/**
+ * Parse spacing and radius values from the layout section body.
+ */
+function parseLayoutTokens(sectionBody: string): { spacingScale: number[]; radiusScale: number[] } {
+  const spacingScale: number[] = [];
+  const radiusScale: number[] = [];
+
+  for (const rawLine of sectionBody.split("\n")) {
+    const line = rawLine.trim().toLowerCase();
+
+    // Spacing scale line: "- **Spacing scale**: 8px, 16px, 21.44px, 4px" or similar
+    if (line.includes("spacing") && line.includes("scale")) {
+      const values = [...line.matchAll(/(\d+(?:\.\d+)?)\s*px/gi)];
+      for (const m of values) {
+        const v = Math.round(parseFloat(m[1]));
+        if (v > 0 && v <= 128 && !spacingScale.includes(v)) spacingScale.push(v);
+      }
+    }
+
+    // Base unit line: "- **Base unit**: 8px"
+    if (line.includes("base unit") && spacingScale.length === 0) {
+      const match = line.match(/(\d+(?:\.\d+)?)\s*px/i);
+      if (match) {
+        const base = Math.round(parseFloat(match[1]));
+        if (base >= 2 && base <= 16) {
+          for (const mult of [0.5, 1, 1.5, 2, 3, 4, 6, 8]) {
+            const v = Math.round(base * mult);
+            if (v > 0 && v <= 128 && !spacingScale.includes(v)) spacingScale.push(v);
+          }
+        }
+      }
+    }
+
+    // Radius scale line: "- **Border-radius scale**: 2px (small), 8px (default), 12px (large), 999px (pill)"
+    if (line.includes("radius")) {
+      const values = [...line.matchAll(/(\d+(?:\.\d+)?)\s*px/gi)];
+      for (const m of values) {
+        const v = Math.round(parseFloat(m[1]));
+        if (v >= 0 && v <= 999 && !radiusScale.includes(v)) radiusScale.push(v);
+      }
+    }
+  }
+
+  spacingScale.sort((a, b) => a - b);
+  radiusScale.sort((a, b) => a - b);
+  return { spacingScale, radiusScale };
+}
+
 function firstColorByName(colors: DesignMdColorToken[], fallback: string, names: string[]) {
-  const token = colors.find((item) => {
+  // 1. Check name
+  const byName = colors.find((item) => {
     const lowered = item.name.toLowerCase();
     return names.some((name) => lowered.includes(name));
   });
-  return token?.hex ?? fallback;
+  if (byName) return byName.hex;
+
+  // 2. Check role description (e.g. role says "Primary brand color" → matches "primary")
+  const byRole = colors.find((item) => {
+    const lowered = item.role.toLowerCase();
+    return names.some((name) => lowered.includes(name));
+  });
+  if (byRole) return byRole.hex;
+
+  // 3. Check subsection tag (injected from ### headers during parsing)
+  const byTag = colors.find((item) => {
+    const tag = (item as DesignMdColorToken & { _subsection?: string })._subsection?.toLowerCase() ?? "";
+    return names.some((name) => tag.includes(name));
+  });
+  if (byTag) return byTag.hex;
+
+  return fallback;
 }
 
 function normalizeColorTokens(colors: DesignMdColorToken[], styleContext: ReferenceStyleContext): DesignMdColorToken[] {
@@ -111,11 +281,14 @@ function normalizeColorTokens(colors: DesignMdColorToken[], styleContext: Refere
       continue;
     }
     seen.add(key);
-    normalized.push({
+    const entry: DesignMdColorToken & { _subsection?: string } = {
       name: token.name.trim(),
       hex,
       role: token.role.trim()
-    });
+    };
+    const sub = (token as DesignMdColorToken & { _subsection?: string })._subsection;
+    if (sub) entry._subsection = sub;
+    normalized.push(entry);
   }
   return normalized;
 }
@@ -285,27 +458,53 @@ function generateMarkdownFromProfile(input: {
     input.elevation ??
     `Use ${input.styleProfile.tokens.shadows.join(", ")} elevation tokens with restrained border contrast.`;
 
-  return `## Overview
+  const spacingScale = input.styleProfile.tokens.spacingScale;
+  const spacingStr = spacingScale.length > 0
+    ? spacingScale.map((v: number) => `${v}px`).join(", ")
+    : "4, 8, 12, 16, 24, 32, 48, 64";
+  const radiusVal = input.styleProfile.componentRecipes?.[0]?.cornerRadius ?? 8;
+
+  return `## Visual Theme & Atmosphere
 ${input.overview}
 
-## Colors
-${input.colors.map((token) => `- **${token.name}** (${token.hex}): ${token.role}`).join("\n")}
+## Color Palette & Roles
+${input.colors.map((token) => `- **${token.name}** (\`${token.hex}\`): ${token.role}`).join("\n")}
 
-## Typography
+## Typography Rules
 - **Headline Font**: ${typography.headlineFont}
 - **Body Font**: ${typography.bodyFont}
 - **Label Font**: ${typography.labelFont}
 
 ${typography.notes.join("\n")}
 
-## Elevation
-${elevation}
-
-## Components
+## Component Stylings
 ${componentLines.map((line) => `- ${line}`).join("\n")}
+
+## Layout Principles
+- **Spacing scale**: ${spacingStr}
+- **Base unit**: ${spacingScale[0] ?? 4}px
+- **Container max-width**: 1200px for content, 1440px for dashboards
+- **Border-radius scale**: ${Math.max(2, radiusVal - 4)}px (small), ${radiusVal}px (default), ${radiusVal + 4}px (large), 999px (pill)
+
+## Depth & Elevation
+${elevation}
 
 ## Do's and Don'ts
 ${[...dos, ...donts].map((line) => `- ${line}`).join("\n")}
+
+## Responsive Behavior
+- **Breakpoints**: 640px (mobile), 768px (tablet), 1024px (small desktop), 1280px (desktop)
+- Below 768px: stack to single column, increase touch targets to 44px
+- Below 640px: collapse sidebar navigation, full-width cards
+- Use min() and clamp() for fluid typography and spacing
+
+## Agent Prompt Guide
+- Primary color: ${input.colors.find((c) => c.name.toLowerCase().includes("primary"))?.hex ?? input.colors[0]?.hex ?? "#000"}
+- Font stack: ${typography.headlineFont} / ${typography.bodyFont}
+- Corner radius: ${radiusVal}px
+- Spacing base: ${spacingScale[0] ?? 8}px
+- Component shape: ${input.styleProfile.componentRecipes?.[0]?.shape ?? "rounded"}
+- Follow the palette strictly and ensure WCAG AA contrast ratios on all text.
 `;
 }
 
@@ -368,56 +567,119 @@ export function parseDesignMarkdown(
 
   for (const key of SECTION_ORDER) {
     if (!sections.has(key)) {
-      warnings.push(`Missing section: ${key}`);
+      // Don't warn about legacy aliases if canonical key exists
+      const isLegacyAlias = Object.keys(HEADING_ALIASES).includes(key) && HEADING_ALIASES[key] !== key;
+      if (!isLegacyAlias) {
+        warnings.push(`Missing section: ${key}`);
+      }
     }
   }
 
-  const overview = sections.get("overview")?.trim() || DEFAULT_OVERVIEW;
-  const colorBody = sections.get("colors") ?? "";
-  const colorLines = extractBulletLines(colorBody);
+  const overview = (sections.get("visual theme & atmosphere") ?? sections.get("overview"))?.trim() || DEFAULT_OVERVIEW;
+  const colorBody = sections.get("color palette & roles") ?? sections.get("colors") ?? "";
   const parsedColors: DesignMdColorToken[] = [];
 
-  for (const line of colorLines) {
-    const match = line.match(/^\*\*(.+?)\*\*\s*\((#[0-9a-fA-F]{3,8})\)\s*:?\s*(.+)$/);
-    if (!match) {
-      continue;
+  // Parse color bullets with sub-section context awareness (### Primary, ### Accent, etc.)
+  {
+    let currentSubsection = "";
+    for (const rawLine of colorBody.split("\n")) {
+      const trimmed = rawLine.trim();
+      // Track ### sub-section headers (e.g. "### Primary", "### Accent Colors")
+      const subMatch = trimmed.match(/^#{2,4}\s+(.+)$/);
+      if (subMatch) {
+        currentSubsection = subMatch[1].trim();
+        continue;
+      }
+      if (!trimmed.startsWith("- ")) continue;
+      const bullet = trimmed.slice(2).trim();
+      const match = bullet.match(/^\*\*(.+?)\*\*\s*\(`?(#[0-9a-fA-F]{3,8})`?\)\s*:?\s*(.+)$/);
+      if (!match) continue;
+      const token: DesignMdColorToken & { _subsection?: string } = {
+        name: match[1].trim(),
+        hex: match[2].trim(),
+        role: match[3].trim()
+      };
+      if (currentSubsection) {
+        token._subsection = currentSubsection;
+      }
+      parsedColors.push(token);
     }
-    parsedColors.push({
-      name: match[1].trim(),
-      hex: match[2].trim(),
-      role: match[3].trim()
-    });
   }
 
-  const typographyBody = sections.get("typography") ?? "";
+  const typographyBody = sections.get("typography rules") ?? sections.get("typography") ?? "";
   const typographyLines = typographyBody.split("\n").map((line) => line.trim()).filter(Boolean);
   const headlineFont = typographyLines.find((line) => /headline font/i.test(line))?.split(":").slice(1).join(":").trim();
   const bodyFont = typographyLines.find((line) => /body font/i.test(line))?.split(":").slice(1).join(":").trim();
   const labelFont = typographyLines.find((line) => /label font/i.test(line))?.split(":").slice(1).join(":").trim();
   const typographyNotes = typographyLines.filter((line) => !line.startsWith("- "));
-  const componentLines = extractBulletLines(sections.get("components") ?? "");
+  const typographyHierarchy = parseTypographyHierarchy(typographyBody);
+  const componentLines = extractBulletLines(sections.get("component stylings") ?? sections.get("components") ?? "");
 
   const dosAndDonts = extractBulletLines(sections.get("do's and don'ts") ?? "");
   const dos = dosAndDonts.filter((line) => /^do\b/i.test(line));
   const donts = dosAndDonts.filter((line) => /^don'?t\b/i.test(line));
-  const elevation = sections.get("elevation")?.trim() || "Depth is conveyed by border contrast and restrained shadows.";
+  const elevation = (sections.get("depth & elevation") ?? sections.get("elevation"))?.trim() || "Depth is conveyed by border contrast and restrained shadows.";
+
+  // Parse layout section for spacing/radius tokens
+  const layoutBody = sections.get("layout principles") ?? "";
+  const responsiveBody = sections.get("responsive behavior") ?? "";
+  const imageryBody = (sections.get("visual theme & atmosphere") ?? sections.get("overview") ?? "")
+    .split("\n")
+    .filter((line) => {
+      const lower = line.toLowerCase();
+      return lower.includes("photo") || lower.includes("image") || lower.includes("illustrat") || lower.includes("icon") || lower.includes("hero") || lower.includes("viewport");
+    })
+    .join("\n")
+    .trim();
+  const layoutTokens = parseLayoutTokens(layoutBody);
 
   const colors = normalizeColorTokens(parsedColors, safeContext);
   const typography: DesignMdTypographyToken = {
     headlineFont: headlineFont || base.styleProfile.tokens.typography.headlineFont,
     bodyFont: bodyFont || base.styleProfile.tokens.typography.bodyFont,
     labelFont: labelFont || base.styleProfile.tokens.typography.labelFont,
-    notes: typographyNotes.length > 0 ? typographyNotes : base.styleProfile.tokens.typography.notes
+    notes: typographyNotes.length > 0 ? typographyNotes : base.styleProfile.tokens.typography.notes,
+    ...(typographyHierarchy.length > 0 && { hierarchy: typographyHierarchy })
   };
+
+  // Build palette with positional fallbacks: if name/role/subsection search fails,
+  // use the first few distinct colors from the parsed list as fallbacks.
+  const resolvedPrimary = firstColorByName(colors, "", ["primary", "brand"]);
+  const resolvedSecondary = firstColorByName(colors, "", ["secondary", "support"]);
+  const resolvedAccent = firstColorByName(colors, "", ["accent", "tertiary"]);
+  const resolvedSurface = firstColorByName(colors, "", ["surface", "neutral", "background", "page"]);
+  const resolvedText = firstColorByName(colors, "", ["text", "ink", "on", "heading"]);
+
+  // Positional fallback: first color = primary, skip duplicates for others
+  const positionalColors = colors.map((c) => c.hex);
+  const usedPositional = new Set<string>();
+  function nextPositional() {
+    for (const hex of positionalColors) {
+      if (!usedPositional.has(hex)) {
+        usedPositional.add(hex);
+        return hex;
+      }
+    }
+    return "";
+  }
+
+  const finalPrimary = resolvedPrimary || nextPositional() || safeContext.palette.primary;
+  usedPositional.add(finalPrimary);
+  const finalSecondary = resolvedSecondary || nextPositional() || safeContext.palette.secondary;
+  usedPositional.add(finalSecondary);
+  const finalAccent = resolvedAccent || nextPositional() || safeContext.palette.accent;
+  usedPositional.add(finalAccent);
+  const finalSurface = resolvedSurface || safeContext.palette.surface;
+  const finalText = resolvedText || safeContext.palette.text;
 
   const styleContextFromMarkdown: ReferenceStyleContext = {
     ...safeContext,
     palette: {
-      primary: firstColorByName(colors, safeContext.palette.primary, ["primary", "brand"]),
-      secondary: firstColorByName(colors, safeContext.palette.secondary, ["secondary", "support"]),
-      accent: firstColorByName(colors, safeContext.palette.accent, ["accent", "tertiary"]),
-      surface: firstColorByName(colors, safeContext.palette.surface, ["surface", "neutral", "background"]),
-      text: firstColorByName(colors, safeContext.palette.text, ["text", "ink", "on"])
+      primary: finalPrimary,
+      secondary: finalSecondary,
+      accent: finalAccent,
+      surface: finalSurface,
+      text: finalText
     },
     typography: {
       headingFamily: typography.headlineFont,
@@ -441,7 +703,9 @@ export function parseDesignMarkdown(
     tokens: {
       ...nextBase.styleProfile.tokens,
       colors,
-      typography
+      typography,
+      ...(layoutTokens.spacingScale.length > 0 && { spacingScale: layoutTokens.spacingScale }),
+      ...(layoutTokens.radiusScale.length > 0 && { radiusScale: layoutTokens.radiusScale })
     }
   });
 
@@ -476,6 +740,9 @@ export function parseDesignMarkdown(
       components: componentLines.length > 0 ? componentLines : recipesToMarkdownLines(styleProfile),
       dos: dos.length > 0 ? dos : DEFAULT_DOS,
       donts: donts.length > 0 ? donts : DEFAULT_DONTS,
+      layout: layoutBody.trim(),
+      responsive: responsiveBody.trim(),
+      imagery: imageryBody,
       styleProfile,
       qualityReport,
       visualBoard

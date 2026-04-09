@@ -67,6 +67,7 @@ export interface PipelineEventPayload {
   confidence?: number | null;
   mismatch?: string[] | null;
   nextAction?: string | null;
+  errorCode?: "auth-error" | "rate-limit" | "llm-timeout" | "validation-failure" | "network-error" | "unknown";
   [key: string]: unknown;
 }
 
@@ -79,6 +80,7 @@ export interface PipelineRun {
   provider: ProviderId;
   model: string;
   passStatusMap: Record<string, RunStatus | "idle">;
+  passOutputs: Record<string, unknown>;
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;

@@ -1,4 +1,5 @@
 import type { DesignMode, DesignSystemMode, DevicePreset, ReferenceStyleContext, SurfaceTarget } from "@designer/shared";
+import { isMobilePreset } from "@designer/shared";
 
 export type FrameArtifacts = {
   frameName: string;
@@ -74,7 +75,7 @@ export function validateArtifactsForDevice(
     detail: "Export HTML is non-empty and substantial."
   });
 
-  if (input.devicePreset === "iphone") {
+  if (isMobilePreset(input.devicePreset)) {
     const explicitMarketingPattern =
       /\b(tw-landing-hero|tw-feature-grid|tw-pricing|tw-testimonial|tw-newsletter|tw-waitlist|pricing table|newsletter signup)\b/i;
     const marketingCueMatches = sourceBlob.match(/\b(pricing|testimonial|newsletter|waitlist|conversion)\b/gi) ?? [];

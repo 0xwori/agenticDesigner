@@ -4,6 +4,7 @@ import {
   DEFAULT_PROJECT_SETTINGS,
   type DesignSystemChecklist,
   type DesignSystemStatus,
+  type DevicePreset,
   type Frame,
   type FrameVersion,
   type FrameWithVersions,
@@ -137,6 +138,9 @@ function mapProjectDesignSystemRow(row: Record<string, any>): ProjectDesignSyste
     components: [],
     dos: [],
     donts: [],
+    layout: "",
+    responsive: "",
+    imagery: "",
     styleProfile: fallbackStyleProfile,
     qualityReport: fallbackQualityReport,
     visualBoard: buildDesignSystemVisualBoard({
@@ -263,6 +267,7 @@ function mapRunRow(row: Record<string, any>): PipelineRun {
     provider: row.provider,
     model: row.model,
     passStatusMap: parseJson<Record<string, RunStatus | "idle">>(row.pass_status_map, {}),
+    passOutputs: parseJson<Record<string, unknown>>(row.pass_outputs, {}),
     createdAt: toIso(row.created_at) ?? new Date().toISOString(),
     startedAt: toIso(row.started_at),
     finishedAt: toIso(row.finished_at)
@@ -389,6 +394,10 @@ export async function initDatabase() {
       ALTER TABLE reference_sources ADD COLUMN IF NOT EXISTS design_system_checklist JSONB;
       ALTER TABLE reference_sources ADD COLUMN IF NOT EXISTS design_system_notes TEXT;
       ALTER TABLE reference_sources ADD COLUMN IF NOT EXISTS design_system_updated_at TIMESTAMPTZ;
+    `);
+
+    await client.query(`
+      ALTER TABLE pipeline_runs ADD COLUMN IF NOT EXISTS pass_outputs JSONB NOT NULL DEFAULT '{}';
     `);
   } finally {
     await client.query("SELECT pg_advisory_unlock($1)", [setupLockId]).catch(() => {
@@ -737,7 +746,7 @@ export async function getLatestSyncedReference(projectId: string): Promise<Refer
 export async function createFrameRecord(input: {
   projectId: string;
   name: string;
-  devicePreset: "desktop" | "iphone";
+  devicePreset: DevicePreset;
   mode: "wireframe" | "high-fidelity";
   position: { x: number; y: number };
   size: { width: number; height: number };
@@ -823,6 +832,12 @@ export async function getFrame(frameId: string): Promise<Frame | null> {
   }
 
   return mapFrameRow(result.rows[0]);
+}
+
+export async function deleteFrame(frameId: string): Promise<boolean> {
+  const result = await pool.query(`DELETE FROM frame_versions WHERE frame_id = $1`, [frameId]);
+  const frameResult = await pool.query(`DELETE FROM frames WHERE id = $1`, [frameId]);
+  return (frameResult.rowCount ?? 0) > 0;
 }
 
 export async function getFrameVersions(frameId: string): Promise<FrameVersion[]> {
@@ -968,6 +983,27 @@ export async function updatePipelineRun(
   );
 
   return mapRunRow(result.rows[0]);
+}
+
+export async function updateRunPassOutputs(
+  runId: string,
+  key: string,
+  value: unknown
+): Promise<void> {
+  await pool.query(
+    `
+      UPDATE pipeline_runs
+      SET pass_outputs = pass_outputs || jsonb_build_object($2::text, $3::jsonb)
+      WHERE id = $1
+    `,
+    [runId, key, JSON.stringify(value)]
+  );
+}
+
+export async function getRunPassOutputs(runId: string): Promise<Record<string, unknown>> {
+  const result = await pool.query(`SELECT pass_outputs FROM pipeline_runs WHERE id = $1`, [runId]);
+  if (!result.rows[0]) return {};
+  return parseJson<Record<string, unknown>>(result.rows[0].pass_outputs, {});
 }
 
 export async function appendPipelineEvent(event: PipelineEvent): Promise<PipelineEvent> {
