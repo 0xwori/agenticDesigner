@@ -15,6 +15,7 @@ import {
   isMobilePreset,
   type PipelineEvent,
   type PipelineStage,
+  type ProjectBundle,
   type PromptIntentType,
   type ProjectDesignSystem,
   type ProviderId,
@@ -52,7 +53,7 @@ import {
   mergeComponentRecipeSets
 } from "./designSystemProfile.js";
 import { buildDesignSystemComponentsArtifacts as buildDesignSystemComponentsArtifactsFromProfile } from "./designSystemArtifacts.js";
-import { requestCompletion } from "./llmProviders.js";
+import { requestCompletion, requestCompletionStreaming } from "./llmProviders.js";
 import type { RunHub } from "./runHub.js";
 import { selectImagesForPlan, buildImageContextBlock } from "./unsplash.js";
 import {
@@ -92,6 +93,9 @@ type PipelineInput = {
   selectedFrameContext?: SelectedFrameContext;
   frameId?: string;
   editing: boolean;
+  intentHint?: PromptIntentType;
+  /** Pre-loaded project bundle to avoid re-fetching inside pipeline */
+  preloadedBundle?: ProjectBundle;
 };
 
 // ---------------------------------------------------------------------------
@@ -110,14 +114,24 @@ function classifyEditComplexity(prompt: string): EditComplexity {
   const lower = prompt.toLowerCase().trim();
   const wordCount = lower.split(/\s+/).length;
 
-  // Trivial: very short prompts with simple verbs
-  const trivialPattern = /^(delete|remove|hide|show|change|rename|swap|replace|update|move|toggle|set|make)\b/;
-  const singlePropertyChange = /\b(color|text|font|size|padding|margin|background|border|title|label|name|icon|image)\b/;
+  const simpleVerb = /\b(delete|remove|hide|show|change|rename|swap|replace|update|move|toggle|set|make|add)\b/;
+  const singlePropertyChange = /\b(color|text|font|size|padding|margin|background|border|title|label|name|icon|image|nav|navigation|header|footer|sidebar|button|section|block|card)\b/;
 
-  if (wordCount <= 8 && trivialPattern.test(lower)) {
+  // Trivial: short prompts with simple verbs
+  if (wordCount <= 8 && simpleVerb.test(lower)) {
     return "trivial";
   }
-  if (wordCount <= 12 && singlePropertyChange.test(lower) && !lower.includes(" and ")) {
+
+  // Compound simple edits: "add X and remove Y" — both halves are simple
+  if (lower.includes(" and ")) {
+    const parts = lower.split(/\s+and\s+/);
+    const allPartsSimple = parts.every((part) => simpleVerb.test(part.trim()) || singlePropertyChange.test(part.trim()));
+    if (allPartsSimple && wordCount <= 20) {
+      return "trivial";
+    }
+  }
+
+  if (wordCount <= 12 && singlePropertyChange.test(lower)) {
     return "trivial";
   }
 
@@ -127,6 +141,146 @@ function classifyEditComplexity(prompt: string): EditComplexity {
   }
 
   return "complex";
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic edits — apply simple changes without LLM (Phase 3.1)
+// Returns null if the edit can't be applied deterministically.
+// ---------------------------------------------------------------------------
+type DeterministicEditResult = {
+  sourceCode: string;
+  cssCode: string;
+  exportHtml: string;
+};
+
+function tryDeterministicEdit(
+  prompt: string,
+  previousSourceCode: string,
+  previousCssCode: string,
+  previousExportHtml: string
+): DeterministicEditResult | null {
+  if (!previousSourceCode || previousSourceCode.length < 50) return null;
+
+  const lower = prompt.toLowerCase().trim();
+  let sourceCode = previousSourceCode;
+  let cssCode = previousCssCode;
+  let exportHtml = previousExportHtml;
+  let applied = false;
+
+  // Pattern: "change/set background to/color to <color>"
+  const bgColorMatch = lower.match(/(?:change|set|make)\s+(?:the\s+)?background\s+(?:color\s+)?(?:to\s+)?([#a-z0-9]+(?:\([^)]+\))?)/);
+  if (bgColorMatch) {
+    const newColor = bgColorMatch[1];
+    // Replace CSS custom property for surface/background
+    const cssBgPatterns = [
+      /--tw-surface:\s*[^;]+;/g,
+      /--tw-bg:\s*[^;]+;/g,
+      /--surface:\s*[^;]+;/g,
+      /background-color:\s*[^;]+;/g,
+    ];
+    for (const pattern of cssBgPatterns) {
+      if (pattern.test(cssCode)) {
+        const propName = cssCode.match(pattern)?.[0]?.split(":")[0] ?? "background-color";
+        cssCode = cssCode.replace(pattern, `${propName}: ${newColor};`);
+        applied = true;
+      }
+    }
+    if (!applied) {
+      // Fallback: add background-color to :root or body
+      if (cssCode.includes(":root {")) {
+        cssCode = cssCode.replace(/:root\s*{/, `:root {\n  background-color: ${newColor};`);
+      } else {
+        cssCode = `body { background-color: ${newColor}; }\n${cssCode}`;
+      }
+      applied = true;
+    }
+  }
+
+  // Pattern: "change/set text color to <color>"
+  if (!applied) {
+    const textColorMatch = lower.match(/(?:change|set|make)\s+(?:the\s+)?(?:text|font)\s+color\s+(?:to\s+)?([#a-z0-9]+(?:\([^)]+\))?)/);
+    if (textColorMatch) {
+      const newColor = textColorMatch[1];
+      const cssTextPatterns = [
+        /--tw-text:\s*[^;]+;/g,
+        /--text:\s*[^;]+;/g,
+      ];
+      for (const pattern of cssTextPatterns) {
+        if (pattern.test(cssCode)) {
+          const propName = cssCode.match(pattern)?.[0]?.split(":")[0] ?? "--tw-text";
+          cssCode = cssCode.replace(pattern, `${propName}: ${newColor};`);
+          applied = true;
+        }
+      }
+      if (!applied && cssCode.includes("color:")) {
+        cssCode = cssCode.replace(/(?<=:root\s*{[^}]*)color:\s*[^;]+;/, `color: ${newColor};`);
+        applied = true;
+      }
+    }
+  }
+
+  // Pattern: "change/set/update title/heading to 'new text'" or "rename title to 'new text'"
+  if (!applied) {
+    const titleMatch = lower.match(/(?:change|set|update|rename)\s+(?:the\s+)?(?:title|heading|header)\s+(?:text\s+)?(?:to\s+)["']?(.+?)["']?$/);
+    if (titleMatch) {
+      const newTitle = prompt.match(/(?:to\s+)["']?(.+?)["']?$/i)?.[1] ?? titleMatch[1];
+      // Find the first h1/h2/h3 in sourceCode and replace its content
+      const headingPattern = /(<h[1-3][^>]*>)([^<]+)(<\/h[1-3]>)/;
+      if (headingPattern.test(sourceCode)) {
+        sourceCode = sourceCode.replace(headingPattern, `$1${newTitle}$3`);
+        if (headingPattern.test(exportHtml)) {
+          exportHtml = exportHtml.replace(headingPattern, `$1${newTitle}$3`);
+        }
+        applied = true;
+      }
+    }
+  }
+
+  // Pattern: "hide/remove <element>" — comment out or remove matching JSX
+  if (!applied) {
+    const hideMatch = lower.match(/^(?:hide|remove|delete)\s+(?:the\s+)?(.+)$/);
+    if (hideMatch) {
+      const target = hideMatch[1].trim();
+      // Try to find a component or element with matching name/text
+      const componentPattern = new RegExp(`<${escapeRegExp(target)}[^/>]*(?:/>|>[\\s\\S]*?</${escapeRegExp(target)}>)`, "i");
+      if (componentPattern.test(sourceCode)) {
+        sourceCode = sourceCode.replace(componentPattern, `{/* Removed: ${target} */}`);
+        applied = true;
+      }
+    }
+  }
+
+  // Pattern: "make it dark" / "switch to dark mode"
+  if (!applied && /\b(?:dark\s*mode|make\s+it\s+dark|switch\s+to\s+dark)\b/.test(lower)) {
+    const lightBgPatterns = [
+      { pattern: /--tw-surface:\s*#f[0-9a-f]{5};/g, replacement: "--tw-surface: #141922;" },
+      { pattern: /--tw-text:\s*#[0-3][0-9a-f]{5};/g, replacement: "--tw-text: #f5f8ff;" },
+      { pattern: /background-color:\s*#f[0-9a-f]{5};/g, replacement: "background-color: #141922;" },
+      { pattern: /background-color:\s*white;/g, replacement: "background-color: #141922;" },
+    ];
+    for (const { pattern, replacement } of lightBgPatterns) {
+      if (pattern.test(cssCode)) {
+        cssCode = cssCode.replace(pattern, replacement);
+        applied = true;
+      }
+    }
+  }
+
+  if (!applied) return null;
+
+  // Apply same CSS changes to exportHtml if it has inline styles
+  if (exportHtml && applied && cssCode !== previousCssCode) {
+    // exportHtml often has a <style> block — replace it
+    if (exportHtml.includes("<style>") && previousCssCode) {
+      exportHtml = exportHtml.replace(previousCssCode, cssCode);
+    }
+  }
+
+  return { sourceCode, cssCode, exportHtml };
+}
+
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function resolveModelForPass(
@@ -157,11 +311,8 @@ function resolveModelForPass(
   }
 
   if (complexity === "moderate") {
-    // Moderate edits: fast for plan, user model for generate
-    if (pass === "enhance-plan" || pass === "repair" || pass === "diff-repair") {
-      return { model: FAST_MODELS[input.provider] ?? userModel, reason: `edit-moderate-fast` };
-    }
-    return { model: userModel };
+    // Moderate edits: fast model for everything — these are still targeted edits
+    return { model: FAST_MODELS[input.provider] ?? userModel, reason: `edit-moderate-fast` };
   }
 
   // Complex: user model for generate, fast for planning
@@ -2617,20 +2768,27 @@ async function generateScreenArtifacts(args: {
   previousExportHtml?: string;
   designSystemMarkdown?: string;
   imageContext?: string;
+  onStreamChunk?: (chunk: string, accumulated: string) => void;
 }): Promise<GenerateArtifactsResult> {
   const isIphone = isMobilePreset(args.input.devicePreset);
   const surfaceTarget = args.input.surfaceTarget ?? (isIphone ? "mobile" : "web");
   const { model: generateModel } = resolveModelForPass(args.input, "generate");
   const designSystemMode = args.input.designSystemMode ?? "strict";
 
-  const completion = await requestCompletion({
+  const editComplexityForTimeout = args.input.editing ? classifyEditComplexity(args.input.prompt) : null;
+  const timeoutMs = editComplexityForTimeout === "trivial" ? 30_000
+    : editComplexityForTimeout === "moderate" ? 45_000
+    : 120_000;
+
+  const completion = await requestCompletionStreaming({
     provider: args.input.provider,
     model: generateModel,
     apiKey: args.input.apiKey,
     allowMock: false,
     jsonMode: true,
-    timeoutMs: 120_000,
+    timeoutMs,
     attachments: args.input.attachments,
+    onChunk: args.onStreamChunk,
     system: `You are a senior UI engineer and product designer.
 Return STRICT JSON only with keys:
 - frameName (string)
@@ -3185,7 +3343,7 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
   });
 
   try {
-    const projectBundle = await getProjectBundle(input.projectId);
+    const projectBundle = input.preloadedBundle ?? await getProjectBundle(input.projectId);
     if (!projectBundle) {
       throw new Error("Project not found.");
     }
@@ -3225,7 +3383,19 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
     }
 
     const hasSyncedReference = projectStyleContexts.length > 0;
-    const intent = await classifyPromptIntent(input, styleContext, hasSyncedReference);
+
+    // Fast-path: skip LLM intent classification when the frontend already knows intent
+    let intent: PromptIntent;
+    if (input.intentHint) {
+      intent = {
+        type: input.intentHint,
+        reason: "Intent provided by client (skipped LLM classification).",
+        shouldTakeAction: true,
+        designSystemAction: "none"
+      };
+    } else {
+      intent = await classifyPromptIntent(input, styleContext, hasSyncedReference);
+    }
 
     await emitAgentEvent(context, {
       runId: input.runId,
@@ -3360,10 +3530,12 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
       const previousCss = previousVersion?.cssCode ?? "";
       const previousExportHtml = previousVersion?.exportHtml ?? "";
 
-      await setPassStatus(input.runId, passStatusMap, "enhance", "running");
-
       // For trivial edits, skip the LLM enhance+plan and use fast fallbacks
       const editComplexity = input.editing ? classifyEditComplexity(input.prompt) : null;
+
+      if (editComplexity !== "trivial") {
+        await setPassStatus(input.runId, passStatusMap, "enhance", "running");
+      }
       let enhanced: EnhanceResult;
       let plan: PlanResult;
 
@@ -3410,16 +3582,23 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
         ({ enhanced, plan } = await enhanceAndPlan(input, styleContext, previousSource));
       }
 
-      await setPassStatus(input.runId, passStatusMap, "enhance", "completed");
-      await updateRunPassOutputs(input.runId, "enhance", enhanced).catch(() => {});
-      await appendChatMessage({
-        projectId: input.projectId,
-        runId: input.runId,
-        role: "agent",
-        content: `Enhanced brief: ${enhanced.title}`
-      });
-      await setPassStatus(input.runId, passStatusMap, "plan", "completed");
-      await updateRunPassOutputs(input.runId, "plan", plan).catch(() => {});
+      // For trivial edits, skip DB writes for hardcoded enhance/plan (saves ~4 DB round trips)
+      if (editComplexity !== "trivial") {
+        await setPassStatus(input.runId, passStatusMap, "enhance", "completed");
+        await updateRunPassOutputs(input.runId, "enhance", enhanced).catch(() => {});
+        await appendChatMessage({
+          projectId: input.projectId,
+          runId: input.runId,
+          role: "agent",
+          content: `Enhanced brief: ${enhanced.title}`
+        });
+        await setPassStatus(input.runId, passStatusMap, "plan", "completed");
+        await updateRunPassOutputs(input.runId, "plan", plan).catch(() => {});
+      } else {
+        // Mark as completed in local map only (no DB write)
+        passStatusMap.enhance = "completed";
+        passStatusMap.plan = "completed";
+      }
 
       // Select images for the planned sections (non-blocking; falls back to placeholders)
       let imageContext = "";
@@ -3438,6 +3617,76 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
         }
       }
 
+      // Phase 3.1: Try deterministic edit for trivial prompts (no LLM needed)
+      let deterministicResult: DeterministicEditResult | null = null;
+      if (editComplexity === "trivial" && previousSource) {
+        deterministicResult = tryDeterministicEdit(input.prompt, previousSource, previousCss, previousExportHtml);
+      }
+
+      if (deterministicResult) {
+        // Deterministic edit succeeded — skip LLM generate entirely
+        passStatusMap.generate = "completed";
+        const generated: FrameArtifacts = {
+          frameName: frame.name,
+          sourceCode: deterministicResult.sourceCode,
+          cssCode: deterministicResult.cssCode,
+          exportHtml: deterministicResult.exportHtml
+        };
+        await emitAgentEvent(context, {
+          runId: input.runId,
+          stage: "generate",
+          status: "success",
+          kind: "action",
+          agent: primaryDesigner,
+          message: "Applied deterministic edit — no LLM call needed.",
+          payload: {
+            step: "artifact-generated",
+            frameId: frame.id,
+            strategy: "deterministic",
+            attempt: 0
+          }
+        });
+
+        const repaired = repairArtifacts(generated);
+        const diffRepaired = applyDiffRepair(repaired, input.prompt, previousSource);
+        passStatusMap.repair = "completed";
+        const versionFinal = await persistVersion({
+          frameId: frame.id,
+          previousSourceCode: previousSource,
+          artifacts: diffRepaired,
+          tailwindEnabled: input.tailwindEnabled ?? false,
+          passName: "diff-repair",
+          passOutput: {
+            prompt: input.prompt,
+            attemptCount: 0,
+            strategy: "deterministic",
+            note: "Deterministic trivial edit — no LLM call."
+          }
+        });
+        await setPassStatus(input.runId, passStatusMap, "diff-repair", "completed");
+        await updateFrameStatus(frame.id, "ready");
+        await emitAgentEvent(context, {
+          runId: input.runId,
+          stage: "diff-repair",
+          status: "success",
+          kind: "action",
+          agent: "orchestrator",
+          message: "Finalized deterministic edit.",
+          payload: {
+            step: "diff-repair-complete",
+            frameId: frame.id,
+            versionId: versionFinal.id,
+            previousVersionId: previousVersion?.id ?? null,
+            frameContent: {
+              sourceCode: diffRepaired.sourceCode,
+              cssCode: diffRepaired.cssCode,
+              exportHtml: diffRepaired.exportHtml,
+              tailwindEnabled: input.tailwindEnabled ?? false
+            }
+          }
+        });
+      } else {
+      // LLM generation path (non-deterministic)
       await setPassStatus(input.runId, passStatusMap, "generate", "running");
       let generation: GenerateArtifactsResult | null = null;
       let attemptCount = 0;
@@ -3453,7 +3702,8 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
       };
       let retryIssues: string[] = [];
 
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const maxAttempts = editComplexity === "trivial" ? 1 : editComplexity === "moderate" ? 2 : 3;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         attemptCount = attempt;
 
         if (attempt > 1) {
@@ -3489,6 +3739,30 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
               })}`;
 
         try {
+          // Throttled streaming callback — emits progress every ~5s with elapsed time
+          const streamStartedAt = Date.now();
+          let lastStreamEmit = 0;
+          const STREAM_THROTTLE_MS = 5000;
+          const onStreamChunk = (_chunk: string, _accumulated: string) => {
+            const now = Date.now();
+            if (now - lastStreamEmit < STREAM_THROTTLE_MS) return;
+            lastStreamEmit = now;
+            const elapsedSec = Math.round((now - streamStartedAt) / 1000);
+            void emitAgentEvent(context, {
+              runId: input.runId,
+              stage: "generate",
+              status: "info",
+              kind: "status",
+              agent: primaryDesigner,
+              message: `Still generating your design... (${elapsedSec}s elapsed)`,
+              payload: {
+                step: "generate-streaming",
+                frameId: frame.id,
+                elapsedMs: now - streamStartedAt
+              }
+            });
+          };
+
           generation = await generateScreenArtifacts({
             input: {
               ...input,
@@ -3502,11 +3776,12 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
             previousCssCode: previousCss,
             previousExportHtml,
             designSystemMarkdown: projectBundle.designSystem?.markdown,
-            imageContext
+            imageContext,
+            onStreamChunk
           });
         } catch (genError) {
           const errorCode = classifyPipelineError(genError);
-          if (!isRetriableError(errorCode) || attempt >= 3) {
+          if (!isRetriableError(errorCode) || attempt >= maxAttempts) {
             throw genError;
           }
           await emitAgentEvent(context, {
@@ -3525,11 +3800,16 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
           devicePreset: input.devicePreset,
           mode: input.mode
         });
-        designSystemValidation = validateDesignSystemAdherence(
-          generation.artifacts,
-          styleContext,
-          input.designSystemMode ?? "strict"
-        );
+        // Skip expensive design-system validation for trivial edits (source was already valid)
+        if (editComplexity !== "trivial") {
+          designSystemValidation = validateDesignSystemAdherence(
+            generation.artifacts,
+            styleContext,
+            input.designSystemMode ?? "strict"
+          );
+        } else {
+          designSystemValidation = { valid: true, issues: [], checks: [] };
+        }
         retryIssues = [...validation.issues, ...designSystemValidation.issues];
 
         if (validation.valid && designSystemValidation.valid) {
@@ -3547,7 +3827,7 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
             step: "artifact-validate",
             attempt,
             statusDetail: retryIssues.join("; "),
-            nextStep: attempt < 3 ? "retry-generate" : "stop-with-error"
+            nextStep: attempt < maxAttempts ? "retry-generate" : "stop-with-error"
           }
         });
       }
@@ -3597,112 +3877,163 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
         }
       });
 
-      await setPassStatus(input.runId, passStatusMap, "repair", "running");
-      await emitAgentEvent(context, {
-        runId: input.runId,
-        stage: "repair",
-        status: "info",
-        kind: "summary",
-        agent: "design-system-designer",
-        message: "I’m polishing structure and consistency so this aligns cleanly with your design system.",
-        payload: {
-          step: "repair-pass"
-        }
-      });
+      // ----- Repair + diff-repair -----
       const repaired = repairArtifacts(generated);
-      const designSystemMode = input.designSystemMode ?? "strict";
-      let strictAdjusted = repaired;
-      if (designSystemMode === "strict") {
-        const strictValidation = validateDesignSystemAdherence(strictAdjusted, styleContext, "strict");
-        if (!strictValidation.valid) {
-          strictAdjusted = enforceStrictDesignSystemAlignment(strictAdjusted, styleContext);
-          await emitAgentEvent(context, {
-            runId: input.runId,
-            stage: "repair",
-            status: "info",
-            kind: "action",
-            agent: "design-system-designer",
-            message: "Applied an extra strict design-system repair pass to reduce style drift.",
-            payload: {
-              step: "strict-repair-pass",
-              statusDetail: strictValidation.issues.join("; "),
-              nextStep: "diff-repair-pass"
+
+      if (editComplexity === "trivial") {
+        // Fast path: merge repair + diff-repair, skip strict DS alignment, single persist
+        const diffRepaired = applyDiffRepair(repaired, input.prompt, previousSource);
+        passStatusMap.repair = "completed";
+        const versionFinal = await persistVersion({
+          frameId: frame.id,
+          previousSourceCode: versionGenerate.sourceCode,
+          artifacts: diffRepaired,
+          tailwindEnabled: input.tailwindEnabled ?? false,
+          passName: "diff-repair",
+          passOutput: {
+            prompt: input.prompt,
+            attemptCount,
+            mobileQualityChecks: validation.checks,
+            note: "Trivial edit — merged repair + diff-repair."
+          }
+        });
+        await setPassStatus(input.runId, passStatusMap, "diff-repair", "completed");
+        await updateFrameStatus(frame.id, "ready");
+        await emitAgentEvent(context, {
+          runId: input.runId,
+          stage: "diff-repair",
+          status: "success",
+          kind: "action",
+          agent: "orchestrator",
+          message: "Finalized version after fast repair.",
+          payload: {
+            step: "diff-repair-complete",
+            frameId: frame.id,
+            versionId: versionFinal.id,
+            previousVersionId: previousVersion?.id ?? null,
+            frameContent: {
+              sourceCode: diffRepaired.sourceCode,
+              cssCode: diffRepaired.cssCode,
+              exportHtml: diffRepaired.exportHtml,
+              tailwindEnabled: input.tailwindEnabled ?? false
             }
-          });
+          }
+        });
+      } else {
+        // Full repair path for non-trivial edits and new generations
+        await setPassStatus(input.runId, passStatusMap, "repair", "running");
+        await emitAgentEvent(context, {
+          runId: input.runId,
+          stage: "repair",
+          status: "info",
+          kind: "summary",
+          agent: "design-system-designer",
+          message: "I’m polishing structure and consistency so this aligns cleanly with your design system.",
+          payload: {
+            step: "repair-pass"
+          }
+        });
+        const designSystemMode = input.designSystemMode ?? "strict";
+        let strictAdjusted = repaired;
+        if (designSystemMode === "strict") {
+          const strictValidation = validateDesignSystemAdherence(strictAdjusted, styleContext, "strict");
+          if (!strictValidation.valid) {
+            strictAdjusted = enforceStrictDesignSystemAlignment(strictAdjusted, styleContext);
+            await emitAgentEvent(context, {
+              runId: input.runId,
+              stage: "repair",
+              status: "info",
+              kind: "action",
+              agent: "design-system-designer",
+              message: "Applied an extra strict design-system repair pass to reduce style drift.",
+              payload: {
+                step: "strict-repair-pass",
+                statusDetail: strictValidation.issues.join("; "),
+                nextStep: "diff-repair-pass"
+              }
+            });
+          }
         }
+        const versionRepair = await persistVersion({
+          frameId: frame.id,
+          previousSourceCode: versionGenerate.sourceCode,
+          artifacts: strictAdjusted,
+          tailwindEnabled: input.tailwindEnabled ?? false,
+          passName: "repair",
+          passOutput: {
+            note: "Applied structural and style safeguards.",
+            attemptCount,
+            mobileQualityChecks: validation.checks,
+            designSystemChecks: designSystemValidation.checks,
+            designSystemMode: input.designSystemMode ?? "strict"
+          }
+        });
+        await setPassStatus(input.runId, passStatusMap, "repair", "completed");
+        await emitAgentEvent(context, {
+          runId: input.runId,
+          stage: "repair",
+          status: "success",
+          kind: "action",
+          agent: "design-system-designer",
+          message: "Repaired and normalized generated output.",
+          payload: {
+            step: "repair-complete",
+            frameId: frame.id,
+            versionId: versionRepair.id
+          }
+        });
+
+        await setPassStatus(input.runId, passStatusMap, "diff-repair", "running");
+        await emitAgentEvent(context, {
+          runId: input.runId,
+          stage: "diff-repair",
+          status: "info",
+          kind: "summary",
+          agent: "orchestrator",
+          message: "I’m applying a focused diff repair so updates stay stable while matching your request.",
+          payload: {
+            step: "diff-repair-pass"
+          }
+        });
+        const diffRepaired = applyDiffRepair(strictAdjusted, input.editing ? input.prompt : undefined, input.editing ? previousSource : undefined);
+        const versionDiffRepair = await persistVersion({
+          frameId: frame.id,
+          previousSourceCode: versionRepair.sourceCode,
+          artifacts: diffRepaired,
+          tailwindEnabled: input.tailwindEnabled ?? false,
+          passName: "diff-repair",
+          passOutput: {
+            prompt: input.prompt,
+            attemptCount,
+            mobileQualityChecks: validation.checks
+          }
+        });
+        await setPassStatus(input.runId, passStatusMap, "diff-repair", "completed");
+
+        await updateFrameStatus(frame.id, "ready");
+
+        await emitAgentEvent(context, {
+          runId: input.runId,
+          stage: "diff-repair",
+          status: "success",
+          kind: "action",
+          agent: "orchestrator",
+          message: "Finalized version after diff-aware repair.",
+          payload: {
+            step: "diff-repair-complete",
+            frameId: frame.id,
+            versionId: versionDiffRepair.id,
+            previousVersionId: previousVersion?.id ?? null,
+            frameContent: {
+              sourceCode: diffRepaired.sourceCode,
+              cssCode: diffRepaired.cssCode,
+              exportHtml: diffRepaired.exportHtml,
+              tailwindEnabled: input.tailwindEnabled ?? false
+            }
+          }
+        });
       }
-      const versionRepair = await persistVersion({
-        frameId: frame.id,
-        previousSourceCode: versionGenerate.sourceCode,
-        artifacts: strictAdjusted,
-        tailwindEnabled: input.tailwindEnabled ?? false,
-        passName: "repair",
-        passOutput: {
-          note: "Applied structural and style safeguards.",
-          attemptCount,
-          mobileQualityChecks: validation.checks,
-          designSystemChecks: designSystemValidation.checks,
-          designSystemMode: input.designSystemMode ?? "strict"
-        }
-      });
-      await setPassStatus(input.runId, passStatusMap, "repair", "completed");
-      await emitAgentEvent(context, {
-        runId: input.runId,
-        stage: "repair",
-        status: "success",
-        kind: "action",
-        agent: "design-system-designer",
-        message: "Repaired and normalized generated output.",
-        payload: {
-          step: "repair-complete",
-          frameId: frame.id,
-          versionId: versionRepair.id
-        }
-      });
-
-      await setPassStatus(input.runId, passStatusMap, "diff-repair", "running");
-      await emitAgentEvent(context, {
-        runId: input.runId,
-        stage: "diff-repair",
-        status: "info",
-        kind: "summary",
-        agent: "orchestrator",
-        message: "I’m applying a focused diff repair so updates stay stable while matching your request.",
-        payload: {
-          step: "diff-repair-pass"
-        }
-      });
-      const diffRepaired = applyDiffRepair(strictAdjusted, input.editing ? input.prompt : undefined, input.editing ? previousSource : undefined);
-      const versionDiffRepair = await persistVersion({
-        frameId: frame.id,
-        previousSourceCode: versionRepair.sourceCode,
-        artifacts: diffRepaired,
-        tailwindEnabled: input.tailwindEnabled ?? false,
-        passName: "diff-repair",
-        passOutput: {
-          prompt: input.prompt,
-          attemptCount,
-          mobileQualityChecks: validation.checks
-        }
-      });
-      await setPassStatus(input.runId, passStatusMap, "diff-repair", "completed");
-
-      await updateFrameStatus(frame.id, "ready");
-
-      await emitAgentEvent(context, {
-        runId: input.runId,
-        stage: "diff-repair",
-        status: "success",
-        kind: "action",
-        agent: "orchestrator",
-        message: "Finalized version after diff-aware repair.",
-        payload: {
-          step: "diff-repair-complete",
-          frameId: frame.id,
-          versionId: versionDiffRepair.id,
-          previousVersionId: previousVersion?.id ?? null
-        }
-      });
+      } // end LLM generation else-branch (deterministic edit fast path)
     }
 
     await updatePipelineRun(input.runId, {

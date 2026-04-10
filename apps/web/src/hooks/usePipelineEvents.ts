@@ -245,6 +245,39 @@ export function usePipelineEvents(
         onEvent: (event) => {
           appendOrderedEvent(event);
           const step = typeof event.payload?.step === "string" ? event.payload.step : null;
+
+          // Phase 2.1: Optimistic frame update from inline content (avoids HTTP refresh latency)
+          if (step === "diff-repair-complete" && event.payload?.frameId && event.payload?.frameContent) {
+            const fc = event.payload.frameContent as { sourceCode: string; cssCode: string; exportHtml: string; tailwindEnabled: boolean };
+            const fid = event.payload.frameId as string;
+            const vid = (event.payload.versionId as string) ?? `inline-${Date.now()}`;
+            setBundle((current) => {
+              if (!current) return current;
+              return {
+                ...current,
+                frames: current.frames.map((f) => {
+                  if (f.id !== fid) return f;
+                  const inlineVersion = {
+                    id: vid,
+                    frameId: fid,
+                    sourceCode: fc.sourceCode,
+                    cssCode: fc.cssCode,
+                    exportHtml: fc.exportHtml,
+                    tailwindEnabled: fc.tailwindEnabled,
+                    passOutputs: {} as Record<string, unknown>,
+                    diffFromPrevious: { addedLines: 0, removedLines: 0, changedLines: 0 },
+                    createdAt: new Date().toISOString()
+                  };
+                  return {
+                    ...f,
+                    status: "ready" as const,
+                    versions: [...f.versions, inlineVersion]
+                  };
+                })
+              };
+            });
+          }
+
           if (step === "run-complete") {
             resolveRunCompletion(runId, true);
           } else if (step === "run-failed") {
@@ -265,7 +298,9 @@ export function usePipelineEvents(
             window.setTimeout(() => { void openProjectDesignSystemRef.current(); }, 420);
           }
           if (event.payload?.frameId || event.status === "success" || event.status === "error") {
-            scheduleRefresh(320);
+            // Shorter debounce when we already have inline content (edit runs)
+            const delay = event.payload?.frameContent ? 100 : 320;
+            scheduleRefresh(delay);
           }
         },
         onClose: () => {

@@ -216,7 +216,9 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
         attachments,
         selectedFrameContext: parseSelectedFrameContext(request.body?.selectedFrameContext),
         frameId: frame.id,
-        editing: true
+        editing: true,
+        intentHint: request.body?.intentHint === "screen-action" ? "screen-action" : undefined,
+        preloadedBundle: projectBundle
       },
       { hub: runHub }
     );

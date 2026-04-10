@@ -389,3 +389,117 @@ export async function requestCompletion(input: CompletionInput): Promise<Complet
     };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Streaming completion — emits partial tokens via callback (Phase 3.2)
+// Falls back to non-streaming requestCompletion if streaming fails.
+// ---------------------------------------------------------------------------
+
+type StreamingCompletionInput = CompletionInput & {
+  onChunk?: (chunk: string, accumulated: string) => void;
+};
+
+export async function requestCompletionStreaming(input: StreamingCompletionInput): Promise<CompletionResult> {
+  // If no chunk handler or no API key, fall back to non-streaming
+  if (!input.onChunk || !input.apiKey) {
+    return requestCompletion(input);
+  }
+
+  // Only OpenAI streaming is implemented for now
+  if (input.provider !== "openai") {
+    return requestCompletion(input);
+  }
+
+  if (providerCircuit.isOpen(input.provider)) {
+    return requestCompletion(input);
+  }
+
+  try {
+    const imageAttachments = getImageAttachments(input.attachments);
+    const userContent =
+      imageAttachments.length > 0
+        ? [
+            { type: "text", text: input.prompt },
+            ...imageAttachments.map((a) => ({ type: "image_url", image_url: { url: a.url } }))
+          ]
+        : input.prompt;
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), input.timeoutMs ?? 120_000);
+
+    let response: Response;
+    try {
+      response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${input.apiKey}`
+        },
+        body: JSON.stringify({
+          model: input.model,
+          temperature: 0.4,
+          stream: true,
+          response_format: input.jsonMode ? { type: "json_object" } : undefined,
+          messages: [
+            { role: "system", content: input.system },
+            { role: "user", content: userContent }
+          ]
+        }),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!response.ok || !response.body) {
+      // Fall back to non-streaming
+      return requestCompletion(input);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let accumulated = "";
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data: ")) continue;
+        const data = trimmed.slice(6);
+        if (data === "[DONE]") continue;
+
+        try {
+          const parsed = JSON.parse(data) as {
+            choices?: Array<{ delta?: { content?: string } }>;
+          };
+          const chunk = parsed.choices?.[0]?.delta?.content;
+          if (chunk) {
+            accumulated += chunk;
+            input.onChunk(chunk, accumulated);
+          }
+        } catch {
+          // Skip malformed SSE chunks
+        }
+      }
+    }
+
+    providerCircuit.recordSuccess(input.provider);
+    return {
+      content: accumulated,
+      usedProvider: "openai",
+      usedModel: input.model
+    };
+  } catch (error) {
+    providerCircuit.recordFailure(input.provider);
+    // Fall back to non-streaming on any error
+    console.warn("[llmProviders] Streaming failed, falling back to non-streaming:", error instanceof Error ? error.message : String(error));
+    return requestCompletion(input);
+  }
+}

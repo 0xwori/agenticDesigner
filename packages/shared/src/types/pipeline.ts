@@ -68,6 +68,13 @@ export interface PipelineEventPayload {
   mismatch?: string[] | null;
   nextAction?: string | null;
   errorCode?: "auth-error" | "rate-limit" | "llm-timeout" | "validation-failure" | "network-error" | "unknown";
+  /** Inline frame content for immediate rendering (avoids HTTP refresh round-trip) */
+  frameContent?: {
+    sourceCode: string;
+    cssCode: string;
+    exportHtml: string;
+    tailwindEnabled: boolean;
+  };
   [key: string]: unknown;
 }
 

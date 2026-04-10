@@ -10,6 +10,7 @@ import type {
   ProjectBundle,
   ProjectDesignSystem,
   ProjectSettings,
+  PromptIntentType,
   ProviderId,
   ReferenceSource,
   SelectedFrameContext,
@@ -31,6 +32,7 @@ export type RunRequestPayload = {
   tailwindEnabled: boolean;
   attachments?: ComposerAttachment[];
   selectedFrameContext?: SelectedFrameContext;
+  intentHint?: PromptIntentType;
 };
 
 async function request<T>(apiBaseUrl: string, path: string, options?: RequestInit): Promise<T> {

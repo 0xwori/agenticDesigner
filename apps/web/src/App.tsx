@@ -1026,12 +1026,23 @@ function AppContent() {
       variation,
       tailwindEnabled: tailwindOverride,
       attachments: imageAttachment ? [imageAttachment] : undefined,
-      selectedFrameContext
+      selectedFrameContext,
+      intentHint: runMode === "edit-selected" && selectedFrame && !imageAttachment ? "screen-action" as const : undefined
     } as const;
 
     try {
       let runId: string;
       if (runMode === "edit-selected" && selectedFrame && !imageAttachment) {
+        // Phase 2.3: Optimistic "building" state for immediate visual feedback
+        setBundle((current) => {
+          if (!current) return current;
+          return {
+            ...current,
+            frames: current.frames.map((f) =>
+              f.id === selectedFrame.id ? { ...f, status: "building" as const } : f
+            )
+          };
+        });
         const { variation: _ignoredVariation, ...editPayload } = payload;
         const run = await startEditRun(getApiBaseUrl(preferences.apiBaseUrl), selectedFrame.id, {
           ...editPayload
