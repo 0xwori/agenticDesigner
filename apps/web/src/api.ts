@@ -3,7 +3,9 @@ import type {
   DesignMode,
   DesignSystemMode,
   DevicePreset,
+  FlowDocument,
   Frame,
+  FrameKind,
   FrameVersion,
   PipelineEvent,
   Project,
@@ -316,7 +318,16 @@ export function markReferenceDesignSystemNeedsEdits(apiBaseUrl: string, referenc
 export function createManualFrame(
   apiBaseUrl: string,
   projectId: string,
-  payload: { devicePreset: DevicePreset; mode: DesignMode; tailwindEnabled: boolean }
+  payload: {
+    devicePreset?: DevicePreset;
+    mode?: DesignMode;
+    tailwindEnabled?: boolean;
+    name?: string;
+    position?: { x: number; y: number };
+    size?: { width: number; height: number };
+    frameKind?: FrameKind;
+    flowDocument?: FlowDocument;
+  }
 ) {
   return request<Frame & { versions: FrameVersion[] }>(apiBaseUrl, `/projects/${encodeURIComponent(projectId)}/frames`, {
     method: "POST",
@@ -337,6 +348,41 @@ export function updateFrameLayout(
 ) {
   return request<Frame>(apiBaseUrl, `/frames/${encodeURIComponent(frameId)}/layout`, {
     method: "PATCH",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function updateFlowDocument(
+  apiBaseUrl: string,
+  frameId: string,
+  flowDocument: FlowDocument
+) {
+  return request<Frame>(apiBaseUrl, `/frames/${encodeURIComponent(frameId)}/flow-document`, {
+    method: "PATCH",
+    body: JSON.stringify({ flowDocument })
+  });
+}
+
+export function sendFlowAction(
+  apiBaseUrl: string,
+  frameId: string,
+  payload: {
+    prompt: string;
+    provider: string;
+    model: string;
+    apiKey?: string;
+    attachments?: ComposerAttachment[];
+    focusedAreaId?: string;
+  }
+) {
+  return request<{
+    ok: boolean;
+    frameId: string;
+    commands: unknown[];
+    flowDocument: FlowDocument;
+    summary: string;
+  }>(apiBaseUrl, `/frames/${encodeURIComponent(frameId)}/flow-action`, {
+    method: "POST",
     body: JSON.stringify(payload)
   });
 }

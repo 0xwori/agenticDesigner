@@ -1,4 +1,5 @@
 export * from "./types/core.js";
+export * from "./types/flow.js";
 export * from "./types/project.js";
 export * from "./types/references.js";
 export * from "./types/frames.js";

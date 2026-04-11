@@ -9,6 +9,8 @@ import {
   type DesignSystemChecklist,
   type DesignSystemComponentFamily,
   type DesignSystemMode,
+  type FlowDocument,
+  type FrameKind,
   PIPELINE_STAGES,
   type DesignMode,
   type DevicePreset,
@@ -3096,19 +3098,42 @@ export async function createManualFrame(input: {
   devicePreset: DevicePreset;
   mode: DesignMode;
   tailwindEnabled: boolean;
+  name?: string;
+  position?: { x: number; y: number };
+  size?: { width: number; height: number };
+  frameKind?: FrameKind;
+  flowDocument?: FlowDocument;
 }) {
   const bundle = await getProjectBundle(input.projectId);
   if (!bundle) {
     throw new Error("Project not found.");
   }
 
-  const style = (await getProjectStyleContexts(input.projectId))[0] ?? buildFallbackStyleContext();
   const existingCount = bundle.frames.length;
-  const frameSize = computeFrameSize(input.devicePreset);
-  const framePosition = computeNextFramePosition(bundle.frames, frameSize);
+  const frameSize = input.size ?? computeFrameSize(input.devicePreset);
+  const framePosition = input.position ?? computeNextFramePosition(bundle.frames, frameSize);
+
+  // Flow frames don't need generated artifacts
+  if (input.frameKind === "flow") {
+    const frame = await createFrameRecord({
+      projectId: input.projectId,
+      name: input.name ?? `Flow Board ${existingCount + 1}`,
+      devicePreset: input.devicePreset,
+      mode: input.mode,
+      position: framePosition,
+      size: frameSize,
+      status: "ready",
+      selected: true,
+      frameKind: "flow",
+      flowDocument: input.flowDocument,
+    });
+    return frame.id;
+  }
+
+  const style = (await getProjectStyleContexts(input.projectId))[0] ?? buildFallbackStyleContext();
   const frame = await createFrameRecord({
     projectId: input.projectId,
-    name: `Blank Screen ${existingCount + 1}`,
+    name: input.name ?? `Blank Screen ${existingCount + 1}`,
     devicePreset: input.devicePreset,
     mode: input.mode,
     position: framePosition,

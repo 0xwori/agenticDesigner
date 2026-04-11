@@ -1,6 +1,7 @@
 import type { CaptureLogEntry } from "../lib/figmaCapture";
-import type { ComposerAttachment, DesignMode, DesignSystemMode, DevicePreset, PipelineEvent, ProviderId, ProjectBundle, SurfaceTarget } from "@designer/shared";
+import type { ComposerAttachment, DesignMode, DesignSystemMode, DevicePreset, FrameKind, PipelineEvent, ProviderId, ProjectBundle, SurfaceTarget } from "@designer/shared";
 
+export type CanvasMode = "design" | "flow";
 export type RunMode = "new-frame" | "edit-selected";
 export type CopyState = "idle" | "capturing" | "copied" | "failed";
 
@@ -123,6 +124,8 @@ export type AppUIState = {
   pendingFigmaAttachUrl: string | null;
   isFrameInteractionUnlocked: boolean;
   pendingCanvasCards: PendingCanvasCard[];
+  canvasMode: CanvasMode;
+  lastFlowFrameId: string | null;
 };
 
 export type AppState = {

@@ -214,6 +214,8 @@ export function useUIState() {
       setPendingCanvasCards: ((v) => set("pendingCanvasCards", v)) as Setter<AppUIState, "pendingCanvasCards">,
       setBrandPickerOpen: ((v) => set("isBrandPickerOpen", v)) as Setter<AppUIState, "isBrandPickerOpen">,
       setActiveBrandName: ((v) => set("activeBrandName", v)) as Setter<AppUIState, "activeBrandName">,
+      setCanvasMode: ((v) => set("canvasMode", v)) as Setter<AppUIState, "canvasMode">,
+      setLastFlowFrameId: ((v) => set("lastFlowFrameId", v)) as Setter<AppUIState, "lastFlowFrameId">,
     };
   }, [setState]);
 
@@ -234,6 +236,8 @@ export function useUIState() {
     pendingFigmaAttachUrl: state.pendingFigmaAttachUrl,
     isFrameInteractionUnlocked: state.isFrameInteractionUnlocked,
     pendingCanvasCards: state.pendingCanvasCards,
+    canvasMode: state.canvasMode,
+    lastFlowFrameId: state.lastFlowFrameId,
     ...setters,
   };
 }

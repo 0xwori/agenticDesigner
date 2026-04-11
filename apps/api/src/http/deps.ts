@@ -13,6 +13,7 @@ import {
   getReferenceSource,
   resetReferenceDesignSystemMetadata,
   upsertProjectDesignSystem,
+  updateFlowDocument,
   updateFrameLayout,
   updateProjectSettings,
   updateReferenceSource
@@ -65,6 +66,7 @@ export type ApiDeps = {
   createManualFrame: typeof createManualFrame;
   getFrameWithVersions: typeof getFrameWithVersions;
   updateFrameLayout: typeof updateFrameLayout;
+  updateFlowDocument: typeof updateFlowDocument;
   deleteFrame: typeof deleteFrame;
   getFrame: typeof getFrame;
   getFrameVersions: typeof getFrameVersions;
@@ -101,6 +103,7 @@ export const defaultApiDeps: ApiDeps = {
   deleteFrame,
   getFrameWithVersions,
   updateFrameLayout,
+  updateFlowDocument,
   getFrame,
   getFrameVersions,
   createPipelineRun,

@@ -1,4 +1,5 @@
 import type { DesignMode, DevicePreset } from "./core.js";
+import type { FrameKind, FlowDocument } from "./flow.js";
 
 export interface Frame {
   id: string;
@@ -17,6 +18,8 @@ export interface Frame {
   };
   currentVersionId: string | null;
   status: "building" | "ready";
+  frameKind?: FrameKind;
+  flowDocument?: FlowDocument;
   createdAt: string;
   updatedAt: string;
 }

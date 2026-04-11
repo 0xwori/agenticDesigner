@@ -5,7 +5,9 @@ import {
   type DesignSystemChecklist,
   type DesignSystemStatus,
   type DevicePreset,
+  type FlowDocument,
   type Frame,
+  type FrameKind,
   type FrameVersion,
   type FrameWithVersions,
   type PipelineEvent,
@@ -235,6 +237,8 @@ function mapFrameRow(row: Record<string, any>): Frame {
     size: parseJson<{ width: number; height: number }>(row.size, { width: 1024, height: 720 }),
     currentVersionId: row.current_version_id,
     status: row.status,
+    frameKind: (row.frame_kind as FrameKind) ?? "design",
+    flowDocument: row.flow_document ? parseJson<FlowDocument>(row.flow_document, undefined as any) : undefined,
     createdAt: toIso(row.created_at) ?? new Date().toISOString(),
     updatedAt: toIso(row.updated_at) ?? new Date().toISOString()
   };
@@ -398,6 +402,11 @@ export async function initDatabase() {
 
     await client.query(`
       ALTER TABLE pipeline_runs ADD COLUMN IF NOT EXISTS pass_outputs JSONB NOT NULL DEFAULT '{}';
+    `);
+
+    await client.query(`
+      ALTER TABLE frames ADD COLUMN IF NOT EXISTS frame_kind TEXT NOT NULL DEFAULT 'design';
+      ALTER TABLE frames ADD COLUMN IF NOT EXISTS flow_document JSONB;
     `);
   } finally {
     await client.query("SELECT pg_advisory_unlock($1)", [setupLockId]).catch(() => {
@@ -752,6 +761,8 @@ export async function createFrameRecord(input: {
   size: { width: number; height: number };
   status: "building" | "ready";
   selected?: boolean;
+  frameKind?: FrameKind;
+  flowDocument?: FlowDocument;
 }): Promise<Frame> {
   if (input.selected) {
     await pool.query(`UPDATE frames SET selected = FALSE WHERE project_id = $1`, [input.projectId]);
@@ -761,9 +772,9 @@ export async function createFrameRecord(input: {
   const result = await pool.query(
     `
       INSERT INTO frames (
-        id, project_id, name, device_preset, mode, selected, position, size, status
+        id, project_id, name, device_preset, mode, selected, position, size, status, frame_kind, flow_document
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9)
+      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11::jsonb)
       RETURNING *
     `,
     [
@@ -775,7 +786,9 @@ export async function createFrameRecord(input: {
       Boolean(input.selected),
       JSON.stringify(input.position),
       JSON.stringify(input.size),
-      input.status
+      input.status,
+      input.frameKind ?? "design",
+      input.flowDocument ? JSON.stringify(input.flowDocument) : null
     ]
   );
 
@@ -818,6 +831,23 @@ export async function updateFrameLayout(
     ]
   );
 
+  return mapFrameRow(result.rows[0]);
+}
+
+export async function updateFlowDocument(frameId: string, flowDocument: FlowDocument): Promise<Frame | null> {
+  const result = await pool.query(
+    `
+      UPDATE frames
+      SET flow_document = $2::jsonb,
+          updated_at = NOW()
+      WHERE id = $1 AND frame_kind = 'flow'
+      RETURNING *
+    `,
+    [frameId, JSON.stringify(flowDocument)]
+  );
+  if (result.rowCount === 0) {
+    return null;
+  }
   return mapFrameRow(result.rows[0]);
 }
 

@@ -2,13 +2,14 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type {
   DesignSystemMode,
   DevicePreset,
+  FlowDocument,
   FrameVersion,
   PipelineEvent,
   ProjectSettings,
   ReferenceSource,
   SurfaceTarget
 } from "@designer/shared";
-import { isMobilePreset } from "@designer/shared";
+import { createEmptyFlowDocument, isMobilePreset } from "@designer/shared";
 import { select, type Selection } from "d3-selection";
 import { zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
 import {
@@ -21,11 +22,20 @@ import {
   resyncReference,
   startEditRun,
   startGenerateRun,
+  sendFlowAction,
+  updateFlowDocument,
   updateFrameLayout,
   updateProjectSettings
 } from "./api";
 import { captureSelectorToFigmaClipboard, type CaptureLogEntry } from "./lib/figmaCapture";
 import { ArtboardPane } from "./components/ArtboardPane";
+import {
+  ensureCanonicalFlowDocument,
+  resolveActiveFlowFrame,
+  resolveFlowModeTarget,
+  shouldUseFlowActionRoute,
+} from "./lib/flowMode";
+import { replaceFlowDocumentInBundle, rollbackFlowDocumentIfCurrent } from "./lib/flowDocumentState";
 import { PromptPanel } from "./components/PromptPanel";
 import { WorkspaceSettingsModal } from "./components/WorkspaceSettingsModal";
 import { BrandPickerModal } from "./components/BrandPickerModal";
@@ -112,6 +122,8 @@ const appStore = createStore<AppState>({
     pendingFigmaAttachUrl: null,
     isFrameInteractionUnlocked: false,
     pendingCanvasCards: [],
+    canvasMode: "design",
+    lastFlowFrameId: null,
   },
 });
 
@@ -175,6 +187,8 @@ function AppContent() {
     pendingFigmaAttachUrl, setPendingFigmaAttachUrl,
     isFrameInteractionUnlocked, setFrameInteractionUnlocked,
     pendingCanvasCards, setPendingCanvasCards,
+    canvasMode, setCanvasMode,
+    lastFlowFrameId, setLastFlowFrameId,
   } = useUIState();
 
   const bundleRef = useRef(bundle);
@@ -192,6 +206,7 @@ function AppContent() {
   const frameHeightModeRef = useRef<Map<string, "standard" | "content">>(new Map());
   const framePromptsRef = useRef<Map<string, string>>(new Map());
   const [framePromptsVersion, setFramePromptsVersion] = useState(0);
+  const [focusedFlowAreaId, setFocusedFlowAreaId] = useState<string | null>(null);
 
   // Stable ref for openProjectDesignSystem — written after dsWorkspace is created
   const openProjectDesignSystemRef = useRef<() => Promise<void>>(async () => {});
@@ -424,7 +439,7 @@ function AppContent() {
     }
   }, [chatEvents, promptHistory]);
 
-  // Delete/Backspace to remove selected frame (except design-system frames)
+  // Delete/Backspace to remove selected frame (except design-system and flow frames)
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Delete" && event.key !== "Backspace") return;
@@ -439,7 +454,7 @@ function AppContent() {
 
       // Protect design-system frames from deletion
       const meta = extractFrameSourceMeta(selected);
-      if (meta?.sourceRole === "design-system") return;
+      if (meta?.sourceRole === "design-system" || selected.frameKind === "flow") return;
 
       event.preventDefault();
       // Optimistically remove from local state
@@ -521,7 +536,10 @@ function AppContent() {
                 width: isMobilePreset(frame.devicePreset)
                   ? frame.size.width
                   : Math.max(220, interaction.originWidth + scaledDeltaX),
-                height: Math.max(260, interaction.originHeight + scaledDeltaY)
+                height:
+                  frame.frameKind === "flow"
+                    ? frame.size.height
+                    : Math.max(260, interaction.originHeight + scaledDeltaY)
               }
             };
           })
@@ -992,22 +1010,103 @@ function AppContent() {
       }
     }
 
-    if (!cleanedPrompt && imageAttachment) {
+    if (canvasMode === "flow" && activeFlowFrame && !cleanedPrompt && imageAttachment) {
+      cleanedPrompt = "Add the attached image to the flow board in the user-journey lane.";
+    } else if (!cleanedPrompt && imageAttachment) {
       cleanedPrompt = "Rebuild the attached image into an editable screen and refresh the canonical design-system board.";
     }
 
-    const selectedSourceMeta = selectedFrame ? extractFrameSourceMeta(selectedFrame) : null;
-    const selectedFrameContext = selectedFrame
+    if (canvasMode === "flow" && !activeFlowFrame && (cleanedPrompt || imageAttachment) && !figmaUrl) {
+      appendSystemEvent({
+        status: "error",
+        kind: "action",
+        message: "Open flow mode first so the prompt has an active flow board to update."
+      });
+      return;
+    }
+
+    if (
+      activeFlowFrame &&
+      selectedFrame?.id !== activeFlowFrame.id &&
+      canvasMode === "flow"
+    ) {
+      await selectFrame(activeFlowFrame.id);
+    }
+
+    // ---- Flow-action dispatch: route to LLM mutation handler when in flow mode ----
+    if (
+      shouldUseFlowActionRoute({
+        canvasMode,
+        flowFrameId: activeFlowFrame?.id ?? null,
+        prompt: cleanedPrompt,
+        figmaUrl
+      }) &&
+      activeFlowFrame
+    ) {
+      const flowRunId = createLocalRunId("flow-action");
+      appendPromptTurn({ runId: flowRunId, prompt: promptValue });
+      setComposerPrompt("");
+      setComposerAttachments([]);
+
+      appendChatEvent({
+        runId: flowRunId,
+        stage: "system",
+        status: "info",
+        kind: "action",
+        message: "Running flow-action: asking the agent to update the flow board..."
+      });
+
+      try {
+        const result = await sendFlowAction(
+          getApiBaseUrl(preferences.apiBaseUrl),
+          activeFlowFrame.id,
+          {
+            prompt: cleanedPrompt,
+            provider: preferences.provider,
+            model: preferences.model,
+            apiKey: preferences.apiKey.trim() || undefined,
+            attachments: imageAttachment ? [imageAttachment] : undefined,
+            focusedAreaId: focusedFlowAreaId ?? undefined,
+          }
+        );
+
+        if (result.flowDocument) {
+          await handleFlowDocumentChange(activeFlowFrame.id, result.flowDocument);
+        }
+
+        appendChatEvent({
+          runId: flowRunId,
+          stage: "system",
+          status: "success",
+          kind: "summary",
+          message: result.summary || `Applied ${result.commands?.length ?? 0} flow mutation(s).`
+        });
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        appendChatEvent({
+          runId: flowRunId,
+          stage: "system",
+          status: "error",
+          kind: "summary",
+          message: `Flow action failed: ${message}`
+        });
+        pushDebugLog("flow-action", reason, { frameId: activeFlowFrame.id }, "error");
+      }
+      return;
+    }
+
+    const selectedSourceMeta = selectedDesignFrame ? extractFrameSourceMeta(selectedDesignFrame) : null;
+    const selectedFrameContext = selectedDesignFrame
       ? {
-          frameId: selectedFrame.id,
-          name: selectedFrame.name,
-          devicePreset: selectedFrame.devicePreset,
-          mode: selectedFrame.mode,
+          frameId: selectedDesignFrame.id,
+          name: selectedDesignFrame.name,
+          devicePreset: selectedDesignFrame.devicePreset,
+          mode: selectedDesignFrame.mode,
           size: {
-            width: selectedFrame.size.width,
-            height: selectedFrame.size.height
+            width: selectedDesignFrame.size.width,
+            height: selectedDesignFrame.size.height
           },
-          latestVersionId: selectedFrame.currentVersionId,
+          latestVersionId: selectedDesignFrame.currentVersionId,
           sourceType: selectedSourceMeta?.sourceType ?? null,
           sourceRole: selectedSourceMeta?.sourceRole ?? null,
           sourceGroupId: selectedSourceMeta?.sourceGroupId ?? null
@@ -1027,24 +1126,24 @@ function AppContent() {
       tailwindEnabled: tailwindOverride,
       attachments: imageAttachment ? [imageAttachment] : undefined,
       selectedFrameContext,
-      intentHint: runMode === "edit-selected" && selectedFrame && !imageAttachment ? "screen-action" as const : undefined
+      intentHint: runMode === "edit-selected" && selectedDesignFrame && !imageAttachment ? "screen-action" as const : undefined
     } as const;
 
     try {
       let runId: string;
-      if (runMode === "edit-selected" && selectedFrame && !imageAttachment) {
+      if (runMode === "edit-selected" && selectedDesignFrame && !imageAttachment) {
         // Phase 2.3: Optimistic "building" state for immediate visual feedback
         setBundle((current) => {
           if (!current) return current;
           return {
             ...current,
             frames: current.frames.map((f) =>
-              f.id === selectedFrame.id ? { ...f, status: "building" as const } : f
+              f.id === selectedDesignFrame.id ? { ...f, status: "building" as const } : f
             )
           };
         });
         const { variation: _ignoredVariation, ...editPayload } = payload;
-        const run = await startEditRun(getApiBaseUrl(preferences.apiBaseUrl), selectedFrame.id, {
+        const run = await startEditRun(getApiBaseUrl(preferences.apiBaseUrl), selectedDesignFrame.id, {
           ...editPayload
         });
         runId = run.runId;
@@ -1083,7 +1182,7 @@ function AppContent() {
       pushDebugLog("start-run", "Pipeline run started", {
         runId,
         mode: runMode,
-        selectedFrameId: selectedFrame?.id ?? null,
+        selectedFrameId: selectedDesignFrame?.id ?? activeFlowFrame?.id ?? null,
         provider: preferences.provider,
         model: preferences.model,
         devicePreset: selectedDevice,
@@ -1178,6 +1277,13 @@ function AppContent() {
       return;
     }
 
+    if (canvasMode === "flow") {
+      setViewportPanning(false);
+      zoomBehaviorRef.current = null;
+      zoomSelectionRef.current = null;
+      return;
+    }
+
     const selection = select(viewportElement);
     const behavior = zoom<HTMLDivElement, unknown>()
       .scaleExtent([VIEWPORT_MIN_SCALE, VIEWPORT_MAX_SCALE])
@@ -1197,7 +1303,7 @@ function AppContent() {
           const wheelEvent = event as WheelEvent;
           return wheelEvent.ctrlKey || wheelEvent.metaKey;
         }
-        if (target?.closest(".frame-card")) {
+        if (target?.closest(".frame-card, .flow-frame-card")) {
           return false;
         }
         if (eventType === "mousedown") {
@@ -1260,7 +1366,7 @@ function AppContent() {
       zoomBehaviorRef.current = null;
       zoomSelectionRef.current = null;
     };
-  }, [applyViewportTransform, loading]);
+  }, [applyViewportTransform, canvasMode, loading]);
 
   const focusViewportOnFrame = useCallback((frameId: string) => {
     if (!bundle) {
@@ -1340,10 +1446,16 @@ function AppContent() {
         sourceRole: sourceMeta?.sourceRole ?? null
       }
     });
-    focusViewportOnFrame(selectedFrame.id);
+    if (selectedFrame.frameKind !== "flow") {
+      focusViewportOnFrame(selectedFrame.id);
+    }
   }, [appendSystemEvent, focusViewportOnFrame, selectedFrame]);
 
   function zoomBy(factor: number) {
+    if (canvasMode === "flow") {
+      return;
+    }
+
     const behavior = zoomBehaviorRef.current;
     const selection = zoomSelectionRef.current;
     const viewportElement = artboardViewportRef.current;
@@ -1471,8 +1583,13 @@ function AppContent() {
   }
 
   async function selectFrame(frameId: string) {
-    if (!bundleRef.current) {
+    const currentBundle = bundleRef.current;
+    if (!currentBundle) {
       return;
+    }
+    const frame = currentBundle.frames.find((item) => item.id === frameId);
+    if (frame?.frameKind === "flow") {
+      setLastFlowFrameId(frameId);
     }
     setRunMode("edit-selected");
     setBundle((current) => {
@@ -1580,6 +1697,18 @@ function AppContent() {
       return;
     }
 
+    if (canvasMode === "flow") {
+      const flowTarget = resolveActiveFlowFrame(
+        currentBundle.frames.filter((frame) => frame.frameKind === "flow"),
+        currentBundle.frames.find((frame) => frame.selected && frame.frameKind === "flow")?.id ?? null,
+        lastFlowFrameId
+      );
+      if (flowTarget && !flowTarget.selected) {
+        await selectFrame(flowTarget.id);
+      }
+      return;
+    }
+
     const selected = currentBundle.frames.find((frame) => frame.selected);
     if (!selected) {
       setRunMode("new-frame");
@@ -1609,7 +1738,7 @@ function AppContent() {
     await updateFrameLayout(getApiBaseUrl(preferences.apiBaseUrl), selected.id, { selected: false }).catch((reason) => {
       pushDebugLog("select-frame", reason, { frameId: selected.id, mode: "deselect" }, "warn");
     });
-  }, [preferences.apiBaseUrl, pushDebugLog, showToast]);
+  }, [canvasMode, lastFlowFrameId, preferences.apiBaseUrl, pushDebugLog, selectFrame, showToast]);
 
   const frameLookup = useMemo(() => {
     if (!bundle) {
@@ -1759,6 +1888,151 @@ function AppContent() {
 
   const artboardBackgroundStyle = createArtboardBackgroundStyle(viewport);
 
+  // ── Flow mode helpers ─────────────────────────────────────────────────
+  const allFrames = bundle?.frames ?? [];
+  const designFrames = useMemo(
+    () => allFrames.filter((f) => f.frameKind !== "flow"),
+    [allFrames]
+  );
+  const flowFrames = useMemo(
+    () => allFrames.filter((f) => f.frameKind === "flow"),
+    [allFrames]
+  );
+  const selectedDesignFrame = useMemo(
+    () => (selectedFrame?.frameKind === "flow" ? null : selectedFrame),
+    [selectedFrame]
+  );
+  const activeFlowFrame = useMemo(
+    () =>
+      resolveActiveFlowFrame(
+        flowFrames,
+        selectedFrame?.frameKind === "flow" ? selectedFrame.id : null,
+        lastFlowFrameId
+      ),
+    [flowFrames, lastFlowFrameId, selectedFrame]
+  );
+  const filteredFrames = canvasMode === "flow" ? flowFrames : designFrames;
+
+  const createFlowBoard = useCallback(async () => {
+    if (!bundle) {
+      return null;
+    }
+
+    try {
+      const nextBoardNumber = flowFrames.length + 1;
+      const frame = await createManualFrame(getApiBaseUrl(preferences.apiBaseUrl), bundle.project.id, {
+        name: nextBoardNumber === 1 ? "Flow Board" : `Flow Board ${nextBoardNumber}`,
+        devicePreset: "desktop",
+        mode: "high-fidelity",
+        position: { x: 120, y: 120 },
+        size: { width: 1400, height: 800 },
+        frameKind: "flow",
+        flowDocument: createEmptyFlowDocument(),
+      });
+      setBundle((current) => {
+        if (!current) return current;
+        return {
+          ...current,
+          frames: [
+            ...current.frames.map((item) => ({ ...item, selected: false })),
+            { ...frame, selected: true, versions: [] },
+          ],
+        };
+      });
+      setLastFlowFrameId(frame.id);
+      setRunMode("edit-selected");
+      await updateFrameLayout(getApiBaseUrl(preferences.apiBaseUrl), frame.id, { selected: true }).catch((reason) => {
+        pushDebugLog("select-frame", reason, { frameId: frame.id, mode: "flow-create-select" }, "warn");
+      });
+      return frame;
+    } catch (reason) {
+      pushDebugLog("create-flow-board", reason, { projectId: bundle.project.id }, "error");
+      return null;
+    }
+  }, [
+    bundle,
+    flowFrames.length,
+    preferences.apiBaseUrl,
+    pushDebugLog,
+    setBundle,
+    setLastFlowFrameId,
+    setRunMode,
+  ]);
+
+  const handleCanvasModeChange = useCallback(async (mode: "design" | "flow") => {
+    setCanvasMode(mode);
+    if (mode !== "flow") {
+      setFocusedFlowAreaId(null);
+      if (selectedFrame?.frameKind === "flow") {
+        setBundle((current) => {
+          if (!current) return current;
+          return {
+            ...current,
+            frames: current.frames.map((frame) =>
+              frame.frameKind === "flow" ? { ...frame, selected: false } : frame
+            ),
+          };
+        });
+        setRunMode("new-frame");
+      }
+      return;
+    }
+
+    const transitionTarget = resolveFlowModeTarget(flowFrames, lastFlowFrameId);
+    if (transitionTarget.selectedFlowFrameId) {
+      await selectFrame(transitionTarget.selectedFlowFrameId);
+      setLastFlowFrameId(transitionTarget.selectedFlowFrameId);
+      return;
+    }
+
+    if (!bundle || !transitionTarget.shouldCreateFlowBoard) {
+      return;
+    }
+
+    await createFlowBoard();
+  }, [
+    bundle,
+    createFlowBoard,
+    flowFrames,
+    lastFlowFrameId,
+    selectFrame,
+    selectedFrame,
+    setCanvasMode,
+    setFocusedFlowAreaId,
+    setLastFlowFrameId,
+    setRunMode,
+  ]);
+
+  const handleCreateFlowBoard = useCallback(async () => {
+    await createFlowBoard();
+  }, [createFlowBoard]);
+
+  const handleFlowDocumentChange = useCallback(async (frameId: string, doc: FlowDocument) => {
+    const previousDoc = bundleRef.current?.frames.find((frame) => frame.id === frameId)?.flowDocument;
+
+    setBundle((current) => replaceFlowDocumentInBundle(current, frameId, doc));
+    try {
+      await updateFlowDocument(getApiBaseUrl(preferences.apiBaseUrl), frameId, doc);
+    } catch (err) {
+      pushDebugLog("flow-document-save", err, { frameId }, "error");
+      showToast("Flow board save failed. Reverted the local change.", 3600);
+      setBundle((current) => rollbackFlowDocumentIfCurrent(current, frameId, doc, previousDoc));
+    }
+  }, [preferences.apiBaseUrl, pushDebugLog, setBundle, showToast]);
+
+  useEffect(() => {
+    if (canvasMode !== "flow" || !activeFlowFrame) {
+      return;
+    }
+
+    const ensured = ensureCanonicalFlowDocument(activeFlowFrame, flowFrames);
+    if (!ensured.changed) {
+      return;
+    }
+
+    void handleFlowDocumentChange(activeFlowFrame.id, ensured.flowDocument);
+  }, [activeFlowFrame, canvasMode, flowFrames, handleFlowDocumentChange]);
+
   async function copyDebugLogs() {
     const content = debugLogs
       .map((entry) => {
@@ -1901,7 +2175,7 @@ function AppContent() {
         artboardBackgroundStyle={artboardBackgroundStyle}
         viewport={viewport}
         viewportRef={artboardViewportRef}
-        frames={bundle?.frames ?? []}
+        frames={filteredFrames}
         frameLookup={frameLookup}
         frameMetaById={frameMetaById}
         frameLinks={frameLinks}
@@ -1927,6 +2201,15 @@ function AppContent() {
         toggleFrameHeight={toggleFrameHeight}
         onRegenerate={(fId) => void handleRegenerate(fId)}
         framePrompts={framePromptsSnapshot}
+        canvasMode={canvasMode}
+        onCanvasModeChange={handleCanvasModeChange}
+        activeFlowFrame={activeFlowFrame}
+        allDesignFrames={designFrames}
+        allFlowFrames={flowFrames}
+        onFlowDocumentChange={handleFlowDocumentChange}
+        onFocusedFlowAreaChange={setFocusedFlowAreaId}
+        onSelectFlowBoard={selectFrame}
+        onCreateFlowBoard={handleCreateFlowBoard}
       />
 
       {captureFrame ? (

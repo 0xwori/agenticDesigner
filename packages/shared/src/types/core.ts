@@ -16,7 +16,7 @@ export type EventKind = "status" | "summary" | "action";
 export type SyncStatus = "syncing" | "synced" | "failed";
 export type ReferenceScope = "frame" | "page";
 export type DesignSystemStatus = "draft" | "approved" | "needs-edits";
-export type PromptIntentType = "screen-action" | "question" | "design-system";
+export type PromptIntentType = "screen-action" | "question" | "design-system" | "flow-action";
 export type AgentRole =
   | "orchestrator"
   | "web-designer"

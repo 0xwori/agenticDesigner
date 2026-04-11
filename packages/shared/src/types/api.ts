@@ -1,4 +1,5 @@
 import type { DesignMode, DesignSystemMode, DevicePreset, ProviderId, SurfaceTarget } from "./core.js";
+import type { FrameKind, FlowSummary } from "./flow.js";
 import type { FrameWithVersions } from "./frames.js";
 import type { PipelineRun } from "./pipeline.js";
 import type { ProjectDesignSystem } from "./designSystem.js";
@@ -37,6 +38,8 @@ export interface SelectedFrameContext {
   sourceType: string | null;
   sourceRole: string | null;
   sourceGroupId: string | null;
+  frameKind?: FrameKind;
+  flowSummary?: FlowSummary;
 }
 
 export interface GenerateRunInput {

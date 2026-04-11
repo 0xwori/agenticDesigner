@@ -80,6 +80,52 @@ export function detectIntentHeuristic(prompt: string): PromptIntent {
   };
 }
 
+/**
+ * Detects flow-action intent when the selected frame is a flow board.
+ * Call before the general heuristic; returns null if the prompt is not flow-related.
+ */
+export function detectFlowIntentHeuristic(
+  prompt: string,
+  frameKind: string | undefined
+): PromptIntent | null {
+  if (frameKind !== "flow") return null;
+
+  const normalized = prompt.trim().toLowerCase();
+  const flowVerb =
+    /\b(add|connect|link|remove|generate|create|upload|disconnect|attach|insert)\b/.test(normalized);
+
+  if (flowVerb) {
+    return {
+      type: "flow-action",
+      reason: "Flow board is selected and prompt contains a flow mutation verb.",
+      shouldTakeAction: true,
+      designSystemAction: "none",
+    };
+  }
+
+  // If a flow board is selected but prompt looks like a question, treat as question
+  const isQuestion =
+    normalized.endsWith("?") ||
+    /^(what|why|how|when|where|who|can you|could you|would you|is it|are there)\b/.test(normalized);
+
+  if (isQuestion) {
+    return {
+      type: "question",
+      reason: "Flow board context but prompt is asking a question.",
+      shouldTakeAction: false,
+      designSystemAction: "none",
+    };
+  }
+
+  // Default: treat as flow-action when a flow board is selected
+  return {
+    type: "flow-action",
+    reason: "Flow board is selected; routing to flow-action by default.",
+    shouldTakeAction: true,
+    designSystemAction: "none",
+  };
+}
+
 export async function classifyPromptIntent(input: {
   prompt: string;
   provider: ProviderId;
@@ -98,7 +144,7 @@ export async function classifyPromptIntent(input: {
     allowMock: false,
     jsonMode: true,
     system:
-      "Classify prompt intent for a design assistant. Return JSON with keys: type (screen-action|question|design-system), shouldTakeAction (boolean), reason (string), designSystemAction (none|approve|iterate).",
+      "Classify prompt intent for a design assistant. Return JSON with keys: type (screen-action|question|design-system|flow-action), shouldTakeAction (boolean), reason (string), designSystemAction (none|approve|iterate). Use flow-action when the prompt targets a flow board (adding screens, journey steps, connections, code blocks).",
     prompt: `Prompt: ${input.prompt}
 Editing mode: ${input.editing}
 Has synced reference: ${input.hasSyncedReference}
@@ -108,7 +154,7 @@ Return strict JSON.`
 
   const parsed = asJsonObject<Partial<PromptIntent>>(completion.content, fallback);
   const type =
-    parsed.type === "screen-action" || parsed.type === "question" || parsed.type === "design-system"
+    parsed.type === "screen-action" || parsed.type === "question" || parsed.type === "design-system" || parsed.type === "flow-action"
       ? parsed.type
       : fallback.type;
   const designSystemAction =

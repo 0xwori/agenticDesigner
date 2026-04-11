@@ -1,7 +1,9 @@
 import type { Express } from "express";
+import { createEmptyFlowDocument } from "@designer/shared";
 import type { RunHub } from "../../services/runHub.js";
 import type { ApiDeps } from "../deps.js";
 import { sendApiError } from "../errors.js";
+import { runFlowAction } from "../../services/pipeline/flowAction.js";
 import {
   parseAttachments,
   parseDesignSystemMode,
@@ -27,7 +29,12 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
         projectId: request.params.id,
         devicePreset: parseDevicePreset(request.body?.devicePreset),
         mode: parseMode(request.body?.mode),
-        tailwindEnabled: parseTailwind(request.body?.tailwindEnabled)
+        tailwindEnabled: parseTailwind(request.body?.tailwindEnabled),
+        name: typeof request.body?.name === "string" ? request.body.name : undefined,
+        position: request.body?.position,
+        size: request.body?.size,
+        frameKind: request.body?.frameKind === "flow" ? "flow" : undefined,
+        flowDocument: request.body?.frameKind === "flow" ? request.body?.flowDocument : undefined,
       });
       const frame = await deps.getFrameWithVersions(frameId);
       response.status(201).json(frame);
@@ -63,6 +70,33 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
     response.json(frame);
   });
 
+  app.patch("/frames/:id/flow-document", async (request, response) => {
+    const existing = await deps.getFrame(request.params.id);
+    if (!existing) {
+      sendApiError(response, 404, "Frame not found.", "not_found");
+      return;
+    }
+    if (existing.frameKind !== "flow") {
+      sendApiError(response, 400, "Frame is not a flow board.", "validation_error");
+      return;
+    }
+    const flowDocument = request.body?.flowDocument;
+    if (!flowDocument || typeof flowDocument !== "object") {
+      sendApiError(response, 400, "flowDocument is required.", "validation_error");
+      return;
+    }
+    try {
+      const updated = await deps.updateFlowDocument(request.params.id, flowDocument);
+      if (!updated) {
+        sendApiError(response, 404, "Frame not found.", "not_found");
+        return;
+      }
+      response.json(updated);
+    } catch (error) {
+      sendApiError(response, 500, error instanceof Error ? error.message : String(error), "internal_error");
+    }
+  });
+
   app.get("/frames/:id", async (request, response) => {
     const frame = await deps.getFrameWithVersions(request.params.id);
     if (!frame) {
@@ -74,6 +108,16 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
   });
 
   app.delete("/frames/:id", async (request, response) => {
+    const frame = await deps.getFrame(request.params.id);
+    if (!frame) {
+      sendApiError(response, 404, "Frame not found.", "not_found");
+      return;
+    }
+    if (frame.frameKind === "flow") {
+      sendApiError(response, 400, "Flow boards are protected from deletion.", "validation_error");
+      return;
+    }
+
     const deleted = await deps.deleteFrame(request.params.id);
     if (!deleted) {
       sendApiError(response, 404, "Frame not found.", "not_found");
@@ -224,5 +268,74 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
     );
 
     response.status(202).json({ runId: run.id });
+  });
+
+  // ── Flow action (lightweight document mutation) ─────────────
+  app.post("/frames/:id/flow-action", async (request, response) => {
+    const frame = await deps.getFrame(request.params.id);
+    if (!frame) {
+      sendApiError(response, 404, "Frame not found.", "not_found");
+      return;
+    }
+    if (frame.frameKind !== "flow") {
+      sendApiError(response, 400, "Frame is not a flow board.", "validation_error");
+      return;
+    }
+
+    const prompt = typeof request.body?.prompt === "string" ? request.body.prompt.trim() : "";
+    if (!prompt) {
+      sendApiError(response, 400, "prompt is required.", "validation_error");
+      return;
+    }
+
+    let attachments;
+    try {
+      attachments = parseAttachments(request.body?.attachments);
+    } catch (error) {
+      sendApiError(response, 400, error instanceof Error ? error.message : String(error), "validation_error");
+      return;
+    }
+
+    try {
+      const provider = parseProvider(request.body?.provider);
+      const model = typeof request.body?.model === "string" ? request.body.model : "gpt-5.4-mini";
+      const apiKey = typeof request.body?.apiKey === "string" ? request.body.apiKey : undefined;
+
+      // Gather design frame names for the LLM context
+      const projectBundle = await deps.getProjectBundle(frame.projectId);
+      const designFrames = (projectBundle?.frames ?? [])
+        .filter((f) => f.frameKind !== "flow")
+        .map((f) => ({ id: f.id, name: f.name }));
+
+      const result = await runFlowAction({
+        prompt,
+        flowDocument: frame.flowDocument ?? createEmptyFlowDocument(),
+        designFrames,
+        provider,
+        model,
+        apiKey,
+        attachments,
+        focusedAreaId:
+          typeof request.body?.focusedAreaId === "string" && request.body.focusedAreaId.trim().length > 0
+            ? request.body.focusedAreaId.trim()
+            : undefined,
+      });
+
+      // Persist the updated document
+      if (result.commands.length > 0) {
+        await deps.updateFlowDocument(frame.id, result.updatedDocument);
+      }
+
+      response.json({
+        ok: true,
+        frameId: frame.id,
+        commands: result.commands,
+        flowDocument: result.updatedDocument,
+        summary: result.summary,
+      });
+    } catch (err) {
+      console.error("[flow-action] Error:", err);
+      sendApiError(response, 500, "Flow action failed.", "internal_error");
+    }
   });
 }
