@@ -59,6 +59,7 @@ type ArtboardPaneProps = {
   onCreateFlowBoard?: () => Promise<void>;
   onDeleteFlowBoard?: (frameId: string) => Promise<void>;
   onAskAgentForFlowBoard?: (frameId: string) => Promise<void>;
+  onOpenFlowBoardMemory?: (frameId: string) => Promise<void> | void;
   onOpenFlowStory?: (frameId: string) => Promise<void>;
   activeFlowBoardTask?: "agent" | "story" | null;
 };
@@ -104,6 +105,7 @@ export function ArtboardPane(props: ArtboardPaneProps) {
     onCreateFlowBoard,
     onDeleteFlowBoard,
     onAskAgentForFlowBoard,
+    onOpenFlowBoardMemory,
     onOpenFlowStory,
     activeFlowBoardTask,
   } = props;
@@ -309,6 +311,7 @@ export function ArtboardPane(props: ArtboardPaneProps) {
               onCreateFlowBoard={onCreateFlowBoard}
               onDeleteBoard={onDeleteFlowBoard}
               onAskAgentForBoard={onAskAgentForFlowBoard}
+              onOpenBoardMemory={onOpenFlowBoardMemory}
               onOpenFlowStory={onOpenFlowStory}
               boardBusyState={activeFlowBoardTask}
             />

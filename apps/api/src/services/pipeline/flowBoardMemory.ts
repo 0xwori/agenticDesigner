@@ -1,23 +1,15 @@
 import type {
-  FlowDocument,
   FlowBoardMemoryDocument,
-  FlowBoardMemoryJourneyNode,
   FlowBoardMemoryJourneyLaneId,
   FlowBoardMemoryState,
   JourneyStepArtifact,
   TechnicalBriefArtifact,
 } from "@designer/shared";
 import {
-  FLOW_LANE_LABELS,
-  FLOW_LANE_ORDER,
   createEmptyFlowBoardMemoryDocument,
-  getFlowGlobalColumn,
   normalizeFlowBoardMemoryDocument,
-  normalizeFlowDocument,
-  resolveFlowArea,
 } from "@designer/shared";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import type { FlowDesignFrameContext } from "./flowFrameContext.js";
 
 const TOP_LEVEL_KEYS = new Set([
   "version",
@@ -142,121 +134,6 @@ function parseJourneyKind(value: unknown, path: string): "step" | "decision" {
     return "decision";
   }
   throw new FlowBoardMemoryParseError("Journey kind must be either step or decision.", path);
-}
-
-function compareFlowCells(
-  doc: FlowDocument,
-  left: FlowDocument["cells"][number],
-  right: FlowDocument["cells"][number],
-) {
-  const columnDelta = getFlowGlobalColumn(doc, left) - getFlowGlobalColumn(doc, right);
-  if (columnDelta !== 0) {
-    return columnDelta;
-  }
-
-  const laneDelta = FLOW_LANE_ORDER.indexOf(left.laneId) - FLOW_LANE_ORDER.indexOf(right.laneId);
-  if (laneDelta !== 0) {
-    return laneDelta;
-  }
-
-  return left.id.localeCompare(right.id);
-}
-
-function toJourneyLaneId(laneId: FlowDocument["cells"][number]["laneId"]): FlowBoardMemoryJourneyLaneId | null {
-  if (laneId === "user-journey" || laneId === "normal-flow" || laneId === "unhappy-path") {
-    return laneId;
-  }
-  return null;
-}
-
-function getCellMemoryTitle(
-  cell: FlowDocument["cells"][number],
-  designFramesById: Map<string, FlowDesignFrameContext>,
-) {
-  switch (cell.artifact.type) {
-    case "design-frame-ref":
-      return designFramesById.get(cell.artifact.frameId)?.name ?? cell.artifact.frameId;
-    case "uploaded-image":
-      return cell.artifact.label?.trim() || "Board image";
-    case "journey-step":
-      return cell.artifact.text.trim() || "Journey step";
-    case "technical-brief":
-      return cell.artifact.title.trim() || "Technical note";
-  }
-}
-
-function getOrCreateScreenId(input: {
-  cell: FlowDocument["cells"][number];
-  screens: FlowBoardMemoryDocument["screens"];
-  artifactMappings: FlowBoardMemoryDocument["artifactMappings"];
-  screenIdsByKey: Map<string, string>;
-  designFramesById: Map<string, FlowDesignFrameContext>;
-}) {
-  const { cell, screens, artifactMappings, screenIdsByKey, designFramesById } = input;
-  if (cell.artifact.type !== "design-frame-ref" && cell.artifact.type !== "uploaded-image") {
-    return undefined;
-  }
-
-  const key =
-    cell.artifact.type === "design-frame-ref"
-      ? `frame:${cell.artifact.frameId}`
-      : `image:${cell.id}`;
-  const existing = screenIdsByKey.get(key);
-  if (existing) {
-    return existing;
-  }
-
-  const nextId = `screen-${screens.length + 1}`;
-  screenIdsByKey.set(key, nextId);
-
-  if (cell.artifact.type === "design-frame-ref") {
-    const frame = designFramesById.get(cell.artifact.frameId);
-    screens.push({
-      id: nextId,
-      title: frame?.name ?? cell.artifact.frameId,
-      frameId: cell.artifact.frameId,
-      summary: frame?.summary,
-      notes: [],
-    });
-    artifactMappings.push({
-      memoryId: nextId,
-      frameId: cell.artifact.frameId,
-    });
-  } else {
-    screens.push({
-      id: nextId,
-      title: cell.artifact.label?.trim() || `Board image ${screens.length + 1}`,
-      summary: undefined,
-      notes: [],
-    });
-  }
-
-  return nextId;
-}
-
-function buildJourneyNode(
-  cell: FlowDocument["cells"][number],
-  designFramesById: Map<string, FlowDesignFrameContext>,
-  screenId?: string,
-): FlowBoardMemoryJourneyNode | null {
-  const laneId = toJourneyLaneId(cell.laneId);
-  if (!laneId) {
-    return null;
-  }
-
-  const title = getCellMemoryTitle(cell, designFramesById);
-  if (!title) {
-    return null;
-  }
-
-  return {
-    id: "",
-    title,
-    laneId,
-    kind: cell.artifact.type === "journey-step" && cell.artifact.shape === "diamond" ? "decision" : "step",
-    screenId,
-    notes: [],
-  };
 }
 
 export function parseFlowBoardMemoryText(authoredText: string): FlowBoardMemoryDocument {
@@ -394,94 +271,6 @@ export function createFlowBoardMemoryState(
     authoredText,
     snapshot,
     updatedAt,
-  };
-}
-
-export function createFlowBoardMemoryStateFromFlowDocument(
-  doc: FlowDocument,
-  designFrames: FlowDesignFrameContext[] = [],
-): FlowBoardMemoryState {
-  const normalizedDoc = normalizeFlowDocument(doc);
-  const designFramesById = new Map(designFrames.map((frame) => [frame.id, frame]));
-  const orderedCells = [...normalizedDoc.cells].sort((left, right) => compareFlowCells(normalizedDoc, left, right));
-
-  const screens: FlowBoardMemoryDocument["screens"] = [];
-  const journey: FlowBoardMemoryDocument["journey"] = [];
-  const technicalNotes: FlowBoardMemoryDocument["technicalNotes"] = [];
-  const artifactMappings: FlowBoardMemoryDocument["artifactMappings"] = [];
-  const screenIdsByKey = new Map<string, string>();
-
-  for (const cell of orderedCells) {
-    const area = resolveFlowArea(normalizedDoc, cell.areaId);
-    const areaNote = (normalizedDoc.areas?.length ?? 0) > 1 ? `Area: ${area.name}` : undefined;
-    const laneNote = `Lane: ${FLOW_LANE_LABELS[cell.laneId]}`;
-    const screenId = getOrCreateScreenId({
-      cell,
-      screens,
-      artifactMappings,
-      screenIdsByKey,
-      designFramesById,
-    });
-
-    const journeyNode = buildJourneyNode(cell, designFramesById, screenId);
-    if (journeyNode) {
-      const memoryId = `journey-${journey.length + 1}`;
-      journey.push({
-        ...journeyNode,
-        id: memoryId,
-        notes: [areaNote, laneNote].filter((note): note is string => Boolean(note)),
-      });
-      artifactMappings.push({
-        memoryId,
-        cellId: cell.id,
-        frameId: cell.artifact.type === "design-frame-ref" ? cell.artifact.frameId : undefined,
-      });
-      continue;
-    }
-
-    if (cell.artifact.type === "technical-brief") {
-      const memoryId = `technical-note-${technicalNotes.length + 1}`;
-      technicalNotes.push({
-        id: memoryId,
-        title: cell.artifact.title.trim() || `Technical note ${technicalNotes.length + 1}`,
-        body: cell.artifact.body,
-        language: cell.artifact.language,
-        tags: [areaNote, laneNote].filter((note): note is string => Boolean(note)),
-      });
-      artifactMappings.push({
-        memoryId,
-        cellId: cell.id,
-      });
-    }
-  }
-
-  return createFlowBoardMemoryState({
-    snapshot: {
-      version: 1,
-      goals: [],
-      assumptions: [],
-      entities: [],
-      screens,
-      journey,
-      technicalNotes,
-      openQuestions: [],
-      artifactMappings,
-    },
-  });
-}
-
-export function ensureFlowBoardMemoryDocument(
-  doc: FlowDocument,
-  designFrames: FlowDesignFrameContext[] = [],
-): FlowDocument {
-  const normalizedDoc = normalizeFlowDocument(doc);
-  if (normalizedDoc.boardMemory) {
-    return normalizedDoc;
-  }
-
-  return {
-    ...normalizedDoc,
-    boardMemory: createFlowBoardMemoryStateFromFlowDocument(normalizedDoc, designFrames),
   };
 }
 

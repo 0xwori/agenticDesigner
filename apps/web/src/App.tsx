@@ -11,7 +11,7 @@ import type {
   ReferenceSource,
   SurfaceTarget
 } from "@designer/shared";
-import { createEmptyFlowDocument, isMobilePreset } from "@designer/shared";
+import { createEmptyFlowDocument, isMobilePreset, normalizeFlowDocument } from "@designer/shared";
 import { select, type Selection } from "d3-selection";
 import { zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
 import {
@@ -40,6 +40,7 @@ import {
 } from "./lib/flowMode";
 import { replaceFlowDocumentInBundle, rollbackFlowDocumentIfCurrent } from "./lib/flowDocumentState";
 import { PromptPanel } from "./components/PromptPanel";
+import { FlowBoardMemoryModal } from "./components/FlowBoardMemoryModal";
 import { FlowStoryModal } from "./components/FlowStoryModal";
 import { WorkspaceSettingsModal } from "./components/WorkspaceSettingsModal";
 import { BrandPickerModal } from "./components/BrandPickerModal";
@@ -93,6 +94,11 @@ type FlowStoryModalState = {
   story: FlowStory | null;
 };
 
+type FlowBoardMemoryModalState = {
+  open: boolean;
+  frameId: string | null;
+};
+
 const FLOW_BOARD_AGENT_PROMPT = "Review this entire flow board. Improve the user journey end to end, add missing happy-path and unhappy-path steps, and add short technical briefings for API, SDK, auth, session, cache, refresh-on-load, and recovery where useful. Edit only this selected board.";
 
 function buildFlowBoardScopedPrompt(prompt: string) {
@@ -116,6 +122,134 @@ function buildFlowStoryClipboard(story: FlowStory) {
     : "- None";
 
   return [`# ${story.title}`, "", "## User Story", story.userStory, "", "## Acceptance Criteria", acceptanceCriteria, "", "## Technical Notes", technicalNotes].join("\n");
+}
+
+function formatMemoryYamlValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => formatMemoryYamlValue(item)).join(", ")}]`;
+  }
+
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).filter(([, item]) => {
+      if (item === undefined) {
+        return false;
+      }
+      if (Array.isArray(item)) {
+        return item.length > 0;
+      }
+      if (typeof item === "string") {
+        return item.trim().length > 0;
+      }
+      return true;
+    });
+    return `{ ${entries.map(([key, item]) => `${key}: ${formatMemoryYamlValue(item)}`).join(", ")} }`;
+  }
+
+  if (typeof value === "string") {
+    return JSON.stringify(value);
+  }
+
+  return typeof value === "number" || typeof value === "boolean" ? String(value) : "null";
+}
+
+function buildFlowBoardMemoryPreview(flowDocument?: FlowDocument): { text: string; persisted: boolean } {
+  const doc = normalizeFlowDocument(flowDocument ?? createEmptyFlowDocument());
+  const authoredText = doc.boardMemory?.authoredText?.trim();
+
+  if (authoredText) {
+    return { text: authoredText, persisted: true };
+  }
+
+  const snapshot = doc.boardMemory?.snapshot ?? {
+    version: 1 as const,
+    goals: [],
+    assumptions: [],
+    entities: [],
+    screens: doc.cells.flatMap((cell) => {
+      if (cell.artifact.type === "design-frame-ref") {
+        return [{
+          id: `screen-${cell.id}`,
+          title: `Frame ${cell.artifact.frameId}`,
+          frameId: cell.artifact.frameId,
+          summary: "Referenced on the current board.",
+          notes: [],
+        }];
+      }
+
+      if (cell.artifact.type === "uploaded-image") {
+        return [{
+          id: `screen-${cell.id}`,
+          title: cell.artifact.label?.trim() || `Image ${cell.id}`,
+          summary: "Uploaded image artifact on the current board.",
+          notes: [],
+        }];
+      }
+
+      return [];
+    }),
+    journey: doc.cells
+      .flatMap((cell) =>
+        cell.artifact.type === "journey-step"
+          ? [{
+              id: `journey-${cell.id}`,
+              title: cell.artifact.text.trim() || `Step ${cell.column + 1}`,
+              laneId: cell.laneId,
+              kind: cell.artifact.shape === "diamond" ? "decision" : "step",
+              notes: [],
+            }]
+          : [],
+      )
+      .sort((left, right) => left.id.localeCompare(right.id)),
+    technicalNotes: doc.cells.flatMap((cell) =>
+      cell.artifact.type === "technical-brief"
+        ? [{
+            id: `note-${cell.id}`,
+            title: cell.artifact.title.trim() || `Note ${cell.id}`,
+            body: cell.artifact.body,
+            language: cell.artifact.language,
+            tags: [],
+          }]
+        : [],
+    ),
+    openQuestions: [],
+    artifactMappings: doc.cells.flatMap((cell) => {
+      if (cell.artifact.type === "design-frame-ref") {
+        return [{ memoryId: `screen-${cell.id}`, cellId: cell.id, frameId: cell.artifact.frameId }];
+      }
+      if (cell.artifact.type === "uploaded-image") {
+        return [{ memoryId: `screen-${cell.id}`, cellId: cell.id }];
+      }
+      if (cell.artifact.type === "journey-step") {
+        return [{ memoryId: `journey-${cell.id}`, cellId: cell.id }];
+      }
+      if (cell.artifact.type === "technical-brief") {
+        return [{ memoryId: `note-${cell.id}`, cellId: cell.id }];
+      }
+      return [];
+    }),
+  };
+
+  const lines = [
+    `version: ${snapshot.version}`,
+    `goals: ${formatMemoryYamlValue(snapshot.goals)}`,
+    `assumptions: ${formatMemoryYamlValue(snapshot.assumptions)}`,
+    `entities: ${formatMemoryYamlValue(snapshot.entities)}`,
+    "screens:",
+    ...(snapshot.screens.length > 0 ? snapshot.screens.map((screen) => `  - ${formatMemoryYamlValue(screen)}`) : ["  []"]),
+    "journey:",
+    ...(snapshot.journey.length > 0 ? snapshot.journey.map((node) => `  - ${formatMemoryYamlValue(node)}`) : ["  []"]),
+    "technicalNotes:",
+    ...(snapshot.technicalNotes.length > 0
+      ? snapshot.technicalNotes.map((note) => `  - ${formatMemoryYamlValue(note)}`)
+      : ["  []"]),
+    `openQuestions: ${formatMemoryYamlValue(snapshot.openQuestions)}`,
+    "artifactMappings:",
+    ...(snapshot.artifactMappings.length > 0
+      ? snapshot.artifactMappings.map((mapping) => `  - ${formatMemoryYamlValue(mapping)}`)
+      : ["  []"]),
+  ];
+
+  return { text: lines.join("\n"), persisted: Boolean(doc.boardMemory?.snapshot) };
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +438,11 @@ function AppContent() {
     story: null,
   });
   const [flowStoryCopied, setFlowStoryCopied] = useState(false);
+  const [flowBoardMemoryModal, setFlowBoardMemoryModal] = useState<FlowBoardMemoryModalState>({
+    open: false,
+    frameId: null,
+  });
+  const [flowBoardMemoryCopied, setFlowBoardMemoryCopied] = useState(false);
   const showToast = useCallback((msg: string, durationMs = 5000) => {
     setToastMessage(msg);
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -1923,6 +2062,17 @@ function AppContent() {
     [flowFrames, lastFlowFrameId, selectedFrame]
   );
   const filteredFrames = canvasMode === "flow" ? flowFrames : designFrames;
+  const flowBoardMemoryFrame = useMemo(
+    () =>
+      flowBoardMemoryModal.frameId
+        ? bundle?.frames.find((frame) => frame.id === flowBoardMemoryModal.frameId && frame.frameKind === "flow") ?? null
+        : null,
+    [bundle, flowBoardMemoryModal.frameId],
+  );
+  const flowBoardMemoryPreview = useMemo(
+    () => (flowBoardMemoryFrame ? buildFlowBoardMemoryPreview(flowBoardMemoryFrame.flowDocument) : null),
+    [flowBoardMemoryFrame],
+  );
 
   function applyFlowDocumentFromServer(frameId: string, doc: FlowDocument) {
     setBundle((current) => replaceFlowDocumentInBundle(current, frameId, doc));
@@ -2123,6 +2273,22 @@ function AppContent() {
       window.setTimeout(() => setFlowStoryCopied(false), 1200);
     } catch (reason) {
       pushDebugLog("flow-story-copy", reason, { frameId: flowStoryModal.frameId }, "warn");
+    }
+  }
+
+  async function copyFlowBoardMemoryToClipboard() {
+    const frameId = flowBoardMemoryModal.frameId;
+    const frame = bundleRef.current?.frames.find((candidate) => candidate.id === frameId) ?? null;
+    if (!frame || frame.frameKind !== "flow") {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(buildFlowBoardMemoryPreview(frame.flowDocument).text);
+      setFlowBoardMemoryCopied(true);
+      window.setTimeout(() => setFlowBoardMemoryCopied(false), 1200);
+    } catch (reason) {
+      pushDebugLog("flow-board-memory-copy", reason, { frameId }, "warn");
     }
   }
 
@@ -2406,6 +2572,21 @@ function AppContent() {
         }}
       />
 
+      <FlowBoardMemoryModal
+        open={flowBoardMemoryModal.open}
+        boardName={flowBoardMemoryFrame?.name ?? null}
+        memoryText={flowBoardMemoryPreview?.text ?? ""}
+        copied={flowBoardMemoryCopied}
+        persisted={flowBoardMemoryPreview?.persisted ?? false}
+        onClose={() => {
+          setFlowBoardMemoryCopied(false);
+          setFlowBoardMemoryModal({ open: false, frameId: null });
+        }}
+        onCopy={() => {
+          void copyFlowBoardMemoryToClipboard();
+        }}
+      />
+
       <ArtboardPane
         interactionType={isViewportPanning ? "pan" : interaction?.type ?? null}
         artboardBackgroundStyle={artboardBackgroundStyle}
@@ -2454,6 +2635,10 @@ function AppContent() {
             taskKind: "agent",
             statusMessage: "Running flow-action: asking the journey agent to review the whole board...",
           });
+        }}
+        onOpenFlowBoardMemory={(frameId) => {
+          setFlowBoardMemoryCopied(false);
+          setFlowBoardMemoryModal({ open: true, frameId });
         }}
         onOpenFlowStory={openFlowStoryExport}
         activeFlowBoardTask={activeFlowFrame && flowBoardTask?.frameId === activeFlowFrame.id ? flowBoardTask.kind : null}

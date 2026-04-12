@@ -12,15 +12,23 @@ import {
   resolveFlowArea,
 } from "@designer/shared";
 import { requestCompletion } from "../llmProviders.js";
-import type { FlowDesignFrameContext } from "./flowFrameContext.js";
-import { buildFlowBoardMemoryContext, ensureFlowBoardMemoryDocument } from "./flowBoardMemory.js";
+import { buildFlowBoardMemoryContext } from "./flowBoardMemory.js";
 
-const MAX_BOARD_VISION_IMAGES = 6;
+interface DesignFrameInfo {
+  id: string;
+  name: string;
+  summary?: string;
+}
+
+type VisionAttachment = ComposerAttachment & {
+  width?: number;
+  height?: number;
+};
 
 interface FlowActionInput {
   prompt: string;
   flowDocument: FlowDocument;
-  designFrames: FlowDesignFrameContext[];
+  designFrames: DesignFrameInfo[];
   provider: ProviderId;
   model: string;
   apiKey?: string;
@@ -70,12 +78,60 @@ function getAttachmentSize(
   };
 }
 
+function sanitizeContextText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function inferMimeTypeFromDataUrl(dataUrl: string): string | undefined {
+  const match = /^data:([^;,]+)[;,]/i.exec(dataUrl);
+  return match?.[1]?.trim() || undefined;
+}
+
+function buildVisionAttachments(doc: FlowDocument, attachments?: ComposerAttachment[]): VisionAttachment[] {
+  const merged: VisionAttachment[] = [];
+  const seenKeys = new Set<string>();
+
+  const pushAttachment = (attachment: VisionAttachment) => {
+    const key = attachment.dataUrl?.trim() || attachment.id.trim();
+    if (!key || seenKeys.has(key)) {
+      return;
+    }
+    seenKeys.add(key);
+    merged.push(attachment);
+  };
+
+  for (const attachment of listImageAttachments(attachments) as VisionAttachment[]) {
+    pushAttachment(attachment);
+  }
+
+  for (const cell of doc.cells) {
+    if (merged.length >= 6) {
+      break;
+    }
+    if (cell.artifact.type !== "uploaded-image" || typeof cell.artifact.dataUrl !== "string") {
+      continue;
+    }
+
+    pushAttachment({
+      id: `board-image-${cell.id}`,
+      type: "image",
+      status: "uploaded",
+      name: cell.artifact.label?.trim() || `Board image ${cell.id}`,
+      mimeType: inferMimeTypeFromDataUrl(cell.artifact.dataUrl),
+      dataUrl: cell.artifact.dataUrl,
+      width: cell.artifact.width,
+      height: cell.artifact.height,
+    });
+  }
+
+  return merged.slice(0, 6);
+}
+
 function buildFlowContext(
   doc: FlowDocument,
-  frames: FlowDesignFrameContext[],
+  frames: DesignFrameInfo[],
   focusedAreaId?: string,
   attachments?: ComposerAttachment[],
-  boardVisionImages?: ComposerAttachment[],
 ): string {
   const normalizedDoc = normalizeFlowDocument(doc);
   const focusedArea = resolveFlowArea(normalizedDoc, focusedAreaId);
@@ -92,7 +148,7 @@ function buildFlowContext(
 
     if (artifact.type === "design-frame-ref") {
       const frame = frames.find((candidate) => candidate.id === artifact.frameId);
-      label = `design-frame-ref → "${frame?.name ?? artifact.frameId}"${frame?.summary ? ` | ${frame.summary}` : ""}`;
+      label = `design-frame-ref → "${frame?.name ?? artifact.frameId}"`;
     } else if (artifact.type === "journey-step") {
       label = `journey-step: "${artifact.text.slice(0, 50)}"`;
     } else if (artifact.type === "technical-brief") {
@@ -116,17 +172,15 @@ function buildFlowContext(
     return `  - "${connection.fromCellId}" → "${connection.toCellId}"${handles} (id: "${connection.id}")`;
   });
 
-  const frameLines = frames.map(
-    (frame) =>
-      `  - id="${frame.id}" name="${frame.name}"${frame.summary ? ` summary="${frame.summary}"` : ""}`,
-  );
+  const frameLines = frames.map((frame) => {
+    const summary = typeof frame.summary === "string" ? sanitizeContextText(frame.summary) : "";
+    return summary.length > 0
+      ? `  - id="${frame.id}" name="${frame.name}"\n    summary: ${summary}`
+      : `  - id="${frame.id}" name="${frame.name}"`;
+  });
   const attachmentLines = listImageAttachments(attachments).map((attachment) => {
     const name = attachment.name?.trim() || "Attached image";
     return `  - attachment "${attachment.id}" name="${name}"`;
-  });
-  const boardVisionLines = (boardVisionImages ?? []).map((attachment, index) => {
-    const name = attachment.name?.trim() || `Board image ${index + 1}`;
-    return `  - vision image ${index + 1}: "${name}"`;
   });
 
   const importedSourceLines = (normalizedDoc.importedSourceFrameIds ?? []).map(
@@ -150,53 +204,10 @@ ${importedSourceLines.join("\n") || "  (none)"}
 Available design frames:
 ${frameLines.join("\n") || "  (none)"}
 
-Existing board images included for vision analysis only:
-${boardVisionLines.join("\n") || "  (none)"}
-
 Available image attachments:
 ${attachmentLines.join("\n") || "  (none)"}
 
 ${boardMemoryContext}`;
-}
-
-function inferMimeTypeFromDataUrl(dataUrl: string): string | undefined {
-  const match = /^data:([^;,]+)[;,]/i.exec(dataUrl);
-  return match?.[1];
-}
-
-function buildBoardVisionAttachments(doc: FlowDocument, focusedAreaId?: string): ComposerAttachment[] {
-  const normalizedDoc = normalizeFlowDocument(doc);
-  const focusedArea = resolveFlowArea(normalizedDoc, focusedAreaId).id;
-
-  return [...normalizedDoc.cells]
-    .filter(
-      (cell): cell is FlowDocument["cells"][number] & {
-        artifact: Extract<FlowDocument["cells"][number]["artifact"], { type: "uploaded-image" }>;
-      } => cell.artifact.type === "uploaded-image" && typeof cell.artifact.dataUrl === "string" && cell.artifact.dataUrl.length > 0,
-    )
-    .sort((left, right) => {
-      const leftFocused = resolveFlowArea(normalizedDoc, left.areaId).id === focusedArea ? 0 : 1;
-      const rightFocused = resolveFlowArea(normalizedDoc, right.areaId).id === focusedArea ? 0 : 1;
-      if (leftFocused !== rightFocused) {
-        return leftFocused - rightFocused;
-      }
-
-      const columnDelta = getFlowGlobalColumn(normalizedDoc, left) - getFlowGlobalColumn(normalizedDoc, right);
-      if (columnDelta !== 0) {
-        return columnDelta;
-      }
-
-      return left.id.localeCompare(right.id);
-    })
-    .slice(0, MAX_BOARD_VISION_IMAGES)
-    .map((cell, index) => ({
-      id: `board-image-${cell.id}`,
-      type: "image",
-      status: "uploaded",
-      name: cell.artifact.label?.trim() || `Board image ${index + 1}`,
-      mimeType: inferMimeTypeFromDataUrl(cell.artifact.dataUrl),
-      dataUrl: cell.artifact.dataUrl,
-    }));
 }
 
 const SYSTEM_PROMPT = `You are a flow-board assistant for a UI design tool. The user has a flow board with swim lanes and wants to make changes.
@@ -249,9 +260,7 @@ ERD / Flow Diagram Rules:
 
 Image Analysis:
 - When uploaded images already exist on the board, analyze their labels/context to understand the screens they represent.
-- Existing board images listed in the context are already on the canvas and are provided for interpretation only.
 - When an image attachment is available and the user wants it on the board, use add-attachment-image rather than embedding a raw data URL.
-- Only items listed under "Available image attachments" may be used with add-attachment-image.
 - Create journey steps that describe the user flow between image/screens, connecting them with add-connection.
 - Infer screen transitions, decision points, and error paths from the screen context.
 
@@ -465,7 +474,7 @@ function isBoardAnalysisPrompt(prompt: string): boolean {
   );
 }
 
-function getArtifactJourneyLabel(artifact: FlowDocument["cells"][number]["artifact"], frames: FlowDesignFrameContext[]): string | null {
+function getArtifactJourneyLabel(artifact: FlowDocument["cells"][number]["artifact"], frames: DesignFrameInfo[]): string | null {
   switch (artifact.type) {
     case "design-frame-ref":
       return frames.find((frame) => frame.id === artifact.frameId)?.name ?? null;
@@ -480,7 +489,7 @@ function getArtifactJourneyLabel(artifact: FlowDocument["cells"][number]["artifa
 
 function buildHeuristicFlowCommands(input: {
   doc: FlowDocument;
-  designFrames: FlowDesignFrameContext[];
+  designFrames: DesignFrameInfo[];
   prompt: string;
   focusedAreaId?: string;
 }): FlowMutationCommand[] {
@@ -587,15 +596,9 @@ function buildHeuristicFlowCommands(input: {
 }
 
 export async function runFlowAction(input: FlowActionInput): Promise<FlowActionResult> {
-  const normalizedDoc = ensureFlowBoardMemoryDocument(input.flowDocument, input.designFrames);
-  const boardVisionImages = input.provider === "openai" ? buildBoardVisionAttachments(normalizedDoc, input.focusedAreaId) : [];
-  const context = buildFlowContext(
-    normalizedDoc,
-    input.designFrames,
-    input.focusedAreaId,
-    input.attachments,
-    boardVisionImages,
-  );
+  const normalizedDoc = normalizeFlowDocument(input.flowDocument);
+  const visionAttachments = buildVisionAttachments(normalizedDoc, input.attachments);
+  const context = buildFlowContext(normalizedDoc, input.designFrames, input.focusedAreaId, visionAttachments);
 
   const completion = await requestCompletion({
     provider: input.provider,
@@ -604,7 +607,7 @@ export async function runFlowAction(input: FlowActionInput): Promise<FlowActionR
     allowMock: false,
     jsonMode: true,
     timeoutMs: 30_000,
-    attachments: boardVisionImages.length > 0 ? [...boardVisionImages, ...(input.attachments ?? [])] : input.attachments,
+    attachments: input.provider === "openai" && visionAttachments.length > 0 ? visionAttachments : undefined,
     system: SYSTEM_PROMPT,
     prompt: `${context}\n\nUser request: ${input.prompt}\n\nReturn JSON array of commands.`,
   });

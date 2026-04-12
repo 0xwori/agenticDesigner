@@ -85,47 +85,4 @@ describe("generateFlowStory", () => {
     expect(input.prompt).toContain("goals=1");
     expect(input.prompt).toContain("User request: Export this board as a story.");
   });
-
-  it("seeds board memory and includes frame summaries when the board has no memory yet", async () => {
-    vi.mocked(requestCompletion).mockResolvedValue({
-      content: JSON.stringify({
-        title: "Checkout completion",
-        userStory: "As a shopper, I want to finish checkout so that I can place my order.",
-        acceptanceCriteria: ["When payment succeeds, the order is confirmed."],
-        technicalNotes: ["Refresh checkout state on load."],
-      }),
-      usedProvider: "openai",
-      usedModel: "gpt-5.4-mini",
-    } as never);
-
-    const result = await generateFlowStory({
-      flowDocument: {
-        ...createEmptyFlowDocument(),
-        cells: [
-          {
-            id: "screen",
-            laneId: "normal-flow",
-            column: 0,
-            artifact: { type: "design-frame-ref", frameId: "frame-1" },
-          },
-        ],
-      },
-      designFrames: [
-        {
-          id: "frame-1",
-          name: "Checkout screen",
-          summary: "key UI copy: Checkout, Card details, Pay now",
-        },
-      ],
-      provider: "openai",
-      model: "gpt-5.4-mini",
-    });
-
-    const input = vi.mocked(requestCompletion).mock.calls.at(-1)?.[0];
-    expect(input?.prompt).toContain("summary=\"key UI copy: Checkout, Card details, Pay now\"");
-    expect(result.updatedDocument.boardMemory?.snapshot.screens[0]).toMatchObject({
-      frameId: "frame-1",
-      title: "Checkout screen",
-    });
-  });
 });

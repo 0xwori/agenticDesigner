@@ -1,9 +1,8 @@
 import type { Express } from "express";
-import { createEmptyFlowDocument } from "@designer/shared";
+import { createEmptyFlowDocument, type FrameVersion, type FrameWithVersions } from "@designer/shared";
 import type { RunHub } from "../../services/runHub.js";
 import type { ApiDeps } from "../deps.js";
 import { sendApiError } from "../errors.js";
-import { buildFlowDesignFrameContexts } from "../../services/pipeline/flowFrameContext.js";
 import { runFlowAction } from "../../services/pipeline/flowAction.js";
 import { generateFlowStory } from "../../services/pipeline/flowStory.js";
 import {
@@ -18,6 +17,104 @@ import {
   parseTailwind,
   parseVariation
 } from "../parsers.js";
+
+function resolveLatestFrameVersion(frame: FrameWithVersions): FrameVersion | null {
+  if (frame.currentVersionId) {
+    const currentVersion = frame.versions.find((version) => version.id === frame.currentVersionId);
+    if (currentVersion) {
+      return currentVersion;
+    }
+  }
+
+  return frame.versions.length > 0 ? frame.versions[frame.versions.length - 1] : null;
+}
+
+function stripMarkupForSummary(value: string): string {
+  return value
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function trimSummary(value: string, maxLength = 360): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function extractTagText(html: string, tagName: string, limit: number): string[] {
+  const matches = Array.from(html.matchAll(new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "gi")));
+  return matches
+    .map((match) => stripMarkupForSummary(match[1] ?? ""))
+    .filter((value) => value.length > 0)
+    .slice(0, limit);
+}
+
+function extractFieldHints(html: string, limit: number): string[] {
+  const matches = Array.from(
+    html.matchAll(/<(?:input|textarea|select)\b[^>]*(?:placeholder|aria-label|name|id)=["']([^"']+)["'][^>]*>/gi),
+  );
+  return matches
+    .map((match) => match[1]?.trim() ?? "")
+    .filter((value) => value.length > 0)
+    .slice(0, limit);
+}
+
+function buildDesignFrameSummary(frame: FrameWithVersions): string | undefined {
+  const version = resolveLatestFrameVersion(frame);
+  if (!version) {
+    return undefined;
+  }
+
+  const visibleContent = stripMarkupForSummary(version.exportHtml);
+  const visibleSnippets = visibleContent
+    .split(/(?<=[.!?])\s+|\s{2,}/)
+    .map((value) => value.trim())
+    .filter((value) => value.length >= 3)
+    .slice(0, 3);
+  const headings = [
+    ...extractTagText(version.exportHtml, "h1", 1),
+    ...extractTagText(version.exportHtml, "h2", 2),
+    ...extractTagText(version.exportHtml, "h3", 2),
+  ].slice(0, 3);
+  const buttons = extractTagText(version.exportHtml, "button", 3);
+  const fieldHints = extractFieldHints(version.exportHtml, 3);
+  const combinedSignals = `${version.exportHtml}\n${version.sourceCode}`;
+  const signals: string[] = [];
+
+  if (headings.length > 0) {
+    signals.push(`Headings: ${headings.join(", ")}`);
+  }
+  if (buttons.length > 0) {
+    signals.push(`Actions: ${buttons.join(", ")}`);
+  }
+  if (fieldHints.length > 0) {
+    signals.push(`Fields: ${fieldHints.join(", ")}`);
+  }
+  if (/fetch\(|axios|graphql|mutation|query|api/i.test(version.sourceCode)) {
+    signals.push("Includes API or data-fetching logic");
+  }
+  if (/auth|session|token|password|login|sign in/i.test(combinedSignals)) {
+    signals.push("Contains auth or session-related UI");
+  }
+  if (/error|retry|failed|invalid|empty state/i.test(combinedSignals)) {
+    signals.push("Shows error, retry, or validation handling");
+  }
+
+  const parts = [
+    visibleSnippets.length > 0 ? `Visible content: ${visibleSnippets.join(" / ")}` : null,
+    ...signals,
+  ].filter((value): value is string => Boolean(value));
+
+  if (parts.length === 0) {
+    return undefined;
+  }
+
+  return trimSummary(parts.join(". "));
+}
 
 export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunHub) {
   app.post("/projects/:id/frames", async (request, response) => {
@@ -300,9 +397,11 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
       const model = typeof request.body?.model === "string" ? request.body.model : "gpt-5.4-mini";
       const apiKey = typeof request.body?.apiKey === "string" ? request.body.apiKey : undefined;
 
-      // Gather design frame content summaries for the LLM context.
+      // Gather design frame names for the LLM context
       const projectBundle = await deps.getProjectBundle(frame.projectId);
-      const designFrames = buildFlowDesignFrameContexts(projectBundle?.frames ?? []);
+      const designFrames = (projectBundle?.frames ?? [])
+        .filter((f) => f.frameKind !== "flow")
+        .map((f) => ({ id: f.id, name: f.name, summary: buildDesignFrameSummary(f) }));
 
       const result = await runFlowAction({
         prompt,
@@ -319,7 +418,7 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
       });
 
       // Persist the updated document
-      if (result.commands.length > 0 || !frame.flowDocument?.boardMemory) {
+      if (result.commands.length > 0) {
         await deps.updateFlowDocument(frame.id, result.updatedDocument);
       }
 
@@ -354,7 +453,9 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
       const prompt = parseNonEmptyString(request.body?.prompt);
 
       const projectBundle = await deps.getProjectBundle(frame.projectId);
-      const designFrames = buildFlowDesignFrameContexts(projectBundle?.frames ?? []);
+      const designFrames = (projectBundle?.frames ?? [])
+        .filter((candidate) => candidate.frameKind !== "flow")
+        .map((candidate) => ({ id: candidate.id, name: candidate.name }));
 
       const result = await generateFlowStory({
         prompt,

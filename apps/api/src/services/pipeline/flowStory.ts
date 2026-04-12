@@ -9,13 +9,17 @@ import {
 } from "@designer/shared";
 
 import { requestCompletion } from "../llmProviders.js";
-import type { FlowDesignFrameContext } from "./flowFrameContext.js";
-import { buildFlowBoardMemoryContext, ensureFlowBoardMemoryDocument } from "./flowBoardMemory.js";
+import { buildFlowBoardMemoryContext } from "./flowBoardMemory.js";
+
+interface DesignFrameInfo {
+  id: string;
+  name: string;
+}
 
 export interface FlowStoryInput {
   prompt?: string;
   flowDocument: FlowDocument;
-  designFrames: FlowDesignFrameContext[];
+  designFrames: DesignFrameInfo[];
   provider: ProviderId;
   model: string;
   apiKey?: string;
@@ -50,7 +54,7 @@ Return ONLY valid JSON with this exact shape:
   "technicalNotes": ["string"]
 }`;
 
-function buildFlowStoryContext(doc: FlowDocument, frames: FlowDesignFrameContext[]): string {
+function buildFlowStoryContext(doc: FlowDocument, frames: DesignFrameInfo[]): string {
   const normalizedDoc = normalizeFlowDocument(doc);
   const summary = summarizeFlowDocument(normalizedDoc);
 
@@ -67,7 +71,7 @@ function buildFlowStoryContext(doc: FlowDocument, frames: FlowDesignFrameContext
     switch (artifact.type) {
       case "design-frame-ref": {
         const refFrame = frames.find((frame) => frame.id === artifact.frameId);
-        return `  - cell "${cell.id}" lane="${laneLabel}" area="${area.name}" globalCol=${globalColumn}: screen "${refFrame?.name ?? artifact.frameId}"${refFrame?.summary ? ` | ${refFrame.summary}` : ""}`;
+        return `  - cell "${cell.id}" lane="${laneLabel}" area="${area.name}" globalCol=${globalColumn}: screen "${refFrame?.name ?? artifact.frameId}"`;
       }
       case "journey-step":
         return `  - cell "${cell.id}" lane="${laneLabel}" area="${area.name}" globalCol=${globalColumn}: step "${artifact.text}" shape="${artifact.shape ?? "rectangle"}"`;
@@ -82,10 +86,7 @@ function buildFlowStoryContext(doc: FlowDocument, frames: FlowDesignFrameContext
     (connection) => `  - "${connection.fromCellId}" -> "${connection.toCellId}"`,
   );
 
-  const frameLines = frames.map(
-    (frame) =>
-      `  - id="${frame.id}" name="${frame.name}"${frame.summary ? ` summary="${frame.summary}"` : ""}`,
-  );
+  const frameLines = frames.map((frame) => `  - id="${frame.id}" name="${frame.name}"`);
   const boardMemoryContext = buildFlowBoardMemoryContext(normalizedDoc.boardMemory);
 
   return `Flow board summary:
@@ -150,7 +151,7 @@ function parseFlowStory(content: string): Omit<FlowStory, "generatedAt" | "sourc
 }
 
 export async function generateFlowStory(input: FlowStoryInput): Promise<FlowStoryResult> {
-  const normalizedDoc = ensureFlowBoardMemoryDocument(input.flowDocument, input.designFrames);
+  const normalizedDoc = normalizeFlowDocument(input.flowDocument);
   const prompt = input.prompt?.trim() || DEFAULT_STORY_PROMPT;
   const context = buildFlowStoryContext(normalizedDoc, input.designFrames);
 

@@ -1,10 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { createEmptyFlowDocument } from "@designer/shared";
 
 import {
   buildFlowBoardMemoryContext,
   createFlowBoardMemoryState,
-  createFlowBoardMemoryStateFromFlowDocument,
   FlowBoardMemoryParseError,
   parseFlowBoardMemoryText,
   projectFlowBoardMemoryToArtifacts,
@@ -119,90 +117,5 @@ journey:
       kind: "step",
     });
     expect(buildFlowBoardMemoryContext(updated)).toContain("journey=1");
-  });
-
-  it("derives a board-memory document from live board artifacts", () => {
-    const state = createFlowBoardMemoryStateFromFlowDocument(
-      {
-        ...createEmptyFlowDocument(),
-        cells: [
-          {
-            id: "journey-step",
-            laneId: "user-journey",
-            column: 0,
-            artifact: { type: "journey-step", text: "Review order" },
-          },
-          {
-            id: "screen-ref",
-            laneId: "normal-flow",
-            column: 0,
-            artifact: { type: "design-frame-ref", frameId: "frame-1" },
-          },
-          {
-            id: "board-image",
-            laneId: "unhappy-path",
-            column: 1,
-            artifact: { type: "uploaded-image", dataUrl: "data:image/png;base64,abc", label: "Payment error" },
-          },
-          {
-            id: "tech-note",
-            laneId: "technical-briefing",
-            column: 1,
-            artifact: { type: "technical-brief", title: "Checkout API", language: "http", body: "POST /checkout" },
-          },
-        ],
-      },
-      [{ id: "frame-1", name: "Checkout screen", summary: "key UI copy: Checkout, Pay now" }],
-    );
-
-    expect(state.snapshot.screens).toEqual([
-      {
-        id: "screen-1",
-        title: "Checkout screen",
-        frameId: "frame-1",
-        summary: "key UI copy: Checkout, Pay now",
-        notes: [],
-      },
-      {
-        id: "screen-2",
-        title: "Payment error",
-        summary: undefined,
-        notes: [],
-      },
-    ]);
-    expect(state.snapshot.journey).toEqual([
-      {
-        id: "journey-1",
-        title: "Review order",
-        laneId: "user-journey",
-        kind: "step",
-        screenId: undefined,
-        notes: ["Lane: User Journey"],
-      },
-      {
-        id: "journey-2",
-        title: "Checkout screen",
-        laneId: "normal-flow",
-        kind: "step",
-        screenId: "screen-1",
-        notes: ["Lane: Normal Flow"],
-      },
-      {
-        id: "journey-3",
-        title: "Payment error",
-        laneId: "unhappy-path",
-        kind: "step",
-        screenId: "screen-2",
-        notes: ["Lane: Unhappy Path"],
-      },
-    ]);
-    expect(state.snapshot.technicalNotes[0]).toMatchObject({
-      id: "technical-note-1",
-      title: "Checkout API",
-      body: "POST /checkout",
-      language: "http",
-      tags: ["Lane: Technical Briefing"],
-    });
-    expect(state.authoredText).toContain("title: Checkout screen");
   });
 });

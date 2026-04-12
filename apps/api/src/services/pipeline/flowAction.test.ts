@@ -342,22 +342,24 @@ describe("runFlowAction", () => {
     expect(result.updatedDocument.connections).toHaveLength(1);
   });
 
-  it("passes frame summaries and board images into the model context and seeds board memory", async () => {
+  it("passes board images and frame summaries into the completion request", async () => {
     vi.mocked(requestCompletion).mockResolvedValue({ content: "[]" } as never);
 
-    const result = await runFlowAction({
-      prompt: "Analyze this board and improve it",
+    await runFlowAction({
+      prompt: "Review the board and improve the flow",
       flowDocument: {
         ...createEmptyFlowDocument(),
         cells: [
           {
-            id: "screen-image",
+            id: "image-1",
             laneId: "normal-flow",
             column: 0,
             artifact: {
               type: "uploaded-image",
-              dataUrl: "data:image/png;base64,xyz",
-              label: "Checkout error state",
+              dataUrl: "data:image/png;base64,board-image",
+              label: "Checkout confirmation",
+              width: 1280,
+              height: 720,
             },
           },
         ],
@@ -365,25 +367,33 @@ describe("runFlowAction", () => {
       designFrames: [
         {
           id: "frame-1",
-          name: "Checkout screen",
-          summary: "key UI copy: Checkout, Shipping address, Pay now",
+          name: "Checkout",
+          summary: "Visible content: Order summary / Billing address. Actions: Continue to payment.",
+        },
+      ],
+      attachments: [
+        {
+          id: "att-1",
+          type: "image",
+          name: "Uploaded login flow",
+          mimeType: "image/png",
+          dataUrl: "data:image/png;base64,composer-image",
         },
       ],
       provider: "openai",
       model: "gpt-5.4-mini",
     });
 
-    const input = vi.mocked(requestCompletion).mock.calls.at(-1)?.[0];
-    expect(input?.prompt).toContain("summary=\"key UI copy: Checkout, Shipping address, Pay now\"");
-    expect(input?.prompt).toContain("Existing board images included for vision analysis only:");
-    expect(input?.attachments).toMatchObject([
-      {
-        id: "board-image-screen-image",
-        name: "Checkout error state",
-      },
-    ]);
-    expect(result.updatedDocument.boardMemory?.snapshot.screens[0]).toMatchObject({
-      title: "Checkout error state",
-    });
+    expect(vi.mocked(requestCompletion)).toHaveBeenCalledTimes(1);
+    const input = vi.mocked(requestCompletion).mock.calls[0][0];
+
+    expect(input.prompt).toContain("summary: Visible content: Order summary / Billing address. Actions: Continue to payment.");
+    expect(input.prompt).toContain('attachment "board-image-image-1" name="Checkout confirmation"');
+    expect(input.attachments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "att-1", dataUrl: "data:image/png;base64,composer-image" }),
+        expect.objectContaining({ id: "board-image-image-1", dataUrl: "data:image/png;base64,board-image" }),
+      ]),
+    );
   });
 });
