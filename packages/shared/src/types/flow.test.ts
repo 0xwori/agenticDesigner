@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   applyFlowMutations,
+  createEmptyFlowBoardMemoryDocument,
   findNextFreeFlowColumn,
   FLOW_AREA_COLUMN_GAP,
   FLOW_AREA_MIN_COLUMNS,
@@ -15,7 +16,9 @@ import {
   getFlowTargetHandleId,
   inferFlowConnectionHandles,
   isConnectionAllowed,
+  isFlowConnectionAllowedBetweenCells,
   createEmptyFlowDocument,
+  normalizeFlowBoardMemoryDocument,
   normalizeFlowDocument,
   normalizeFlowConnection,
   resolveFlowInsertColumn,
@@ -68,6 +71,52 @@ describe("isConnectionAllowed", () => {
   it("keeps technical-briefing isolated to its own lane", () => {
     expect(isConnectionAllowed("technical-briefing", "technical-briefing")).toBe(true);
   });
+
+  it("allows screen refs to connect into technical-briefing through the cell-aware helper", () => {
+    const doc = createEmptyFlowDocument();
+    const fromCell = {
+      id: "screen-ref",
+      areaId: FLOW_DEFAULT_AREA_ID,
+      laneId: "normal-flow" as const,
+      artifact: { type: "design-frame-ref" as const, frameId: "frame-1" },
+    };
+    const toCell = {
+      id: "technical-step",
+      areaId: FLOW_DEFAULT_AREA_ID,
+      laneId: "technical-briefing" as const,
+      artifact: {
+        type: "technical-brief" as const,
+        title: "Payload",
+        language: "json",
+        body: "{}",
+      },
+    };
+
+    expect(isFlowConnectionAllowedBetweenCells(doc, fromCell, toCell)).toBe(true);
+  });
+
+  it("keeps non-screen artifacts blocked from technical-briefing in the cell-aware helper", () => {
+    const doc = createEmptyFlowDocument();
+    const fromCell = {
+      id: "journey-step",
+      areaId: FLOW_DEFAULT_AREA_ID,
+      laneId: "normal-flow" as const,
+      artifact: { type: "journey-step" as const, text: "Start" },
+    };
+    const toCell = {
+      id: "technical-step",
+      areaId: FLOW_DEFAULT_AREA_ID,
+      laneId: "technical-briefing" as const,
+      artifact: {
+        type: "technical-brief" as const,
+        title: "Payload",
+        language: "json",
+        body: "{}",
+      },
+    };
+
+    expect(isFlowConnectionAllowedBetweenCells(doc, fromCell, toCell)).toBe(false);
+  });
 });
 
 describe("createEmptyFlowDocument", () => {
@@ -86,6 +135,58 @@ describe("createEmptyFlowDocument", () => {
     expect(doc.connections).toEqual([]);
     expect(doc.entryFlowFrameId).toBeUndefined();
     expect(doc.exitFlowFrameId).toBeUndefined();
+  });
+});
+
+describe("flow board memory", () => {
+  it("creates an empty board memory document", () => {
+    expect(createEmptyFlowBoardMemoryDocument()).toEqual({
+      version: 1,
+      goals: [],
+      assumptions: [],
+      entities: [],
+      screens: [],
+      journey: [],
+      technicalNotes: [],
+      openQuestions: [],
+      artifactMappings: [],
+    });
+  });
+
+  it("normalizes persisted board memory when flow documents load", () => {
+    const doc = normalizeFlowDocument({
+      ...createEmptyFlowDocument(),
+      boardMemory: {
+        authoredText: "version: 1",
+        updatedAt: "not-a-date",
+        snapshot: {
+          version: 1,
+          goals: ["  Improve checkout clarity  "],
+          assumptions: [" Customer is authenticated "],
+          entities: [{ name: " Shopper " }],
+          screens: [{ title: " Browse ", notes: ["  Show search  "] }],
+          journey: [{ title: " Browse products ", kind: "decision", laneId: "normal-flow" }],
+          technicalNotes: [{ title: " Checkout API ", body: " POST /checkout ", tags: [" api "] }],
+          openQuestions: [" What happens when payment fails? "],
+          artifactMappings: [{ memoryId: "journey-1", cellId: "cell-1" }],
+        },
+      },
+    });
+
+    expect(doc.boardMemory?.updatedAt).toBe(new Date(0).toISOString());
+    expect(doc.boardMemory?.snapshot).toEqual(
+      normalizeFlowBoardMemoryDocument({
+        version: 1,
+        goals: ["Improve checkout clarity"],
+        assumptions: ["Customer is authenticated"],
+        entities: [{ id: "entity-1", name: "Shopper" }],
+        screens: [{ id: "screen-1", title: "Browse", notes: ["Show search"] }],
+        journey: [{ id: "journey-1", title: "Browse products", kind: "decision", laneId: "normal-flow" }],
+        technicalNotes: [{ id: "technical-note-1", title: "Checkout API", body: "POST /checkout", tags: ["api"] }],
+        openQuestions: ["What happens when payment fails?"],
+        artifactMappings: [{ memoryId: "journey-1", cellId: "cell-1" }],
+      }),
+    );
   });
 });
 
@@ -443,6 +544,41 @@ describe("applyFlowMutations", () => {
     ]);
 
     expect(doc.connections).toEqual([]);
+  });
+
+  it("allows screen refs to connect into technical-briefing via mutations", () => {
+    const doc = applyFlowMutations(createEmptyFlowDocument(), [
+      {
+        op: "add-cell",
+        cellId: "screen-ref",
+        laneId: "normal-flow",
+        column: 0,
+        artifact: { type: "design-frame-ref", frameId: "frame-1" },
+      },
+      {
+        op: "add-cell",
+        cellId: "technical-step",
+        laneId: "technical-briefing",
+        column: 0,
+        artifact: {
+          type: "technical-brief",
+          title: "Contract",
+          language: "json",
+          body: "{}",
+        },
+      },
+      {
+        op: "add-connection",
+        fromCellId: "screen-ref",
+        toCellId: "technical-step",
+      },
+    ]);
+
+    expect(doc.connections).toHaveLength(1);
+    expect(doc.connections[0]).toMatchObject({
+      fromCellId: "screen-ref",
+      toCellId: "technical-step",
+    });
   });
 
   it("moves cells between areas and drops now-invalid cross-area connections", () => {

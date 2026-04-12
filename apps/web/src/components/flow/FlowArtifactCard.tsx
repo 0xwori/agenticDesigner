@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type {
   FlowArtifact,
   FlowHandleSide,
@@ -246,6 +246,49 @@ function DesignFrameRefContent({
   buildPreviewDocument: (frameId: string, version?: FrameVersion, isBuilding?: boolean) => string;
   onLoad: () => void;
 }) {
+  const previewFrameRef = useRef<HTMLDivElement | null>(null);
+  const [previewScale, setPreviewScale] = useState(1);
+  const previewWidth = Math.max(refFrame?.size.width ?? 1, 1);
+  const previewHeight = Math.max(refFrame?.size.height ?? 1, 1);
+
+  const updatePreviewScale = useCallback(() => {
+    const element = previewFrameRef.current;
+    if (!element) {
+      return;
+    }
+
+    const nextScale = Math.min(
+      element.clientWidth / previewWidth,
+      element.clientHeight / previewHeight,
+    );
+    if (!Number.isFinite(nextScale) || nextScale <= 0) {
+      return;
+    }
+
+    setPreviewScale((current) => (Math.abs(current - nextScale) < 0.01 ? current : nextScale));
+  }, [previewHeight, previewWidth]);
+
+  useEffect(() => {
+    if (!refFrame) {
+      return;
+    }
+
+    updatePreviewScale();
+  }, [refFrame, updatePreviewScale]);
+
+  useEffect(() => {
+    const element = previewFrameRef.current;
+    if (!refFrame || !element || typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      updatePreviewScale();
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [refFrame, updatePreviewScale]);
+
   if (!refFrame) {
     return (
       <div className="flow-rf-node__frame-preview">
@@ -282,17 +325,27 @@ function DesignFrameRefContent({
           {statusLabel}
         </span>
       </div>
-      <div className="flow-rf-node__frame-live" style={{ aspectRatio: previewAspectRatio }}>
-        <iframe
-          key={previewVersion?.id ?? refFrame.id}
-          srcDoc={previewHtml}
-          title={refFrame.name}
-          sandbox="allow-scripts"
-          loading="lazy"
-          tabIndex={-1}
-          aria-hidden="true"
-          onLoad={onLoad}
-        />
+      <div ref={previewFrameRef} className="flow-rf-node__frame-live" style={{ aspectRatio: previewAspectRatio }}>
+        <div className="flow-rf-node__frame-live-stage">
+          <iframe
+            key={previewVersion?.id ?? refFrame.id}
+            srcDoc={previewHtml}
+            title={refFrame.name}
+            sandbox="allow-scripts"
+            loading="lazy"
+            tabIndex={-1}
+            aria-hidden="true"
+            style={{
+              width: previewWidth,
+              height: previewHeight,
+              transform: `translate(-50%, -50%) scale(${previewScale})`,
+            }}
+            onLoad={() => {
+              updatePreviewScale();
+              onLoad();
+            }}
+          />
+        </div>
       </div>
     </div>
   );

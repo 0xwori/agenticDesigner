@@ -16,7 +16,7 @@ import {
   getFlowCellAreaId,
   getFlowGlobalColumn,
   getFlowHandleSideFromId,
-  isConnectionAllowed,
+  isFlowConnectionAllowedBetweenCells,
   normalizeFlowConnection,
 } from "@designer/shared";
 
@@ -170,6 +170,10 @@ export interface FlowAreaChrome {
   height: number;
   gutterWidth: number;
   lanes: FlowLaneChrome[];
+  gridColumns: Array<{
+    left: number;
+    width: number;
+  }>;
 }
 
 export type FlowTranslateExtent = [[number, number], [number, number]];
@@ -561,6 +565,10 @@ export function buildFlowChromeAreas(metrics: FlowLayoutMetrics): FlowAreaChrome
     width: area.width,
     height: metrics.contentHeight,
     gutterWidth: Math.max(metrics.labelWidth, area.slotLeft - area.left - Math.round(metrics.nodePaddingLeft / 2)),
+    gridColumns: Array.from({ length: area.localColumnCount }, (_, columnIndex) => ({
+      left: area.slotLeft - area.left + columnIndex * metrics.slotStep,
+      width: metrics.nodeWidth,
+    })),
     lanes: FLOW_LANE_ORDER.map((laneId, laneIndex) => ({
       areaId: area.id,
       laneId,
@@ -621,11 +629,7 @@ export function buildFlowBoardLayout(
       continue;
     }
 
-    if (getFlowCellAreaId(doc, fromCell) !== getFlowCellAreaId(doc, toCell)) {
-      continue;
-    }
-
-    if (!isConnectionAllowed(fromCell.laneId, toCell.laneId)) {
+    if (!isFlowConnectionAllowedBetweenCells(doc, fromCell, toCell)) {
       continue;
     }
 
@@ -679,11 +683,7 @@ export function isValidFlowConnectionBetweenCells(
     return false;
   }
 
-  if (getFlowCellAreaId(doc, sourceCell) !== getFlowCellAreaId(doc, targetCell)) {
-    return false;
-  }
-
-  return isConnectionAllowed(sourceCell.laneId, targetCell.laneId);
+  return isFlowConnectionAllowedBetweenCells(doc, sourceCell, targetCell);
 }
 
 export function toFlowConnectionRecord(

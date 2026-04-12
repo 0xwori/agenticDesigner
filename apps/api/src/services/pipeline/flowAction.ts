@@ -12,16 +12,15 @@ import {
   resolveFlowArea,
 } from "@designer/shared";
 import { requestCompletion } from "../llmProviders.js";
+import type { FlowDesignFrameContext } from "./flowFrameContext.js";
+import { buildFlowBoardMemoryContext, ensureFlowBoardMemoryDocument } from "./flowBoardMemory.js";
 
-interface DesignFrameInfo {
-  id: string;
-  name: string;
-}
+const MAX_BOARD_VISION_IMAGES = 6;
 
 interface FlowActionInput {
   prompt: string;
   flowDocument: FlowDocument;
-  designFrames: DesignFrameInfo[];
+  designFrames: FlowDesignFrameContext[];
   provider: ProviderId;
   model: string;
   apiKey?: string;
@@ -73,9 +72,10 @@ function getAttachmentSize(
 
 function buildFlowContext(
   doc: FlowDocument,
-  frames: DesignFrameInfo[],
+  frames: FlowDesignFrameContext[],
   focusedAreaId?: string,
   attachments?: ComposerAttachment[],
+  boardVisionImages?: ComposerAttachment[],
 ): string {
   const normalizedDoc = normalizeFlowDocument(doc);
   const focusedArea = resolveFlowArea(normalizedDoc, focusedAreaId);
@@ -92,7 +92,7 @@ function buildFlowContext(
 
     if (artifact.type === "design-frame-ref") {
       const frame = frames.find((candidate) => candidate.id === artifact.frameId);
-      label = `design-frame-ref → "${frame?.name ?? artifact.frameId}"`;
+      label = `design-frame-ref → "${frame?.name ?? artifact.frameId}"${frame?.summary ? ` | ${frame.summary}` : ""}`;
     } else if (artifact.type === "journey-step") {
       label = `journey-step: "${artifact.text.slice(0, 50)}"`;
     } else if (artifact.type === "technical-brief") {
@@ -116,15 +116,23 @@ function buildFlowContext(
     return `  - "${connection.fromCellId}" → "${connection.toCellId}"${handles} (id: "${connection.id}")`;
   });
 
-  const frameLines = frames.map((frame) => `  - id="${frame.id}" name="${frame.name}"`);
+  const frameLines = frames.map(
+    (frame) =>
+      `  - id="${frame.id}" name="${frame.name}"${frame.summary ? ` summary="${frame.summary}"` : ""}`,
+  );
   const attachmentLines = listImageAttachments(attachments).map((attachment) => {
     const name = attachment.name?.trim() || "Attached image";
     return `  - attachment "${attachment.id}" name="${name}"`;
+  });
+  const boardVisionLines = (boardVisionImages ?? []).map((attachment, index) => {
+    const name = attachment.name?.trim() || `Board image ${index + 1}`;
+    return `  - vision image ${index + 1}: "${name}"`;
   });
 
   const importedSourceLines = (normalizedDoc.importedSourceFrameIds ?? []).map(
     (frameId) => `  - imported source frame id="${frameId}"`,
   );
+  const boardMemoryContext = buildFlowBoardMemoryContext(normalizedDoc.boardMemory);
 
   return `Current flow document:
 Areas (${normalizedDoc.areas?.length ?? 0}):
@@ -142,8 +150,53 @@ ${importedSourceLines.join("\n") || "  (none)"}
 Available design frames:
 ${frameLines.join("\n") || "  (none)"}
 
+Existing board images included for vision analysis only:
+${boardVisionLines.join("\n") || "  (none)"}
+
 Available image attachments:
-${attachmentLines.join("\n") || "  (none)"}`;
+${attachmentLines.join("\n") || "  (none)"}
+
+${boardMemoryContext}`;
+}
+
+function inferMimeTypeFromDataUrl(dataUrl: string): string | undefined {
+  const match = /^data:([^;,]+)[;,]/i.exec(dataUrl);
+  return match?.[1];
+}
+
+function buildBoardVisionAttachments(doc: FlowDocument, focusedAreaId?: string): ComposerAttachment[] {
+  const normalizedDoc = normalizeFlowDocument(doc);
+  const focusedArea = resolveFlowArea(normalizedDoc, focusedAreaId).id;
+
+  return [...normalizedDoc.cells]
+    .filter(
+      (cell): cell is FlowDocument["cells"][number] & {
+        artifact: Extract<FlowDocument["cells"][number]["artifact"], { type: "uploaded-image" }>;
+      } => cell.artifact.type === "uploaded-image" && typeof cell.artifact.dataUrl === "string" && cell.artifact.dataUrl.length > 0,
+    )
+    .sort((left, right) => {
+      const leftFocused = resolveFlowArea(normalizedDoc, left.areaId).id === focusedArea ? 0 : 1;
+      const rightFocused = resolveFlowArea(normalizedDoc, right.areaId).id === focusedArea ? 0 : 1;
+      if (leftFocused !== rightFocused) {
+        return leftFocused - rightFocused;
+      }
+
+      const columnDelta = getFlowGlobalColumn(normalizedDoc, left) - getFlowGlobalColumn(normalizedDoc, right);
+      if (columnDelta !== 0) {
+        return columnDelta;
+      }
+
+      return left.id.localeCompare(right.id);
+    })
+    .slice(0, MAX_BOARD_VISION_IMAGES)
+    .map((cell, index) => ({
+      id: `board-image-${cell.id}`,
+      type: "image",
+      status: "uploaded",
+      name: cell.artifact.label?.trim() || `Board image ${index + 1}`,
+      mimeType: inferMimeTypeFromDataUrl(cell.artifact.dataUrl),
+      dataUrl: cell.artifact.dataUrl,
+    }));
 }
 
 const SYSTEM_PROMPT = `You are a flow-board assistant for a UI design tool. The user has a flow board with swim lanes and wants to make changes.
@@ -177,6 +230,14 @@ Connection rules:
 - If the user does not specify an area, use the focused area from the context for newly added content.
 - Never create cross-area connections.
 
+Board analysis rules:
+- Treat the selected board as a full user-journey artifact, not a single-node edit surface.
+- When the user asks for analysis, improvement, refinement, or cleanup, review the whole board before deciding what to mutate.
+- Look for missing happy-path steps, unhappy-path branches, recovery loops, and edge cases implied by the existing sequence.
+- Add concise technical-brief artifacts when the flow implies integration or delivery concerns such as API calls, SDK use, auth/session handling, cache/state sync, refresh-on-load behavior, retries, or async failure recovery.
+- Prefer improving the existing structure over rewriting the whole board.
+- Keep all edits scoped to the current board. Never reference or mutate sibling flow boards.
+
 ERD / Flow Diagram Rules:
 - When the user asks for an ERD, user flow, or flow diagram, create journey-step cells in the "user-journey" lane.
 - Use shape "rectangle" for process steps (actions the user takes).
@@ -188,7 +249,9 @@ ERD / Flow Diagram Rules:
 
 Image Analysis:
 - When uploaded images already exist on the board, analyze their labels/context to understand the screens they represent.
+- Existing board images listed in the context are already on the canvas and are provided for interpretation only.
 - When an image attachment is available and the user wants it on the board, use add-attachment-image rather than embedding a raw data URL.
+- Only items listed under "Available image attachments" may be used with add-attachment-image.
 - Create journey steps that describe the user flow between image/screens, connecting them with add-connection.
 - Infer screen transitions, decision points, and error paths from the screen context.
 
@@ -392,9 +455,147 @@ export function normalizeFlowActionCommands(input: {
   return normalized;
 }
 
+function normalizePromptLabel(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function isBoardAnalysisPrompt(prompt: string): boolean {
+  return /\b(analy[sz]e|review|audit|improve|fill(?:\s+in)?|add(?:\s+the)?\s+steps?|missing\s+steps?|journey|edge\s+cases?|happy\s+path|unhappy\s+path)\b/i.test(
+    prompt,
+  );
+}
+
+function getArtifactJourneyLabel(artifact: FlowDocument["cells"][number]["artifact"], frames: FlowDesignFrameContext[]): string | null {
+  switch (artifact.type) {
+    case "design-frame-ref":
+      return frames.find((frame) => frame.id === artifact.frameId)?.name ?? null;
+    case "uploaded-image":
+      return artifact.label?.trim() || null;
+    case "journey-step":
+      return artifact.text.trim() || null;
+    case "technical-brief":
+      return null;
+  }
+}
+
+function buildHeuristicFlowCommands(input: {
+  doc: FlowDocument;
+  designFrames: FlowDesignFrameContext[];
+  prompt: string;
+  focusedAreaId?: string;
+}): FlowMutationCommand[] {
+  if (!isBoardAnalysisPrompt(input.prompt)) {
+    return [];
+  }
+
+  const normalizedDoc = normalizeFlowDocument(input.doc);
+  const focusedAreaId = resolveFlowArea(normalizedDoc, input.focusedAreaId).id;
+  const areaCells = normalizedDoc.cells
+    .filter((cell) => resolveFlowArea(normalizedDoc, cell.areaId).id === focusedAreaId)
+    .sort((left, right) => {
+      const leftColumn = getFlowGlobalColumn(normalizedDoc, left);
+      const rightColumn = getFlowGlobalColumn(normalizedDoc, right);
+      if (leftColumn !== rightColumn) {
+        return leftColumn - rightColumn;
+      }
+      const laneDelta = FLOW_LANE_ORDER.indexOf(left.laneId) - FLOW_LANE_ORDER.indexOf(right.laneId);
+      if (laneDelta !== 0) {
+        return laneDelta;
+      }
+      return left.id.localeCompare(right.id);
+    });
+
+  const existingJourneySteps = areaCells.filter(
+    (cell) => cell.laneId === "user-journey" && cell.artifact.type === "journey-step",
+  );
+  const existingLabels = new Set(
+    existingJourneySteps.map((cell) =>
+      normalizePromptLabel(cell.artifact.type === "journey-step" ? cell.artifact.text : ""),
+    ),
+  );
+
+  const commands: FlowMutationCommand[] = [];
+  const heuristicSteps: Array<{ cellId: string; column: number }> = [];
+
+  const sourceCells = areaCells.filter(
+    (cell) => cell.laneId !== "user-journey" && cell.laneId !== "technical-briefing",
+  );
+
+  for (const cell of sourceCells) {
+    const label = getArtifactJourneyLabel(cell.artifact, input.designFrames);
+    if (!label) {
+      continue;
+    }
+
+    const normalizedLabel = normalizePromptLabel(label);
+    if (!normalizedLabel || existingLabels.has(normalizedLabel)) {
+      continue;
+    }
+
+    existingLabels.add(normalizedLabel);
+    const cellId = `heuristic-journey-${crypto.randomUUID()}`;
+    commands.push({
+      op: "add-cell",
+      cellId,
+      areaId: focusedAreaId,
+      laneId: "user-journey",
+      column: cell.column,
+      artifact: {
+        type: "journey-step",
+        text: label,
+        shape: "rectangle",
+      },
+    });
+    heuristicSteps.push({ cellId, column: cell.column });
+  }
+
+  const journeySequence = [
+    ...existingJourneySteps.map((cell) => ({ cellId: cell.id, column: cell.column })),
+    ...heuristicSteps,
+  ].sort((left, right) => {
+    if (left.column !== right.column) {
+      return left.column - right.column;
+    }
+    return left.cellId.localeCompare(right.cellId);
+  });
+
+  const existingConnections = new Set(
+    normalizedDoc.connections.map((connection) => `${connection.fromCellId}->${connection.toCellId}`),
+  );
+
+  for (let index = 0; index < journeySequence.length - 1; index += 1) {
+    const fromCellId = journeySequence[index]?.cellId;
+    const toCellId = journeySequence[index + 1]?.cellId;
+    if (!fromCellId || !toCellId) {
+      continue;
+    }
+
+    const key = `${fromCellId}->${toCellId}`;
+    if (existingConnections.has(key)) {
+      continue;
+    }
+
+    existingConnections.add(key);
+    commands.push({
+      op: "add-connection",
+      fromCellId,
+      toCellId,
+    });
+  }
+
+  return commands;
+}
+
 export async function runFlowAction(input: FlowActionInput): Promise<FlowActionResult> {
-  const normalizedDoc = normalizeFlowDocument(input.flowDocument);
-  const context = buildFlowContext(normalizedDoc, input.designFrames, input.focusedAreaId, input.attachments);
+  const normalizedDoc = ensureFlowBoardMemoryDocument(input.flowDocument, input.designFrames);
+  const boardVisionImages = input.provider === "openai" ? buildBoardVisionAttachments(normalizedDoc, input.focusedAreaId) : [];
+  const context = buildFlowContext(
+    normalizedDoc,
+    input.designFrames,
+    input.focusedAreaId,
+    input.attachments,
+    boardVisionImages,
+  );
 
   const completion = await requestCompletion({
     provider: input.provider,
@@ -403,6 +604,7 @@ export async function runFlowAction(input: FlowActionInput): Promise<FlowActionR
     allowMock: false,
     jsonMode: true,
     timeoutMs: 30_000,
+    attachments: boardVisionImages.length > 0 ? [...boardVisionImages, ...(input.attachments ?? [])] : input.attachments,
     system: SYSTEM_PROMPT,
     prompt: `${context}\n\nUser request: ${input.prompt}\n\nReturn JSON array of commands.`,
   });
@@ -415,8 +617,17 @@ export async function runFlowAction(input: FlowActionInput): Promise<FlowActionR
     focusedAreaId: input.focusedAreaId,
   });
 
-  const updatedDocument = applyFlowMutations(normalizedDoc, commands);
-  const summary = describeFlowMutations(commands, normalizedDoc);
+  const resolvedCommands = commands.length > 0
+    ? commands
+    : buildHeuristicFlowCommands({
+        doc: normalizedDoc,
+        designFrames: input.designFrames,
+        prompt: input.prompt,
+        focusedAreaId: input.focusedAreaId,
+      });
 
-  return { commands, updatedDocument, summary };
+  const updatedDocument = applyFlowMutations(normalizedDoc, resolvedCommands);
+  const summary = describeFlowMutations(resolvedCommands, normalizedDoc);
+
+  return { commands: resolvedCommands, updatedDocument, summary };
 }

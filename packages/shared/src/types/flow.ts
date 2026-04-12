@@ -107,6 +107,74 @@ export interface FlowConnection {
   targetHandle?: string;
 }
 
+export interface FlowStory {
+  title: string;
+  userStory: string;
+  acceptanceCriteria: string[];
+  technicalNotes: string[];
+  generatedAt: string;
+  sourcePrompt: string;
+}
+
+export interface FlowBoardMemoryEntity {
+  id: string;
+  name: string;
+  description?: string;
+}
+
+export interface FlowBoardMemoryScreen {
+  id: string;
+  title: string;
+  frameId?: string;
+  summary?: string;
+  notes: string[];
+}
+
+export type FlowBoardMemoryJourneyNodeKind = "step" | "decision";
+
+export type FlowBoardMemoryJourneyLaneId = Exclude<FlowLaneId, "technical-briefing">;
+
+export interface FlowBoardMemoryJourneyNode {
+  id: string;
+  title: string;
+  laneId: FlowBoardMemoryJourneyLaneId;
+  kind: FlowBoardMemoryJourneyNodeKind;
+  screenId?: string;
+  notes: string[];
+}
+
+export interface FlowBoardMemoryTechnicalNote {
+  id: string;
+  title: string;
+  body: string;
+  language?: string;
+  tags: string[];
+}
+
+export interface FlowBoardMemoryArtifactMapping {
+  memoryId: string;
+  cellId?: string;
+  frameId?: string;
+}
+
+export interface FlowBoardMemoryDocument {
+  version: 1;
+  goals: string[];
+  assumptions: string[];
+  entities: FlowBoardMemoryEntity[];
+  screens: FlowBoardMemoryScreen[];
+  journey: FlowBoardMemoryJourneyNode[];
+  technicalNotes: FlowBoardMemoryTechnicalNote[];
+  openQuestions: string[];
+  artifactMappings: FlowBoardMemoryArtifactMapping[];
+}
+
+export interface FlowBoardMemoryState {
+  authoredText: string;
+  snapshot: FlowBoardMemoryDocument;
+  updatedAt: string;
+}
+
 // ── Document ───────────────────────────────────────────────
 
 export interface FlowDocument {
@@ -117,6 +185,8 @@ export interface FlowDocument {
   connections: FlowConnection[];
   entryFlowFrameId?: string;
   exitFlowFrameId?: string;
+  story?: FlowStory;
+  boardMemory?: FlowBoardMemoryState;
 }
 
 export function createEmptyFlowDocument(): FlowDocument {
@@ -220,6 +290,157 @@ function normalizeImportedSourceFrameIds(importedSourceFrameIds?: string[]): str
   return nextIds;
 }
 
+function normalizeFlowBoardMemoryStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const nextItems: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    const normalized = item.trim();
+    if (!normalized) {
+      continue;
+    }
+    nextItems.push(normalized);
+  }
+
+  return nextItems;
+}
+
+function normalizeOptionalFlowBoardMemoryString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeFlowBoardMemoryId(value: unknown, prefix: string, index: number): string {
+  return normalizeOptionalFlowBoardMemoryString(value) ?? `${prefix}-${index + 1}`;
+}
+
+function isIsoDateString(value: string): boolean {
+  return Number.isFinite(Date.parse(value));
+}
+
+export function createEmptyFlowBoardMemoryDocument(): FlowBoardMemoryDocument {
+  return {
+    version: 1,
+    goals: [],
+    assumptions: [],
+    entities: [],
+    screens: [],
+    journey: [],
+    technicalNotes: [],
+    openQuestions: [],
+    artifactMappings: [],
+  };
+}
+
+export function normalizeFlowBoardMemoryDocument(
+  value?: Partial<FlowBoardMemoryDocument> | null,
+): FlowBoardMemoryDocument {
+  const doc = value ?? undefined;
+
+  const entities = Array.isArray(doc?.entities)
+    ? doc.entities.map((entity, index) => ({
+        id: normalizeFlowBoardMemoryId(entity?.id, "entity", index),
+        name: normalizeOptionalFlowBoardMemoryString(entity?.name) ?? `Entity ${index + 1}`,
+        description: normalizeOptionalFlowBoardMemoryString(entity?.description),
+      }))
+    : [];
+
+  const screens = Array.isArray(doc?.screens)
+    ? doc.screens.map((screen, index) => ({
+        id: normalizeFlowBoardMemoryId(screen?.id, "screen", index),
+        title: normalizeOptionalFlowBoardMemoryString(screen?.title) ?? `Screen ${index + 1}`,
+        frameId: normalizeOptionalFlowBoardMemoryString(screen?.frameId),
+        summary: normalizeOptionalFlowBoardMemoryString(screen?.summary),
+        notes: normalizeFlowBoardMemoryStringList(screen?.notes),
+      }))
+    : [];
+
+  const journey: FlowBoardMemoryJourneyNode[] = Array.isArray(doc?.journey)
+    ? doc.journey.map((node, index) => ({
+        id: normalizeFlowBoardMemoryId(node?.id, "journey", index),
+        title: normalizeOptionalFlowBoardMemoryString(node?.title) ?? `Step ${index + 1}`,
+        laneId:
+          node?.laneId === "normal-flow" || node?.laneId === "unhappy-path" || node?.laneId === "user-journey"
+            ? node.laneId
+            : "user-journey",
+        kind: (node?.kind === "decision" ? "decision" : "step") as FlowBoardMemoryJourneyNodeKind,
+        screenId: normalizeOptionalFlowBoardMemoryString(node?.screenId),
+        notes: normalizeFlowBoardMemoryStringList(node?.notes),
+      }))
+    : [];
+
+  const technicalNotes = Array.isArray(doc?.technicalNotes)
+    ? doc.technicalNotes.map((note, index) => ({
+        id: normalizeFlowBoardMemoryId(note?.id, "technical-note", index),
+        title: normalizeOptionalFlowBoardMemoryString(note?.title) ?? `Technical note ${index + 1}`,
+        body: normalizeOptionalFlowBoardMemoryString(note?.body) ?? "",
+        language: normalizeOptionalFlowBoardMemoryString(note?.language),
+        tags: normalizeFlowBoardMemoryStringList(note?.tags),
+      }))
+    : [];
+
+  const artifactMappings: FlowBoardMemoryArtifactMapping[] = Array.isArray(doc?.artifactMappings)
+    ? doc.artifactMappings
+        .map((mapping) => ({
+          memoryId: normalizeOptionalFlowBoardMemoryString(mapping?.memoryId),
+          cellId: normalizeOptionalFlowBoardMemoryString(mapping?.cellId),
+          frameId: normalizeOptionalFlowBoardMemoryString(mapping?.frameId),
+        }))
+        .flatMap((mapping) =>
+          mapping.memoryId
+            ? [
+                {
+                  memoryId: mapping.memoryId,
+                  cellId: mapping.cellId,
+                  frameId: mapping.frameId,
+                },
+              ]
+            : [],
+        )
+    : [];
+
+  return {
+    version: 1,
+    goals: normalizeFlowBoardMemoryStringList(doc?.goals),
+    assumptions: normalizeFlowBoardMemoryStringList(doc?.assumptions),
+    entities,
+    screens,
+    journey,
+    technicalNotes,
+    openQuestions: normalizeFlowBoardMemoryStringList(doc?.openQuestions),
+    artifactMappings,
+  };
+}
+
+export function normalizeFlowBoardMemoryState(
+  value?: Partial<FlowBoardMemoryState> | null,
+): FlowBoardMemoryState | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const authoredText = typeof value.authoredText === "string" ? value.authoredText : "";
+  const updatedAt =
+    typeof value.updatedAt === "string" && isIsoDateString(value.updatedAt)
+      ? value.updatedAt
+      : new Date(0).toISOString();
+
+  return {
+    authoredText,
+    snapshot: normalizeFlowBoardMemoryDocument(value.snapshot),
+    updatedAt,
+  };
+}
+
 export function getDefaultFlowArea(doc: Pick<FlowDocument, "areas">): FlowArea {
   return normalizeFlowAreas(doc.areas)[0];
 }
@@ -313,6 +534,7 @@ export function normalizeFlowDocument(doc: FlowDocument): FlowDocument {
     lanes: lanes.length > 0 ? lanes : [...FLOW_LANE_ORDER],
     areas,
     importedSourceFrameIds: normalizeImportedSourceFrameIds(doc.importedSourceFrameIds),
+    boardMemory: normalizeFlowBoardMemoryState(doc.boardMemory),
     cells: doc.cells.map((cell) => ({
       ...cell,
       column: normalizeFlowColumn(cell.column),
@@ -346,6 +568,28 @@ const ALLOWED_CROSS_LANE: Record<FlowLaneId, Set<FlowLaneId>> = {
  */
 export function isConnectionAllowed(fromLane: FlowLaneId, toLane: FlowLaneId): boolean {
   return ALLOWED_CROSS_LANE[fromLane]?.has(toLane) ?? false;
+}
+
+function isDesignFrameToTechnicalBriefingConnection(
+  fromCell: Pick<FlowCell, "artifact">,
+  toCell: Pick<FlowCell, "laneId">,
+): boolean {
+  return fromCell.artifact.type === "design-frame-ref" && toCell.laneId === "technical-briefing";
+}
+
+export function isFlowConnectionAllowedBetweenCells(
+  doc: Pick<FlowDocument, "areas">,
+  fromCell: Pick<FlowCell, "artifact" | "laneId" | "areaId">,
+  toCell: Pick<FlowCell, "artifact" | "laneId" | "areaId">,
+): boolean {
+  if (getFlowCellAreaId(doc, fromCell) !== getFlowCellAreaId(doc, toCell)) {
+    return false;
+  }
+
+  return (
+    isConnectionAllowed(fromCell.laneId, toCell.laneId) ||
+    isDesignFrameToTechnicalBriefingConnection(fromCell, toCell)
+  );
 }
 
 export function isFlowHandleSide(value: string): value is FlowHandleSide {
@@ -541,10 +785,7 @@ function normalizeAndFilterFlowConnections(doc: FlowDocument): FlowConnection[] 
     if (!fromCell || !toCell) {
       continue;
     }
-    if (getFlowCellAreaId(doc, fromCell) !== getFlowCellAreaId(doc, toCell)) {
-      continue;
-    }
-    if (!isConnectionAllowed(fromCell.laneId, toCell.laneId)) {
+    if (!isFlowConnectionAllowedBetweenCells(doc, fromCell, toCell)) {
       continue;
     }
 
@@ -632,8 +873,7 @@ export function applyFlowMutations(
         const fromCell = result.cells.find((c) => c.id === cmd.fromCellId);
         const toCell = result.cells.find((c) => c.id === cmd.toCellId);
         if (!fromCell || !toCell) break;
-        if (getFlowCellAreaId(result, fromCell) !== getFlowCellAreaId(result, toCell)) break;
-        if (!isConnectionAllowed(fromCell.laneId, toCell.laneId)) break;
+        if (!isFlowConnectionAllowedBetweenCells(result, fromCell, toCell)) break;
         const normalized = normalizeFlowConnection(result, {
           id: crypto.randomUUID(),
           fromCellId: cmd.fromCellId,

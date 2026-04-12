@@ -57,6 +57,10 @@ type ArtboardPaneProps = {
   onFocusedFlowAreaChange?: (areaId: string | null) => void;
   onSelectFlowBoard?: (frameId: string) => Promise<void>;
   onCreateFlowBoard?: () => Promise<void>;
+  onDeleteFlowBoard?: (frameId: string) => Promise<void>;
+  onAskAgentForFlowBoard?: (frameId: string) => Promise<void>;
+  onOpenFlowStory?: (frameId: string) => Promise<void>;
+  activeFlowBoardTask?: "agent" | "story" | null;
 };
 
 export function ArtboardPane(props: ArtboardPaneProps) {
@@ -98,6 +102,10 @@ export function ArtboardPane(props: ArtboardPaneProps) {
     onFocusedFlowAreaChange,
     onSelectFlowBoard,
     onCreateFlowBoard,
+    onDeleteFlowBoard,
+    onAskAgentForFlowBoard,
+    onOpenFlowStory,
+    activeFlowBoardTask,
   } = props;
 
   const [showImportPopover, setShowImportPopover] = useState(false);
@@ -299,6 +307,10 @@ export function ArtboardPane(props: ArtboardPaneProps) {
               onExitToDesign={() => onCanvasModeChange("design")}
               onSelectFlowBoard={onSelectFlowBoard}
               onCreateFlowBoard={onCreateFlowBoard}
+              onDeleteBoard={onDeleteFlowBoard}
+              onAskAgentForBoard={onAskAgentForFlowBoard}
+              onOpenFlowStory={onOpenFlowStory}
+              boardBusyState={activeFlowBoardTask}
             />
           ) : null
         ) : (

@@ -15,6 +15,7 @@ type FlowChromeLayerProps = {
   variant: "underlay" | "overlay";
   viewport?: FlowViewportTransform;
   className?: string;
+  showTitles?: boolean;
 };
 
 function buildLayerStyle(
@@ -39,6 +40,7 @@ export function FlowChromeLayer({
   variant,
   viewport,
   className,
+  showTitles = true,
 }: FlowChromeLayerProps) {
   if (areas.length === 0) {
     return null;
@@ -71,7 +73,26 @@ export function FlowChromeLayer({
             )}px`,
           }}
         >
-          {variant === "overlay" ? (
+          {variant === "underlay" ? (
+            <div className="flow-chrome-area__grid" aria-hidden>
+              {area.lanes.flatMap((lane) =>
+                area.gridColumns.map((column, columnIndex) => (
+                  <div
+                    key={`${area.id}-${lane.laneId}-grid-${columnIndex}`}
+                    className="flow-chrome-grid-cell"
+                    style={{
+                      left: column.left,
+                      top: lane.top + 10,
+                      width: column.width,
+                      height: Math.max(36, lane.height - 20),
+                    }}
+                  />
+                )),
+              )}
+            </div>
+          ) : null}
+
+          {variant === "overlay" && showTitles ? (
             <div className="flow-chrome-area__title" title={area.name}>{area.name}</div>
           ) : null}
 

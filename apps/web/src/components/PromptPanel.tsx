@@ -24,7 +24,7 @@ import {
   UserRound,
   X
 } from "lucide-react";
-import type { LocalPreferences, PromptEntry, RunMode } from "../types/ui";
+import type { CanvasMode, LocalPreferences, PromptEntry, RunMode } from "../types/ui";
 import { ErrorHint, EventStageIcon, stageLabel } from "./pipelineVisuals";
 import { sortPipelineEvents } from "../lib/eventOrdering";
 
@@ -63,6 +63,8 @@ type PromptPanelProps = {
   canSubmit: boolean;
   selectedFrameContextLabel: string | null;
   eventCapReached: boolean;
+  canvasMode: CanvasMode;
+  activeFlowBoardName: string | null;
 };
 
 function toDisplayUrl(value: string) {
@@ -157,7 +159,9 @@ export function PromptPanel(props: PromptPanelProps) {
     formatThoughtDuration,
     canSubmit,
     selectedFrameContextLabel,
-    eventCapReached
+    eventCapReached,
+    canvasMode,
+    activeFlowBoardName,
   } = props;
 
   // -------------------------------------------------------------------------
@@ -272,6 +276,11 @@ export function PromptPanel(props: PromptPanelProps) {
     setFigmaInputOpen(false);
     setAttachMenuOpen(false);
   }
+
+  const composerPlaceholder =
+    canvasMode === "flow"
+      ? "Describe the journey, ask the agent to fix gaps, add edge cases, or write technical briefings for this board..."
+      : "Ask a question, request a screen, or attach a Figma/image reference...";
 
   return (
     <aside className="chat-pane">
@@ -606,7 +615,15 @@ export function PromptPanel(props: PromptPanelProps) {
           </div>
         ) : null}
 
-        {selectedFrameContextLabel ? (
+        {canvasMode === "flow" && activeFlowBoardName ? (
+          <div className="composer-selection-chip composer-selection-chip--flow">
+            <span>Board</span>
+            <strong>{activeFlowBoardName}</strong>
+            <span className="composer-selection-chip__hint">Agent edits only this board</span>
+          </div>
+        ) : null}
+
+        {canvasMode !== "flow" && selectedFrameContextLabel ? (
           <div className="composer-selection-chip">
             <span>{runMode === "edit-selected" ? "Editing:" : "Variant of:"}</span>
             <strong>{selectedFrameContextLabel}</strong>
@@ -617,12 +634,12 @@ export function PromptPanel(props: PromptPanelProps) {
         <textarea
           value={composerPrompt}
           onChange={(event) => setComposerPrompt(event.target.value)}
-          placeholder="Ask a question, request a screen, or attach a Figma/image reference..."
+          placeholder={composerPlaceholder}
           rows={3}
         />
         <div className="composer-toolbar">
           <div className="composer-toolbar__left">
-            {selectedFrameContextLabel ? (
+            {canvasMode !== "flow" && selectedFrameContextLabel ? (
               <div className="composer-mode-toggle">
                 <button
                   type="button"
@@ -640,61 +657,67 @@ export function PromptPanel(props: PromptPanelProps) {
                 </button>
               </div>
             ) : null}
-            <label>
-              <select
-                value={selectedSurfaceTarget}
-                onChange={(event) => {
-                  const next = event.target.value as SurfaceTarget;
-                  setSelectedSurfaceTarget(next);
-                  setSelectedDevice(next === "mobile" ? "iphone" : "desktop");
-                }}
-              >
-                <option value="web">Web</option>
-                <option value="mobile">Mobile</option>
-              </select>
-            </label>
-            <label>
-              <select value={selectedDevice} onChange={(event) => setSelectedDevice(event.target.value as DevicePreset)}>
-                <option value="desktop">Desktop</option>
-                <option value="iphone">iPhone</option>
-                <option value="iphone-15">iPhone 15</option>
-                <option value="iphone-15-pro">iPhone 15 Pro</option>
-                <option value="iphone-15-pro-max">iPhone 15 Pro Max</option>
-              </select>
-            </label>
-            <label>
-              <select value={selectedMode} onChange={(event) => setSelectedMode(event.target.value as DesignMode)}>
-                <option value="high-fidelity">High-fidelity</option>
-                <option value="wireframe">Wireframe</option>
-              </select>
-            </label>
-            <label>
-              <select
-                value={selectedDesignSystemMode}
-                onChange={(event) => setSelectedDesignSystemMode(event.target.value as DesignSystemMode)}
-              >
-                <option value="strict">DS strict</option>
-                <option value="creative">DS creative</option>
-              </select>
-            </label>
-            <label>
-              <select value={variation} onChange={(event) => setVariation(Number(event.target.value))}>
-                <option value={1}>1x</option>
-                <option value={3}>3x</option>
-                <option value={5}>5x</option>
-              </select>
-            </label>
-            <label className="composer-checkbox">
-              <input
-                type="checkbox"
-                checked={tailwindOverride}
-                onChange={(event) => {
-                  const next = event.target.checked;
-                  onTailwindPreferenceChange(next);
-                }}
-              />
-              Tailwind
-            </label>
+            {canvasMode === "flow" ? (
+              <span className="composer-flow-hint">Journey agent mode. The selected board is the only editable scope.</span>
+            ) : (
+              <>
+                <label>
+                  <select
+                    value={selectedSurfaceTarget}
+                    onChange={(event) => {
+                      const next = event.target.value as SurfaceTarget;
+                      setSelectedSurfaceTarget(next);
+                      setSelectedDevice(next === "mobile" ? "iphone" : "desktop");
+                    }}
+                  >
+                    <option value="web">Web</option>
+                    <option value="mobile">Mobile</option>
+                  </select>
+                </label>
+                <label>
+                  <select value={selectedDevice} onChange={(event) => setSelectedDevice(event.target.value as DevicePreset)}>
+                    <option value="desktop">Desktop</option>
+                    <option value="iphone">iPhone</option>
+                    <option value="iphone-15">iPhone 15</option>
+                    <option value="iphone-15-pro">iPhone 15 Pro</option>
+                    <option value="iphone-15-pro-max">iPhone 15 Pro Max</option>
+                  </select>
+                </label>
+                <label>
+                  <select value={selectedMode} onChange={(event) => setSelectedMode(event.target.value as DesignMode)}>
+                    <option value="high-fidelity">High-fidelity</option>
+                    <option value="wireframe">Wireframe</option>
+                  </select>
+                </label>
+                <label>
+                  <select
+                    value={selectedDesignSystemMode}
+                    onChange={(event) => setSelectedDesignSystemMode(event.target.value as DesignSystemMode)}
+                  >
+                    <option value="strict">DS strict</option>
+                    <option value="creative">DS creative</option>
+                  </select>
+                </label>
+                <label>
+                  <select value={variation} onChange={(event) => setVariation(Number(event.target.value))}>
+                    <option value={1}>1x</option>
+                    <option value={3}>3x</option>
+                    <option value={5}>5x</option>
+                  </select>
+                </label>
+                <label className="composer-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={tailwindOverride}
+                    onChange={(event) => {
+                      const next = event.target.checked;
+                      onTailwindPreferenceChange(next);
+                    }}
+                  />
+                  Tailwind
+                </label>
+              </>
+            )}
           </div>
           <button type="submit" disabled={!canSubmit}>
             <SendHorizontal size={13} />

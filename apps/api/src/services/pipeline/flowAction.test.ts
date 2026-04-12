@@ -253,6 +253,21 @@ describe("runFlowAction", () => {
       prompt: "Create a flow for a signup screen with a yes/no decision.",
       flowDocument: {
         ...createEmptyFlowDocument(),
+        boardMemory: {
+          authoredText: "version: 1\ngoals:\n  - Reduce signup drop-off\n",
+          updatedAt: "2026-04-12T10:00:00.000Z",
+          snapshot: {
+            version: 1,
+            goals: ["Reduce signup drop-off"],
+            assumptions: [],
+            entities: [],
+            screens: [],
+            journey: [],
+            technicalNotes: [],
+            openQuestions: [],
+            artifactMappings: [],
+          },
+        },
         areas: [
           { id: FLOW_DEFAULT_AREA_ID, name: "Area 1", columnOffset: 0 },
           { id: "area-2", name: "Checkout", columnOffset: 7 },
@@ -271,6 +286,104 @@ describe("runFlowAction", () => {
     expect(input.system).toContain('outcomes labeled "yes" and "no"');
     expect(input.system).toContain('normalize the second branch to "no"');
     expect(input.system).toContain("Do not create new boards or new areas in this route.");
+    expect(input.system).toContain("Look for missing happy-path steps");
+    expect(input.system).toContain("refresh-on-load behavior");
     expect(input.prompt).toContain('Focused area: "Checkout" (id: "area-2")');
+    expect(input.prompt).toContain("Board memory:");
+    expect(input.prompt).toContain("goals=1");
+  });
+
+  it("fills in missing journey steps from existing screen refs when the model returns no commands", async () => {
+    vi.mocked(requestCompletion).mockResolvedValue({ content: "[]" } as never);
+
+    const result = await runFlowAction({
+      prompt: "Analyse the board and fill in the steps",
+      flowDocument: {
+        ...createEmptyFlowDocument(),
+        cells: [
+          {
+            id: "screen-1",
+            laneId: "normal-flow",
+            column: 0,
+            artifact: { type: "design-frame-ref", frameId: "frame-1" },
+          },
+          {
+            id: "screen-2",
+            laneId: "normal-flow",
+            column: 1,
+            artifact: { type: "design-frame-ref", frameId: "frame-2" },
+          },
+        ],
+        connections: [],
+      },
+      designFrames: [
+        { id: "frame-1", name: "Browse products" },
+        { id: "frame-2", name: "Checkout" },
+      ],
+      provider: "openai",
+      model: "gpt-5.4-mini",
+    });
+
+    expect(result.commands).toHaveLength(3);
+    expect(result.commands[0]).toMatchObject({
+      op: "add-cell",
+      laneId: "user-journey",
+      artifact: { type: "journey-step", text: "Browse products", shape: "rectangle" },
+    });
+    expect(result.commands[1]).toMatchObject({
+      op: "add-cell",
+      laneId: "user-journey",
+      artifact: { type: "journey-step", text: "Checkout", shape: "rectangle" },
+    });
+    expect(result.commands[2]).toMatchObject({
+      op: "add-connection",
+    });
+    expect(result.updatedDocument.cells.some((cell) => cell.laneId === "user-journey" && cell.artifact.type === "journey-step")).toBe(true);
+    expect(result.updatedDocument.connections).toHaveLength(1);
+  });
+
+  it("passes frame summaries and board images into the model context and seeds board memory", async () => {
+    vi.mocked(requestCompletion).mockResolvedValue({ content: "[]" } as never);
+
+    const result = await runFlowAction({
+      prompt: "Analyze this board and improve it",
+      flowDocument: {
+        ...createEmptyFlowDocument(),
+        cells: [
+          {
+            id: "screen-image",
+            laneId: "normal-flow",
+            column: 0,
+            artifact: {
+              type: "uploaded-image",
+              dataUrl: "data:image/png;base64,xyz",
+              label: "Checkout error state",
+            },
+          },
+        ],
+      },
+      designFrames: [
+        {
+          id: "frame-1",
+          name: "Checkout screen",
+          summary: "key UI copy: Checkout, Shipping address, Pay now",
+        },
+      ],
+      provider: "openai",
+      model: "gpt-5.4-mini",
+    });
+
+    const input = vi.mocked(requestCompletion).mock.calls.at(-1)?.[0];
+    expect(input?.prompt).toContain("summary=\"key UI copy: Checkout, Shipping address, Pay now\"");
+    expect(input?.prompt).toContain("Existing board images included for vision analysis only:");
+    expect(input?.attachments).toMatchObject([
+      {
+        id: "board-image-screen-image",
+        name: "Checkout error state",
+      },
+    ]);
+    expect(result.updatedDocument.boardMemory?.snapshot.screens[0]).toMatchObject({
+      title: "Checkout error state",
+    });
   });
 });

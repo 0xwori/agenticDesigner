@@ -4,6 +4,7 @@ import type {
   DesignSystemMode,
   DevicePreset,
   FlowDocument,
+  FlowStoryResponse,
   Frame,
   FrameKind,
   FrameVersion,
@@ -382,6 +383,22 @@ export function sendFlowAction(
     flowDocument: FlowDocument;
     summary: string;
   }>(apiBaseUrl, `/frames/${encodeURIComponent(frameId)}/flow-action`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function generateFlowStory(
+  apiBaseUrl: string,
+  frameId: string,
+  payload: {
+    prompt?: string;
+    provider: ProviderId;
+    model: string;
+    apiKey?: string;
+  },
+) {
+  return request<FlowStoryResponse>(apiBaseUrl, `/frames/${encodeURIComponent(frameId)}/flow-story`, {
     method: "POST",
     body: JSON.stringify(payload)
   });

@@ -1,5 +1,5 @@
 import type { DesignMode, DesignSystemMode, DevicePreset, ProviderId, SurfaceTarget } from "./core.js";
-import type { FrameKind, FlowSummary } from "./flow.js";
+import type { FlowBoardMemoryState, FlowDocument, FlowMutationCommand, FlowStory, FrameKind, FlowSummary } from "./flow.js";
 import type { FrameWithVersions } from "./frames.js";
 import type { PipelineRun } from "./pipeline.js";
 import type { ProjectDesignSystem } from "./designSystem.js";
@@ -59,6 +59,99 @@ export interface GenerateRunInput {
 
 export interface EditRunInput extends GenerateRunInput {
   frameId: string;
+}
+
+export interface FlowStoryRequest {
+  prompt?: string;
+  provider: ProviderId;
+  model: string;
+  apiKey?: string;
+}
+
+export interface FlowStoryResponse {
+  ok: boolean;
+  frameId: string;
+  story: FlowStory;
+  flowDocument: FlowDocument;
+  summary: string;
+}
+
+export type FlowAgentMode = "review" | "auto-apply";
+
+export type FlowAgentPhase =
+  | "intake"
+  | "read-memory"
+  | "interpret"
+  | "analyze"
+  | "plan"
+  | "validate"
+  | "review-ready"
+  | "apply"
+  | "complete";
+
+export type FlowBoardFindingSeverity = "info" | "warning" | "risk";
+
+export interface FlowBoardFinding {
+  id: string;
+  severity: FlowBoardFindingSeverity;
+  title: string;
+  detail: string;
+  relatedCellIds?: string[];
+  relatedMemoryIds?: string[];
+}
+
+export interface FlowBoardPlan {
+  summary: string;
+  rationale: string;
+  warnings: string[];
+  findings: FlowBoardFinding[];
+  commands: FlowMutationCommand[];
+  updatedMemory: FlowBoardMemoryState;
+}
+
+export interface FlowAgentRunRequest {
+  prompt: string;
+  mode?: FlowAgentMode;
+  provider: ProviderId;
+  model: string;
+  apiKey?: string;
+  attachments?: ComposerAttachment[];
+  focusedAreaId?: string;
+}
+
+export interface FlowAgentRunResult {
+  runId: string;
+  mode: FlowAgentMode;
+  phase: FlowAgentPhase;
+}
+
+export interface FlowAgentRunResponse {
+  ok: boolean;
+  frameId: string;
+  run: FlowAgentRunResult;
+}
+
+export interface FlowAgentReviewResponse {
+  ok: boolean;
+  frameId: string;
+  findings: FlowBoardFinding[];
+  plan: FlowBoardPlan;
+  flowDocument: FlowDocument;
+}
+
+export interface FlowAgentApplyRequest {
+  runId?: string;
+  commands?: FlowMutationCommand[];
+  memory?: FlowBoardMemoryState;
+}
+
+export interface FlowAgentApplyResponse {
+  ok: boolean;
+  frameId: string;
+  flowDocument: FlowDocument;
+  appliedCommands: FlowMutationCommand[];
+  summary: string;
+  memory?: FlowBoardMemoryState;
 }
 
 export interface ApiErrorResponse {

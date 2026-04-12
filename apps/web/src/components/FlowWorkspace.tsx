@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import type {
   FlowArtifact,
   FlowDocument,
@@ -11,7 +11,10 @@ import type {
 import {
   createEmptyFlowDocument,
   FLOW_LANE_LABELS,
+  getFlowSourceHandleId,
+  getFlowTargetHandleId,
   isFlowCellOccupied,
+  normalizeFlowConnection,
   resolveFlowInsertColumn,
 } from "@designer/shared";
 import { Code, FileText, LayoutDashboard, Plus, Upload, Workflow, X } from "lucide-react";
@@ -32,15 +35,6 @@ import {
   type FlowBoardCellLayout,
   type FlowGridSlot,
 } from "../lib/flowAdapter";
-import {
-  appendConnectionToFlowDocument,
-  cloneFlowArtifact,
-  removeConnectionFromFlowDocument,
-  resolveNearestConnectionSnapTarget,
-  resolveFlowWheelGesture,
-  shouldIgnoreFlowDeleteShortcut,
-  type FlowConnectionSnapTarget,
-} from "../lib/flowWorkspaceInteractions";
 
 type FlowWorkspaceProps = {
   frame: FrameWithVersions;
@@ -55,9 +49,11 @@ type FlowWorkspaceProps = {
   onExitToDesign?: () => void;
   onSelectFlowBoard?: (frameId: string) => Promise<void> | void;
   onCreateFlowBoard?: () => Promise<void> | void;
+  onDeleteBoard?: (frameId: string) => Promise<void> | void;
+  onAskAgentForBoard?: (frameId: string) => Promise<void> | void;
+  onOpenFlowStory?: (frameId: string) => Promise<void> | void;
+  boardBusyState?: "agent" | "story" | null;
 };
-
-type NodeDragMode = "move" | "duplicate";
 
 type ViewportState = {
   x: number;
@@ -77,8 +73,6 @@ type PointerPanState = {
 type NodeDragState = {
   pointerId: number;
   cellId: string;
-  mode: NodeDragMode;
-  artifact: FlowArtifact;
   areaId: string;
   laneId: FlowBoardCellLayout["laneId"];
   column: number;
@@ -96,19 +90,10 @@ type ConnectionDraftState = {
   sourceSide: FlowHandleSide;
   startPoint: { x: number; y: number };
   currentPoint: { x: number; y: number };
-  snapTarget: FlowConnectionSnapTarget | null;
-};
-
-type WebKitGestureEvent = Event & {
-  clientX: number;
-  clientY: number;
-  scale: number;
 };
 
 const FLOW_WORKSPACE_MIN_ZOOM = 0.35;
 const FLOW_WORKSPACE_MAX_ZOOM = 1.8;
-const FLOW_EDGE_HIT_WIDTH_PX = 24;
-const FLOW_CONNECTION_SNAP_RADIUS_PX = 68;
 
 function newCellId() {
   return crypto.randomUUID();
@@ -158,6 +143,21 @@ async function readImageArtifact(file: File): Promise<UploadedImageArtifact> {
       label: file.name,
     };
   }
+}
+
+function isExactConnectionDuplicate(
+  doc: FlowDocument,
+  nextConnection: Pick<FlowDocument["connections"][number], "fromCellId" | "toCellId" | "sourceHandle" | "targetHandle">,
+  ignoreEdgeId?: string,
+) {
+  return doc.connections.some(
+    (connection) =>
+      connection.id !== ignoreEdgeId &&
+      connection.fromCellId === nextConnection.fromCellId &&
+      connection.toCellId === nextConnection.toCellId &&
+      connection.sourceHandle === nextConnection.sourceHandle &&
+      connection.targetHandle === nextConnection.targetHandle,
+  );
 }
 
 function isInteractiveElement(target: EventTarget | null): boolean {
@@ -263,13 +263,6 @@ function clampViewportPosition(
   };
 }
 
-function getFlowAreaMetricById(
-  metrics: ReturnType<typeof buildFlowBoardLayout>["metrics"],
-  areaId: string,
-) {
-  return metrics.areas.find((area) => area.id === areaId) ?? null;
-}
-
 function FlowWorkspaceInner({
   frame,
   flowDocument,
@@ -294,24 +287,18 @@ function FlowWorkspaceInner({
   const panStateRef = useRef<PointerPanState | null>(null);
   const nodeDragRef = useRef<NodeDragState | null>(null);
   const connectionDraftRef = useRef<ConnectionDraftState | null>(null);
-  const suppressWheelZoomUntilRef = useRef(0);
 
   const [editingCellId, setEditingCellId] = useState<string | null>(null);
   const [hoveredSlot, setHoveredSlot] = useState<FlowGridSlot | null>(null);
   const [activeMenu, setActiveMenu] = useState<SlotMenuState>(null);
   const [showFramePicker, setShowFramePicker] = useState<SlotMenuState>(null);
   const [measuredNodeHeights, setMeasuredNodeHeights] = useState<Record<string, number>>({});
-  const [extraAreaColumns, setExtraAreaColumns] = useState<Record<string, number>>({});
   const [focusedAreaId, setFocusedAreaId] = useState<string | null>(null);
-  const [focusedCellId, setFocusedCellId] = useState<string | null>(null);
   const [viewport, setViewport] = useState<ViewportState>({ x: 0, y: 0, zoom: 1 });
   const [panState, setPanState] = useState<PointerPanState | null>(null);
   const [nodeDrag, setNodeDrag] = useState<NodeDragState | null>(null);
   const [connectionDraft, setConnectionDraft] = useState<ConnectionDraftState | null>(null);
   const [hoveredEdgeId, setHoveredEdgeId] = useState<string | null>(null);
-  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
-  const [selectedCellId, setSelectedCellId] = useState<string | null>(null);
-  const [pendingDeleteCellId, setPendingDeleteCellId] = useState<string | null>(null);
   const markerPrefix = useId().replace(/:/g, "");
 
   useEffect(() => {
@@ -341,38 +328,6 @@ function FlowWorkspaceInner({
     });
   }, [doc.cells]);
 
-  useEffect(() => {
-    if (selectedEdgeId && !doc.connections.some((connection) => connection.id === selectedEdgeId)) {
-      setSelectedEdgeId(null);
-    }
-    if (hoveredEdgeId && !doc.connections.some((connection) => connection.id === hoveredEdgeId)) {
-      setHoveredEdgeId(null);
-    }
-  }, [doc.connections, hoveredEdgeId, selectedEdgeId]);
-
-  useEffect(() => {
-    if (selectedCellId && !doc.cells.some((cell) => cell.id === selectedCellId)) {
-      setSelectedCellId(null);
-    }
-    if (focusedCellId && !doc.cells.some((cell) => cell.id === focusedCellId)) {
-      setFocusedCellId(null);
-    }
-    if (pendingDeleteCellId && !doc.cells.some((cell) => cell.id === pendingDeleteCellId)) {
-      setPendingDeleteCellId(null);
-    }
-  }, [doc.cells, focusedCellId, pendingDeleteCellId, selectedCellId]);
-
-  useEffect(() => {
-    setExtraAreaColumns((current) => {
-      const validAreaIds = new Set(doc.areas?.map((area) => area.id) ?? []);
-      const nextEntries = Object.entries(current).filter(([areaId, count]) => validAreaIds.has(areaId) && count > 0);
-      if (nextEntries.length === Object.keys(current).length) {
-        return current;
-      }
-      return Object.fromEntries(nextEntries);
-    });
-  }, [doc.areas]);
-
   const commitDoc = useCallback(
     (nextDoc: FlowDocument) => {
       docRef.current = nextDoc;
@@ -383,12 +338,7 @@ function FlowWorkspaceInner({
 
   const updateDoc = useCallback(
     (updater: (prev: FlowDocument) => FlowDocument) => {
-      const currentDoc = docRef.current;
-      const nextDoc = updater(currentDoc);
-      if (nextDoc === currentDoc) {
-        return;
-      }
-      commitDoc(nextDoc);
+      commitDoc(updater(docRef.current));
     },
     [commitDoc],
   );
@@ -402,11 +352,10 @@ function FlowWorkspaceInner({
         layoutScale: 1,
         maxVisibleBodyHeight: Math.max(viewportHeight - 160, 640),
         measuredNodeHeights,
-        extraAreaColumns,
         allDesignFrames,
         editingCellId,
       }),
-    [allDesignFrames, doc, editingCellId, extraAreaColumns, measuredNodeHeights, viewportHeight, viewportWidth],
+    [allDesignFrames, doc, editingCellId, measuredNodeHeights, viewportHeight, viewportWidth],
   );
 
   const metrics = layout.metrics;
@@ -471,6 +420,14 @@ function FlowWorkspaceInner({
     return {
       x: (localX - currentViewport.x) / currentViewport.zoom,
       y: (localY - currentViewport.y) / currentViewport.zoom,
+    };
+  }, []);
+
+  const boardToScreenPoint = useCallback((point: { x: number; y: number }) => {
+    const currentViewport = viewportRef.current;
+    return {
+      x: currentViewport.x + point.x * currentViewport.zoom,
+      y: currentViewport.y + point.y * currentViewport.zoom,
     };
   }, []);
 
@@ -616,48 +573,6 @@ function FlowWorkspaceInner({
     setShowFramePicker(null);
   }, []);
 
-  const clearFocusMode = useCallback(() => {
-    setFocusedCellId(null);
-  }, []);
-
-  const enterFocusMode = useCallback(
-    (cellId: string, areaId: string) => {
-      closeMenus();
-      setHoveredEdgeId(null);
-      setSelectedEdgeId(null);
-      setPendingDeleteCellId(null);
-      setSelectedCellId(cellId);
-      setFocusedAreaId(areaId);
-      setFocusedCellId(cellId);
-      shellRef.current?.focus({ preventScroll: true });
-    },
-    [closeMenus],
-  );
-
-  const extendAreaByOneColumn = useCallback(
-    (areaId: string) => {
-      autoFitEnabledRef.current = false;
-      setFocusedAreaId(areaId);
-      setExtraAreaColumns((current) => ({
-        ...current,
-        [areaId]: Math.max(0, Math.floor(current[areaId] ?? 0)) + 1,
-      }));
-    },
-    [],
-  );
-
-  const selectEdge = useCallback(
-    (edgeId: string) => {
-      shellRef.current?.focus({ preventScroll: true });
-      closeMenus();
-      setSelectedCellId(null);
-      setPendingDeleteCellId(null);
-      setSelectedEdgeId(edgeId);
-      setHoveredEdgeId(edgeId);
-    },
-    [closeMenus],
-  );
-
   const handleMeasuredNodeHeight = useCallback((cellId: string, height: number) => {
     const normalizedHeight = Math.max(96, Math.ceil(height));
     setMeasuredNodeHeights((current) => {
@@ -688,9 +603,6 @@ function FlowWorkspaceInner({
         const { [cellId]: _removed, ...rest } = current;
         return rest;
       });
-      setSelectedCellId((current) => (current === cellId ? null : current));
-      setPendingDeleteCellId((current) => (current === cellId ? null : current));
-      setEditingCellId((current) => (current === cellId ? null : current));
     },
     [updateDoc],
   );
@@ -715,36 +627,14 @@ function FlowWorkspaceInner({
 
   const handleDeleteEdge = useCallback(
     (edgeId: string) => {
-      updateDoc((prev) => removeConnectionFromFlowDocument(prev, edgeId));
-      setSelectedEdgeId((current) => (current === edgeId ? null : current));
+      updateDoc((prev) => ({
+        ...prev,
+        connections: prev.connections.filter((connection) => connection.id !== edgeId),
+      }));
       setHoveredEdgeId((current) => (current === edgeId ? null : current));
     },
     [updateDoc],
   );
-
-  const requestCellRemoval = useCallback(
-    (cellId: string) => {
-      shellRef.current?.focus({ preventScroll: true });
-      closeMenus();
-      setSelectedEdgeId(null);
-      setHoveredEdgeId(null);
-      setSelectedCellId(cellId);
-      setPendingDeleteCellId(cellId);
-    },
-    [closeMenus],
-  );
-
-  const confirmPendingCellRemoval = useCallback(() => {
-    if (!pendingDeleteCellId) {
-      return;
-    }
-    handleRemoveCell(pendingDeleteCellId);
-  }, [handleRemoveCell, pendingDeleteCellId]);
-
-  const cancelPendingCellRemoval = useCallback(() => {
-    setPendingDeleteCellId(null);
-    shellRef.current?.focus({ preventScroll: true });
-  }, []);
 
   const placeArtifactAtSlot = useCallback(
     (
@@ -866,6 +756,16 @@ function FlowWorkspaceInner({
     [placeArtifactAtSlot],
   );
 
+  const updateBoardLink = useCallback(
+    (field: "entryFlowFrameId" | "exitFlowFrameId", nextFrameId: string | null) => {
+      updateDoc((prev) => ({
+        ...prev,
+        [field]: nextFrameId && nextFrameId.length > 0 ? nextFrameId : undefined,
+      }));
+    },
+    [updateDoc],
+  );
+
   const handleFlowBoardSelect = useCallback(
     (frameId: string) => {
       if (!frameId || frameId === frame.id) {
@@ -885,18 +785,12 @@ function FlowWorkspaceInner({
       event.stopPropagation();
       autoFitEnabledRef.current = false;
       closeMenus();
-      setSelectedEdgeId(null);
-      setPendingDeleteCellId(null);
-      setSelectedCellId(cell.cellId);
       setFocusedAreaId(cell.areaId);
-      shellRef.current?.focus({ preventScroll: true });
 
       const pointerPoint = screenToBoardPoint(event.clientX, event.clientY);
       const nextState: NodeDragState = {
         pointerId: event.pointerId,
         cellId: cell.cellId,
-        mode: event.altKey ? "duplicate" : "move",
-        artifact: cell.artifact,
         areaId: cell.areaId,
         laneId: cell.laneId,
         column: cell.column,
@@ -924,11 +818,7 @@ function FlowWorkspaceInner({
       event.stopPropagation();
       autoFitEnabledRef.current = false;
       closeMenus();
-      setSelectedEdgeId(null);
-      setPendingDeleteCellId(null);
-      setSelectedCellId(cell.cellId);
       setFocusedAreaId(cell.areaId);
-      shellRef.current?.focus({ preventScroll: true });
 
       const anchor = getFlowNodeHandlePosition(cell, side);
       const nextState: ConnectionDraftState = {
@@ -937,7 +827,6 @@ function FlowWorkspaceInner({
         sourceSide: side,
         startPoint: anchor,
         currentPoint: anchor,
-        snapTarget: null,
       };
 
       connectionDraftRef.current = nextState;
@@ -977,12 +866,7 @@ function FlowWorkspaceInner({
 
       autoFitEnabledRef.current = false;
       closeMenus();
-      shellRef.current?.focus({ preventScroll: true });
-      clearFocusMode();
       setHoveredEdgeId(null);
-      setSelectedEdgeId(null);
-      setSelectedCellId(null);
-      setPendingDeleteCellId(null);
 
       const slot = getFlowGridSlotAtPosition(screenToBoardPoint(event.clientX, event.clientY), metrics);
       if (slot) {
@@ -998,15 +882,13 @@ function FlowWorkspaceInner({
       panStateRef.current = nextState;
       setPanState(nextState);
     },
-    [clearFocusMode, closeMenus, metrics, screenToBoardPoint],
+    [closeMenus, metrics, screenToBoardPoint],
   );
 
   const handleCanvasWheel = useCallback(
     (event: React.WheelEvent<HTMLDivElement>) => {
       event.preventDefault();
-      event.stopPropagation();
       autoFitEnabledRef.current = false;
-      event.currentTarget.focus({ preventScroll: true });
 
       const shellRect = shellRef.current?.getBoundingClientRect();
       const localPoint = {
@@ -1014,87 +896,23 @@ function FlowWorkspaceInner({
         y: event.clientY - (shellRect?.top ?? 0),
       };
 
-      const canvasSize = getCanvasSize();
-      const gesture = resolveFlowWheelGesture({
-        deltaX: event.deltaX,
-        deltaY: event.deltaY,
-        deltaZ: event.deltaZ,
-        deltaMode: event.deltaMode,
-        ctrlKey: event.ctrlKey,
-        metaKey: event.metaKey,
-        shiftKey: event.shiftKey,
-        viewportWidth: canvasSize.width,
-        viewportHeight: canvasSize.height,
-      });
-
-      if (gesture.kind === "zoom") {
-        if (performance.now() < suppressWheelZoomUntilRef.current) {
-          return;
-        }
-        zoomByFactor(gesture.factor, localPoint);
+      if (event.metaKey || event.ctrlKey) {
+        const factor = Math.exp(-event.deltaY * 0.0015);
+        zoomByFactor(factor, localPoint);
         return;
       }
 
       setClampedViewport(
         (current) => ({
           ...current,
-          x: current.x - gesture.deltaX,
-          y: current.y - gesture.deltaY,
+          x: current.x - event.deltaX,
+          y: current.y - event.deltaY,
         }),
         true,
       );
     },
-    [getCanvasSize, setClampedViewport, zoomByFactor],
+    [setClampedViewport, zoomByFactor],
   );
-
-  useEffect(() => {
-    const shellElement = shellRef.current;
-    if (!shellElement) {
-      return;
-    }
-
-    let previousScale = 1;
-    const suppressWheelZoom = () => {
-      suppressWheelZoomUntilRef.current = performance.now() + 260;
-    };
-
-    const handleGestureStart = (event: Event) => {
-      previousScale = 1;
-      suppressWheelZoom();
-      autoFitEnabledRef.current = false;
-      shellElement.focus({ preventScroll: true });
-      event.preventDefault();
-    };
-
-    const handleGestureChange = (event: Event) => {
-      const gestureEvent = event as WebKitGestureEvent;
-      const shellRect = shellElement.getBoundingClientRect();
-      const nextScale = Number.isFinite(gestureEvent.scale) && gestureEvent.scale > 0 ? gestureEvent.scale : 1;
-      const factor = nextScale / Math.max(previousScale, 0.0001);
-      previousScale = nextScale;
-      suppressWheelZoom();
-      zoomByFactor(factor, {
-        x: gestureEvent.clientX - shellRect.left,
-        y: gestureEvent.clientY - shellRect.top,
-      });
-      event.preventDefault();
-    };
-
-    const handleGestureEnd = () => {
-      previousScale = 1;
-      suppressWheelZoom();
-    };
-
-    shellElement.addEventListener("gesturestart", handleGestureStart as EventListener, { passive: false });
-    shellElement.addEventListener("gesturechange", handleGestureChange as EventListener, { passive: false });
-    shellElement.addEventListener("gestureend", handleGestureEnd as EventListener);
-
-    return () => {
-      shellElement.removeEventListener("gesturestart", handleGestureStart as EventListener);
-      shellElement.removeEventListener("gesturechange", handleGestureChange as EventListener);
-      shellElement.removeEventListener("gestureend", handleGestureEnd as EventListener);
-    };
-  }, [zoomByFactor]);
 
   useEffect(() => {
     if (!panState) {
@@ -1154,35 +972,16 @@ function FlowWorkspaceInner({
         x: point.x - currentDrag.pointerOffsetX,
         y: point.y - currentDrag.pointerOffsetY,
       };
-      const nextMode: NodeDragMode = event.altKey ? "duplicate" : "move";
-      const candidateSlot = getFlowGridSlotAtPosition(point, metrics);
-      const nextSlot = (() => {
-        if (!candidateSlot) {
-          return null;
-        }
-
-        if (nextMode !== "duplicate") {
-          return candidateSlot;
-        }
-
-        const isOriginSlot =
-          candidateSlot.areaId === currentDrag.areaId &&
-          candidateSlot.laneId === currentDrag.laneId &&
-          candidateSlot.column === currentDrag.column;
-        if (isOriginSlot) {
-          return null;
-        }
-
-        if (isFlowCellOccupied(docRef.current, candidateSlot.laneId, candidateSlot.column, undefined, candidateSlot.areaId)) {
-          return null;
-        }
-
-        return candidateSlot;
-      })();
+      const nextSlot = getFlowGridSlotAtPosition(
+        {
+          x: nextPosition.x + currentDrag.width / 2,
+          y: nextPosition.y + currentDrag.height / 2,
+        },
+        metrics,
+      );
 
       const nextState = {
         ...currentDrag,
-        mode: nextMode,
         position: nextPosition,
         slot: nextSlot,
       };
@@ -1207,30 +1006,6 @@ function FlowWorkspaceInner({
       setFocusedAreaId(slot.areaId);
 
       const currentDoc = docRef.current;
-      if (currentDrag.mode === "duplicate") {
-        if (isFlowCellOccupied(currentDoc, slot.laneId, slot.column, undefined, slot.areaId)) {
-          return;
-        }
-
-        const duplicateId = newCellId();
-        updateDoc((prev) => ({
-          ...prev,
-          cells: [
-            ...prev.cells,
-            {
-              id: duplicateId,
-              areaId: slot.areaId,
-              laneId: slot.laneId,
-              column: slot.column,
-              artifact: cloneFlowArtifact(currentDrag.artifact),
-            },
-          ],
-        }));
-        setSelectedCellId(duplicateId);
-        setPendingDeleteCellId(null);
-        return;
-      }
-
       const occupant = currentDoc.cells.find(
         (cell) =>
           cell.laneId === slot.laneId &&
@@ -1299,19 +1074,9 @@ function FlowWorkspaceInner({
         return;
       }
 
-      const point = screenToBoardPoint(event.clientX, event.clientY);
-      const snapTarget = resolveNearestConnectionSnapTarget({
-        doc: docRef.current,
-        sourceCellId: currentDraft.fromCellId,
-        point,
-        cells: layout.cells,
-        threshold: FLOW_CONNECTION_SNAP_RADIUS_PX / Math.max(viewportRef.current.zoom, 0.1),
-      });
-
       const nextState = {
         ...currentDraft,
-        currentPoint: point,
-        snapTarget,
+        currentPoint: screenToBoardPoint(event.clientX, event.clientY),
       };
       connectionDraftRef.current = nextState;
       setConnectionDraft(nextState);
@@ -1327,8 +1092,8 @@ function FlowWorkspaceInner({
       const handleElement = targetElement instanceof HTMLElement
         ? targetElement.closest<HTMLElement>("[data-flow-target-handle='true']")
         : null;
-      const targetCellId = currentDraft.snapTarget?.cellId ?? handleElement?.dataset.cellId;
-      const targetSide = currentDraft.snapTarget?.side ?? (handleElement?.dataset.side as FlowHandleSide | undefined);
+      const targetCellId = handleElement?.dataset.cellId;
+      const targetSide = handleElement?.dataset.side as FlowHandleSide | undefined;
 
       if (
         targetCellId &&
@@ -1336,21 +1101,26 @@ function FlowWorkspaceInner({
         targetCellId !== currentDraft.fromCellId &&
         isValidFlowConnectionBetweenCells(docRef.current, currentDraft.fromCellId, targetCellId)
       ) {
-        const nextConnectionId = crypto.randomUUID();
-        const nextDoc = appendConnectionToFlowDocument(docRef.current, {
+        const normalized = normalizeFlowConnection(docRef.current, {
+          id: crypto.randomUUID(),
           fromCellId: currentDraft.fromCellId,
           toCellId: targetCellId,
-          sourceSide: currentDraft.sourceSide,
-          targetSide,
-          createId: () => nextConnectionId,
+          sourceHandle: getFlowSourceHandleId(currentDraft.sourceSide),
+          targetHandle: getFlowTargetHandleId(targetSide),
         });
 
-        if (nextDoc !== docRef.current) {
-          setSelectedCellId(null);
-          setPendingDeleteCellId(null);
-          setSelectedEdgeId(nextConnectionId);
-          setHoveredEdgeId(nextConnectionId);
-          updateDoc(() => nextDoc);
+        if (
+          !isExactConnectionDuplicate(docRef.current, {
+            fromCellId: normalized.fromCellId,
+            toCellId: normalized.toCellId,
+            sourceHandle: normalized.sourceHandle,
+            targetHandle: normalized.targetHandle,
+          })
+        ) {
+          updateDoc((prev) => ({
+            ...prev,
+            connections: [...prev.connections, normalized],
+          }));
         }
       }
 
@@ -1366,64 +1136,38 @@ function FlowWorkspaceInner({
       window.removeEventListener("pointerup", handlePointerUp);
       window.removeEventListener("pointercancel", handlePointerUp);
     };
-  }, [connectionDraft, layout.cells, screenToBoardPoint, updateDoc]);
+  }, [connectionDraft, screenToBoardPoint, updateDoc]);
 
+  const availableFlowBoards = useMemo(
+    () => allFlowFrames.filter((flowFrame) => flowFrame.id !== frame.id),
+    [allFlowFrames, frame.id],
+  );
+  const entryBoardValue = availableFlowBoards.some((flowFrame) => flowFrame.id === doc.entryFlowFrameId)
+    ? doc.entryFlowFrameId ?? ""
+    : "";
+  const exitBoardValue = availableFlowBoards.some((flowFrame) => flowFrame.id === doc.exitFlowFrameId)
+    ? doc.exitFlowFrameId ?? ""
+    : "";
   const visibleSlot = !panState && !nodeDrag && !connectionDraft ? activeMenu ?? hoveredSlot : null;
   const hasLegacyAreas = metrics.areas.length > 1;
   const boardSubtitle = hasLegacyAreas
     ? `Legacy board with ${metrics.areas.length} imported areas`
     : "4 fixed swimlanes";
-  const inverseViewportScale = 1 / viewport.zoom;
-  const edgeHitStrokeWidth = FLOW_EDGE_HIT_WIDTH_PX * inverseViewportScale;
-
-  const focusContext = useMemo(() => {
-    if (!focusedCellId) {
-      return null;
-    }
-
-    const relatedCellIds = new Set<string>([focusedCellId]);
-    const relatedEdgeIds = new Set<string>();
-
-    for (const connection of doc.connections) {
-      if (connection.fromCellId !== focusedCellId && connection.toCellId !== focusedCellId) {
-        continue;
-      }
-
-      relatedCellIds.add(connection.fromCellId);
-      relatedCellIds.add(connection.toCellId);
-      relatedEdgeIds.add(connection.id);
-    }
-
-    return {
-      cellIds: relatedCellIds,
-      edgeIds: relatedEdgeIds,
-    };
-  }, [doc.connections, focusedCellId]);
-
-  const extendableAreas = useMemo(() => {
-    if (!hasLegacyAreas) {
-      return metrics.areas;
-    }
-
-    const areaId = focusedAreaId ?? metrics.areas[0]?.id;
-    return areaId ? metrics.areas.filter((area) => area.id === areaId) : [];
-  }, [focusedAreaId, hasLegacyAreas, metrics.areas]);
 
   const dragLaneTop = nodeDrag?.slot ? getFlowLaneTop(nodeDrag.slot.laneId, metrics) : 0;
   const dragLaneHeight = nodeDrag?.slot ? getFlowLaneHeight(nodeDrag.slot.laneId, metrics) : 0;
   const dragSlotCenter = nodeDrag?.slot ? getFlowSlotCenter(nodeDrag.slot, metrics) : null;
-  const selectedEdgeGeometry = selectedEdgeId ? edgeGeometries.find((edge) => edge.id === selectedEdgeId) ?? null : null;
-  const pendingDeleteCell = pendingDeleteCellId ? doc.cells.find((cell) => cell.id === pendingDeleteCellId) ?? null : null;
-  const pendingDeleteCellLayout = pendingDeleteCellId ? cellLayoutById.get(pendingDeleteCellId) ?? null : null;
 
-  const getFloatingAnchorStyle = useCallback(
-    (point: { x: number; y: number }) => ({
-      left: point.x,
-      top: point.y,
-      transform: `translate(-50%, -50%) scale(${inverseViewportScale})`,
-      transformOrigin: "center center",
-    }),
-    [inverseViewportScale],
+  const getMenuAnchorStyle = useCallback(
+    (slot: FlowGridSlot) => {
+      const center = getFlowSlotCenter(slot, metrics);
+      const screen = boardToScreenPoint(center);
+      return {
+        left: screen.x - 15,
+        top: screen.y - 15,
+      };
+    },
+    [boardToScreenPoint, metrics],
   );
 
   const connectionPreview = useMemo(() => {
@@ -1431,92 +1175,13 @@ function FlowWorkspaceInner({
       return null;
     }
 
-    const previewPoint = connectionDraft.snapTarget?.point ?? connectionDraft.currentPoint;
-    const targetSide = connectionDraft.snapTarget?.side ?? inferFloatingTargetSide(connectionDraft.startPoint, previewPoint);
-    return buildConnectionPath(connectionDraft.startPoint, previewPoint, connectionDraft.sourceSide, targetSide);
-  }, [connectionDraft]);
+    const start = boardToScreenPoint(connectionDraft.startPoint);
+    const end = boardToScreenPoint(connectionDraft.currentPoint);
+    const targetSide = inferFloatingTargetSide(connectionDraft.startPoint, connectionDraft.currentPoint);
+    return buildConnectionPath(start, end, connectionDraft.sourceSide, targetSide);
+  }, [boardToScreenPoint, connectionDraft]);
 
-  const pendingDeleteLabel = useMemo(() => {
-    if (!pendingDeleteCell) {
-      return "selected card";
-    }
-
-    switch (pendingDeleteCell.artifact.type) {
-      case "design-frame-ref":
-        return pendingDeleteCellLayout?.refFrame?.name
-          ? `the \"${pendingDeleteCellLayout.refFrame.name}\" screen card`
-          : "this screen card";
-      case "uploaded-image":
-        return pendingDeleteCell.artifact.label
-          ? `the image \"${pendingDeleteCell.artifact.label}\"`
-          : "this image card";
-      case "journey-step":
-        return pendingDeleteCell.artifact.text.trim().length > 0
-          ? `the step \"${pendingDeleteCell.artifact.text.trim()}\"`
-          : "this step";
-      case "technical-brief":
-        return pendingDeleteCell.artifact.title.trim().length > 0
-          ? `the code block \"${pendingDeleteCell.artifact.title.trim()}\"`
-          : "this code block";
-    }
-  }, [pendingDeleteCell, pendingDeleteCellLayout]);
-
-  const handleCanvasKeyDown = useCallback(
-    (event: ReactKeyboardEvent<HTMLDivElement>) => {
-      if (event.key === "Escape") {
-        if (pendingDeleteCellId) {
-          event.preventDefault();
-          event.stopPropagation();
-          cancelPendingCellRemoval();
-          return;
-        }
-
-        if (showFramePicker) {
-          event.preventDefault();
-          event.stopPropagation();
-          setShowFramePicker(null);
-          return;
-        }
-
-        if (activeMenu) {
-          event.preventDefault();
-          event.stopPropagation();
-          closeMenus();
-          return;
-        }
-
-        if (focusedCellId) {
-          event.preventDefault();
-          event.stopPropagation();
-          clearFocusMode();
-        }
-        return;
-      }
-
-      if (event.key !== "Delete" && event.key !== "Backspace") {
-        return;
-      }
-      if (event.defaultPrevented || shouldIgnoreFlowDeleteShortcut(event.target)) {
-        return;
-      }
-
-      if (selectedEdgeId) {
-        event.preventDefault();
-        event.stopPropagation();
-        handleDeleteEdge(selectedEdgeId);
-        return;
-      }
-
-      if (!selectedCellId) {
-        return;
-      }
-
-      event.preventDefault();
-      event.stopPropagation();
-      setPendingDeleteCellId(selectedCellId);
-    },
-    [activeMenu, cancelPendingCellRemoval, clearFocusMode, closeMenus, focusedCellId, handleDeleteEdge, pendingDeleteCellId, selectedCellId, selectedEdgeId, showFramePicker],
-  );
+  const canvasSize = getCanvasSize();
 
   return (
     <div className="flow-workspace">
@@ -1567,12 +1232,50 @@ function FlowWorkspaceInner({
                 ))}
               </select>
             </label>
+            <label className="flow-workspace__field">
+              <span>Entry board</span>
+              <select
+                value={entryBoardValue}
+                onChange={(event) => updateBoardLink("entryFlowFrameId", event.target.value || null)}
+                disabled={availableFlowBoards.length === 0}
+              >
+                <option value="">None</option>
+                {availableFlowBoards.map((flowFrame) => (
+                  <option key={flowFrame.id} value={flowFrame.id}>
+                    {flowFrame.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flow-workspace__field">
+              <span>Exit board</span>
+              <select
+                value={exitBoardValue}
+                onChange={(event) => updateBoardLink("exitFlowFrameId", event.target.value || null)}
+                disabled={availableFlowBoards.length === 0}
+              >
+                <option value="">None</option>
+                {availableFlowBoards.map((flowFrame) => (
+                  <option key={flowFrame.id} value={flowFrame.id}>
+                    {flowFrame.name}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
-          {hasLegacyAreas ? (
-            <span className="flow-workspace__legacy-note">
-              Legacy imported areas stay readable, but new boards are standalone.
-            </span>
-          ) : null}
+          <div className="flow-workspace__toolbar-links">
+            <button type="button" onClick={() => handleFlowBoardSelect(entryBoardValue)} disabled={!entryBoardValue}>
+              Open entry
+            </button>
+            <button type="button" onClick={() => handleFlowBoardSelect(exitBoardValue)} disabled={!exitBoardValue}>
+              Open exit
+            </button>
+            {hasLegacyAreas ? (
+              <span className="flow-workspace__legacy-note">
+                Legacy imported areas stay readable, but new boards are standalone.
+              </span>
+            ) : null}
+          </div>
         </div>
         {hasLegacyAreas ? (
           <div className="flow-workspace__area-chips" aria-label="Legacy flow areas">
@@ -1592,9 +1295,7 @@ function FlowWorkspaceInner({
 
       <div
         ref={shellRef}
-        className={`flow-workspace__canvas-shell ${panState ? "is-panning" : ""} ${nodeDrag?.mode === "duplicate" ? "is-copying" : ""} ${focusContext ? "is-focus-mode" : ""}`}
-        tabIndex={0}
-        aria-label="Flow board canvas"
+        className={`flow-workspace__canvas-shell ${panState ? "is-panning" : ""}`}
         onPointerMove={handleCanvasPointerMove}
         onPointerLeave={() => {
           if (!activeMenu) {
@@ -1604,7 +1305,6 @@ function FlowWorkspaceInner({
         }}
         onPointerDown={handleCanvasPointerDown}
         onWheel={handleCanvasWheel}
-        onKeyDown={handleCanvasKeyDown}
       >
         <div className="flow-workspace__canvas">
           <div
@@ -1631,102 +1331,70 @@ function FlowWorkspaceInner({
                 aria-hidden
               >
                 <defs>
-                  <marker id={`${markerPrefix}-user-journey`} markerWidth="3.4" markerHeight="3.4" refX="2.8" refY="1.7" orient="auto" markerUnits="strokeWidth">
-                    <path d="M 0 0 L 3.4 1.7 L 0 3.4 z" fill="rgba(92, 98, 239, 0.94)" />
+                  <marker id={`${markerPrefix}-user-journey`} markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto">
+                    <path d="M 0 0 L 12 6 L 0 12 z" fill="rgba(92, 98, 239, 0.94)" />
                   </marker>
-                  <marker id={`${markerPrefix}-normal-flow`} markerWidth="3.4" markerHeight="3.4" refX="2.8" refY="1.7" orient="auto" markerUnits="strokeWidth">
-                    <path d="M 0 0 L 3.4 1.7 L 0 3.4 z" fill="rgba(15, 156, 95, 0.94)" />
+                  <marker id={`${markerPrefix}-normal-flow`} markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto">
+                    <path d="M 0 0 L 12 6 L 0 12 z" fill="rgba(15, 156, 95, 0.94)" />
                   </marker>
-                  <marker id={`${markerPrefix}-unhappy-path`} markerWidth="3.4" markerHeight="3.4" refX="2.8" refY="1.7" orient="auto" markerUnits="strokeWidth">
-                    <path d="M 0 0 L 3.4 1.7 L 0 3.4 z" fill="rgba(234, 120, 36, 0.96)" />
+                  <marker id={`${markerPrefix}-unhappy-path`} markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto">
+                    <path d="M 0 0 L 12 6 L 0 12 z" fill="rgba(234, 120, 36, 0.96)" />
                   </marker>
-                  <marker id={`${markerPrefix}-technical-briefing`} markerWidth="3.4" markerHeight="3.4" refX="2.8" refY="1.7" orient="auto" markerUnits="strokeWidth">
-                    <path d="M 0 0 L 3.4 1.7 L 0 3.4 z" fill="rgba(22, 132, 204, 0.94)" />
+                  <marker id={`${markerPrefix}-technical-briefing`} markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto">
+                    <path d="M 0 0 L 12 6 L 0 12 z" fill="rgba(22, 132, 204, 0.94)" />
                   </marker>
                 </defs>
 
-                {edgeGeometries.map((edge) => {
-                  const edgeSelected = selectedEdgeId === edge.id;
-                  const edgeHovered = hoveredEdgeId === edge.id;
-                  const edgeDimmed = Boolean(focusContext) && !edgeSelected && !focusContext?.edgeIds.has(edge.id);
-
-                  return (
-                    <g key={edge.id}>
-                      <path
-                        d={edge.path}
-                        className={`flow-rf-edge flow-rf-edge--glow ${edge.isCrossLane ? "flow-rf-edge--cross-lane" : ""}`}
-                        style={{
-                          stroke: edge.glowColor,
-                          strokeWidth: edge.isCrossLane ? 5.2 : 5.8,
-                          opacity: edgeDimmed ? 0.06 : edgeHovered || edgeSelected ? 0.34 : 0.22,
-                        }}
-                      />
-                      <path
-                        d={edge.path}
-                        className={`flow-rf-edge ${edge.isCrossLane ? "flow-rf-edge--cross-lane" : ""} ${edgeSelected ? "flow-rf-edge--selected" : ""}`}
-                        style={{
-                          stroke: edge.strokeColor,
-                          strokeWidth: edgeSelected || edgeHovered ? 3.2 : edge.isCrossLane ? 2.35 : 2.7,
-                          markerEnd: `url(#${markerPrefix}-${edge.laneId})`,
-                          opacity: edgeDimmed ? 0.18 : 1,
-                          pointerEvents: "stroke",
-                        }}
-                        onPointerEnter={(event) => {
-                          event.stopPropagation();
-                          setHoveredEdgeId(edge.id);
-                        }}
-                        onPointerLeave={() => {
-                          setHoveredEdgeId((current) => (current === edge.id ? null : current));
-                        }}
-                        onPointerDown={(event) => {
-                          event.stopPropagation();
-                          selectEdge(edge.id);
-                        }}
-                      />
-                      <path
-                        d={edge.path}
-                        className="flow-workspace__edge-hit-area"
-                        style={{ strokeWidth: edgeHitStrokeWidth }}
-                        onPointerEnter={(event) => {
-                          event.stopPropagation();
-                          setHoveredEdgeId(edge.id);
-                        }}
-                        onPointerLeave={() => {
-                          setHoveredEdgeId((current) => (current === edge.id ? null : current));
-                        }}
-                        onPointerDown={(event) => {
-                          event.stopPropagation();
-                          selectEdge(edge.id);
-                        }}
-                      />
-                    </g>
-                  );
-                })}
+                {edgeGeometries.map((edge) => (
+                  <g key={edge.id}>
+                    <path
+                      d={edge.path}
+                      className={`flow-rf-edge flow-rf-edge--glow ${edge.isCrossLane ? "flow-rf-edge--cross-lane" : ""}`}
+                      style={{
+                        stroke: edge.glowColor,
+                        strokeWidth: edge.isCrossLane ? 5.2 : 5.8,
+                        opacity: hoveredEdgeId === edge.id ? 0.34 : 0.22,
+                      }}
+                    />
+                    <path
+                      d={edge.path}
+                      className={`flow-rf-edge ${edge.isCrossLane ? "flow-rf-edge--cross-lane" : ""} ${hoveredEdgeId === edge.id ? "flow-rf-edge--selected" : ""}`}
+                      style={{
+                        stroke: edge.strokeColor,
+                        strokeWidth: hoveredEdgeId === edge.id ? 3.2 : edge.isCrossLane ? 2.35 : 2.7,
+                        markerEnd: `url(#${markerPrefix}-${edge.laneId})`,
+                      }}
+                    />
+                    <path
+                      d={edge.path}
+                      className="flow-workspace__edge-hit-area"
+                      onPointerEnter={(event) => {
+                        event.stopPropagation();
+                        setHoveredEdgeId(edge.id);
+                      }}
+                      onPointerLeave={() => {
+                        setHoveredEdgeId((current) => (current === edge.id ? null : current));
+                      }}
+                      onPointerDown={(event) => {
+                        event.stopPropagation();
+                      }}
+                    />
+                  </g>
+                ))}
               </svg>
 
               <div className="flow-workspace__node-layer">
                 {layout.cells.map((cell) => {
                   const activeDrag = nodeDrag?.cellId === cell.cellId ? nodeDrag : null;
-                  const focusState = !focusContext
-                    ? "default"
-                    : cell.cellId === focusedCellId
-                      ? "primary"
-                      : focusContext.cellIds.has(cell.cellId)
-                        ? "related"
-                        : "dimmed";
-                  const snapTargetSide = connectionDraft?.snapTarget?.cellId === cell.cellId
-                    ? connectionDraft.snapTarget.side
-                    : null;
                   return (
                     <div
                       key={cell.cellId}
-                      className={`flow-workspace__node ${activeDrag ? "is-dragging" : ""} ${focusState !== "default" ? `is-focus-${focusState}` : ""}`}
+                      className={`flow-workspace__node ${activeDrag ? "is-dragging" : ""}`}
                       style={{
                         left: activeDrag?.position.x ?? cell.x,
                         top: activeDrag?.position.y ?? cell.y,
                         width: cell.width,
                         height: cell.height,
-                        zIndex: activeDrag ? 8 : focusState === "primary" ? 7 : focusState === "related" ? 6 : undefined,
                       }}
                     >
                       <FlowArtifactCard
@@ -1737,17 +1405,13 @@ function FlowWorkspaceInner({
                         editing={editingCellId === cell.cellId}
                         dragging={Boolean(activeDrag)}
                         connecting={Boolean(connectionDraft)}
-                        selected={selectedCellId === cell.cellId}
-                        focusState={focusState}
-                        snapTargetSide={snapTargetSide}
-                        onRemove={requestCellRemoval}
+                        onRemove={handleRemoveCell}
                         onUpdateArtifact={handleUpdateArtifact}
                         onStartEdit={handleStartEdit}
                         onFinishEdit={handleFinishEdit}
                         onMeasure={handleMeasuredNodeHeight}
                         onPointerDown={(event) => startNodeDrag(cell, event)}
                         onStartConnection={(side, event) => startConnection(cell, side, event)}
-                        onEnterFocusMode={() => enterFocusMode(cell.cellId, cell.areaId)}
                       />
                     </div>
                   );
@@ -1761,152 +1425,107 @@ function FlowWorkspaceInner({
                 variant="overlay"
                 className="flow-workspace__chrome-layer"
               />
+            </div>
+          </div>
+        </div>
 
-              <div className="flow-workspace__board-overlay">
-                {nodeDrag?.slot && dragSlotCenter ? (
-                  <div
-                    className={`flow-workspace__drag-highlight ${nodeDrag.mode === "duplicate" ? "is-duplicate" : ""}`}
-                    style={{
-                      top: dragLaneTop,
-                      left: dragSlotCenter.x - metrics.nodeWidth / 2,
-                      width: metrics.nodeWidth,
-                      height: Math.max(84, dragLaneHeight - 12),
-                    }}
-                  />
-                ) : null}
+        <div className="flow-workspace__overlay-layer" aria-hidden>
+          {nodeDrag?.slot && dragSlotCenter ? (
+            <div
+              className="flow-workspace__drag-highlight"
+              style={{
+                top: boardToScreenPoint({ x: 0, y: dragLaneTop }).y,
+                left: boardToScreenPoint({ x: dragSlotCenter.x - metrics.nodeWidth / 2, y: 0 }).x,
+                width: metrics.nodeWidth * viewport.zoom,
+                height: Math.max(84, dragLaneHeight - 12) * viewport.zoom,
+              }}
+            />
+          ) : null}
 
-                {extendableAreas.map((area) => {
-                  const areaMetric = getFlowAreaMetricById(metrics, area.id);
-                  if (!areaMetric) {
-                    return null;
-                  }
+          {edgeGeometries.map((edge) => {
+            if (edge.id !== hoveredEdgeId) {
+              return null;
+            }
+            const screenPoint = boardToScreenPoint(edge.midpoint);
+            return (
+              <button
+                key={`${edge.id}-delete`}
+                type="button"
+                className="flow-rf-edge__delete flow-rf-edge__delete--visible flow-workspace__edge-delete"
+                style={{ left: screenPoint.x - 9, top: screenPoint.y - 9 }}
+                onClick={() => handleDeleteEdge(edge.id)}
+                aria-label="Delete connection"
+              >
+                <X size={10} />
+              </button>
+            );
+          })}
 
-                  return (
-                    <button
-                      key={`extend-${area.id}`}
-                      type="button"
-                      className="flow-workspace__add-column-button"
-                      style={getFloatingAnchorStyle({ x: areaMetric.left + areaMetric.width + 18, y: 44 })}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        extendAreaByOneColumn(area.id);
-                      }}
-                    >
-                      <Plus size={12} /> Add column
-                    </button>
+          {visibleSlot ? (
+            <div className="flow-slot-menu-anchor" style={getMenuAnchorStyle(visibleSlot)}>
+              <button
+                type="button"
+                className={`flow-lane__add-btn ${activeMenu ? "flow-lane__add-btn--open" : ""}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setFocusedAreaId(visibleSlot.areaId);
+                  setActiveMenu(
+                    activeMenu &&
+                      activeMenu.areaId === visibleSlot.areaId &&
+                      activeMenu.laneId === visibleSlot.laneId &&
+                      activeMenu.column === visibleSlot.column
+                      ? null
+                      : visibleSlot,
                   );
-                })}
+                }}
+                aria-label={`Add to ${FLOW_LANE_LABELS[visibleSlot.laneId]} column ${visibleSlot.column + 1}`}
+              >
+                <Plus size={14} />
+              </button>
 
-                {selectedEdgeGeometry ? (
+              {activeMenu &&
+              activeMenu.areaId === visibleSlot.areaId &&
+              activeMenu.laneId === visibleSlot.laneId &&
+              activeMenu.column === visibleSlot.column ? (
+                <div className="flow-lane__menu">
                   <button
                     type="button"
-                    className="flow-rf-edge__delete flow-rf-edge__delete--visible flow-workspace__edge-delete"
-                    style={getFloatingAnchorStyle(selectedEdgeGeometry.midpoint)}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      handleDeleteEdge(selectedEdgeGeometry.id);
+                    onClick={() => {
+                      setShowFramePicker(activeMenu);
                     }}
-                    aria-label="Delete connection"
                   >
-                    <X size={10} />
+                    <FileText size={13} /> Add existing frame
                   </button>
-                ) : null}
-
-                {visibleSlot ? (
-                  <div className="flow-slot-menu-anchor" style={getFloatingAnchorStyle(getFlowSlotCenter(visibleSlot, metrics))}>
-                    <button
-                      type="button"
-                      className={`flow-lane__add-btn ${activeMenu ? "flow-lane__add-btn--open" : ""}`}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setSelectedEdgeId(null);
-                        setSelectedCellId(null);
-                        setPendingDeleteCellId(null);
-                        setFocusedAreaId(visibleSlot.areaId);
-                        setActiveMenu(
-                          activeMenu &&
-                            activeMenu.areaId === visibleSlot.areaId &&
-                            activeMenu.laneId === visibleSlot.laneId &&
-                            activeMenu.column === visibleSlot.column
-                            ? null
-                            : visibleSlot,
-                        );
-                      }}
-                      aria-label={`Add to ${FLOW_LANE_LABELS[visibleSlot.laneId]} column ${visibleSlot.column + 1}`}
-                    >
-                      <Plus size={14} />
-                    </button>
-
-                    {activeMenu &&
-                    activeMenu.areaId === visibleSlot.areaId &&
-                    activeMenu.laneId === visibleSlot.laneId &&
-                    activeMenu.column === visibleSlot.column ? (
-                      <div className="flow-lane__menu">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setShowFramePicker(activeMenu);
-                          }}
-                        >
-                          <FileText size={13} /> Add existing frame
-                        </button>
-                        <button type="button" onClick={() => addUploadedImage(activeMenu)}>
-                          <Upload size={13} /> Upload image(s)
-                        </button>
-                        <button type="button" onClick={() => addJourneyStep(activeMenu)}>
-                          <Workflow size={13} /> Add step
-                        </button>
-                        <button type="button" onClick={() => addTechnicalBrief(activeMenu)}>
-                          <Code size={13} /> Add code block
-                        </button>
-                      </div>
-                    ) : null}
-                  </div>
-                ) : null}
-
-                {connectionPreview ? (
-                  <svg
-                    className="flow-workspace__draft-overlay"
-                    width={metrics.contentWidth}
-                    height={metrics.contentHeight}
-                    viewBox={`0 0 ${metrics.contentWidth} ${metrics.contentHeight}`}
-                  >
-                    <path
-                      d={connectionPreview.path}
-                      className="flow-rf-edge flow-rf-edge--selected"
-                      style={{
-                        stroke: "rgba(47, 126, 247, 0.78)",
-                        strokeWidth: 2.4,
-                        fill: "none",
-                        strokeDasharray: "8 6",
-                      }}
-                    />
-                  </svg>
-                ) : null}
-              </div>
+                  <button type="button" onClick={() => addUploadedImage(activeMenu)}>
+                    <Upload size={13} /> Upload image(s)
+                  </button>
+                  <button type="button" onClick={() => addJourneyStep(activeMenu)}>
+                    <Workflow size={13} /> Add step
+                  </button>
+                  <button type="button" onClick={() => addTechnicalBrief(activeMenu)}>
+                    <Code size={13} /> Add code block
+                  </button>
+                </div>
+              ) : null}
             </div>
-          </div>
+          ) : null}
+
+          {connectionPreview ? (
+            <svg className="flow-workspace__draft-overlay" width="100%" height="100%" viewBox={`0 0 ${canvasSize.width} ${canvasSize.height}`}>
+              <path
+                d={connectionPreview.path}
+                className="flow-rf-edge flow-rf-edge--selected"
+                style={{
+                  stroke: "rgba(47, 126, 247, 0.78)",
+                  strokeWidth: 2.4,
+                  fill: "none",
+                  strokeDasharray: "8 6",
+                }}
+              />
+            </svg>
+          ) : null}
         </div>
       </div>
-
-      {pendingDeleteCell ? (
-        <div className="flow-workspace__confirm-overlay" onClick={cancelPendingCellRemoval}>
-          <div className="flow-workspace__confirm-card" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
-            <h3>Delete selected card?</h3>
-            <p>
-              This will remove {pendingDeleteLabel} from the flow board, along with any attached connections.
-            </p>
-            <div className="flow-workspace__confirm-actions">
-              <button type="button" className="flow-workspace__confirm-cancel" onClick={cancelPendingCellRemoval}>
-                Cancel
-              </button>
-              <button type="button" className="flow-workspace__confirm-delete" onClick={confirmPendingCellRemoval}>
-                Delete card
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
 
       {showFramePicker ? (
         <FlowWorkspaceFramePicker

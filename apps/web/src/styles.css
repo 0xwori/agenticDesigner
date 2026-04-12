@@ -2302,9 +2302,6 @@ button:hover {
 
 .artboard-viewport--flow {
   cursor: default;
-  overflow: hidden;
-  overscroll-behavior: none;
-  touch-action: none;
   background:
     radial-gradient(circle at top left, rgba(255, 255, 255, 0.94), transparent 30%),
     linear-gradient(180deg, rgba(245, 247, 252, 0.98), rgba(250, 252, 255, 0.99));
@@ -4014,11 +4011,8 @@ button:hover {
 }
 
 .flow-workspace__toolbar-secondary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  display: grid;
   gap: 10px;
-  flex-wrap: wrap;
 }
 
 .flow-workspace__toolbar-title {
@@ -4083,7 +4077,7 @@ button:hover {
 .flow-workspace__field {
   display: grid;
   gap: 5px;
-  min-width: 152px;
+  min-width: 176px;
 }
 
 .flow-workspace__field span {
@@ -4184,13 +4178,6 @@ button:hover {
   background:
     radial-gradient(circle at top left, rgba(255, 255, 255, 0.82), transparent 28%),
     linear-gradient(180deg, rgba(246, 248, 252, 0.86), rgba(251, 252, 255, 0.90));
-  touch-action: none;
-  overscroll-behavior: none;
-  outline: none;
-}
-
-.flow-workspace__canvas-shell:focus-visible {
-  box-shadow: inset 0 0 0 2px rgba(47, 126, 247, 0.34);
 }
 
 .flow-workspace__canvas {
@@ -4201,7 +4188,6 @@ button:hover {
   width: 100%;
   display: block;
   overflow: hidden;
-  overscroll-behavior: none;
   background: transparent;
   cursor: grab;
 }
@@ -4231,23 +4217,20 @@ button:hover {
 
 .flow-workspace__edge-hit-area {
   fill: none;
-  stroke: rgba(15, 23, 42, 0.08);
+  stroke: transparent;
   stroke-width: 18px;
   pointer-events: stroke;
-  cursor: pointer;
 }
 
 .flow-workspace__node-layer {
   position: absolute;
   inset: 0;
   z-index: 2;
-  pointer-events: none;
 }
 
 .flow-workspace__node {
   position: absolute;
   transform-origin: center center;
-  pointer-events: auto;
 }
 
 .flow-workspace__node.is-dragging {
@@ -4275,26 +4258,12 @@ button:hover {
   overflow: visible;
 }
 
-.flow-workspace__board-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 5;
-  pointer-events: none;
-  overflow: visible;
-}
-
 .flow-workspace__drag-highlight {
   position: absolute;
   border-radius: 14px;
   background: rgba(47, 126, 247, 0.08);
   border: 1.5px dashed rgba(47, 126, 247, 0.38);
   box-shadow: 0 10px 24px rgba(47, 126, 247, 0.12);
-}
-
-.flow-workspace__drag-highlight.is-duplicate {
-  background: rgba(15, 156, 95, 0.08);
-  border-color: rgba(15, 156, 95, 0.4);
-  box-shadow: 0 10px 24px rgba(15, 156, 95, 0.14);
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -4523,7 +4492,7 @@ button:hover {
   width: 100%;
   height: 100%;
   min-width: 120px;
-  overflow: visible;
+  overflow: hidden;
   cursor: grab;
   box-sizing: border-box;
   transition: transform 0.15s ease, filter 0.15s ease;
@@ -4531,33 +4500,6 @@ button:hover {
 
 .flow-rf-node:hover {
   filter: saturate(1.03);
-}
-
-.flow-workspace__canvas-shell.is-copying .flow-workspace__canvas,
-.flow-workspace__canvas-shell.is-copying .flow-rf-node,
-.flow-workspace__canvas-shell.is-copying .flow-rf-node__visual {
-  cursor: copy;
-}
-
-.flow-workspace__node.is-focus-dimmed {
-  opacity: 0.24;
-}
-
-.flow-workspace__node.is-focus-related,
-.flow-workspace__node.is-focus-primary {
-  opacity: 1;
-}
-
-.flow-rf-node.is-focus-primary .flow-rf-node__visual {
-  border-color: rgba(47, 126, 247, 0.56);
-  box-shadow:
-    0 0 0 2px rgba(47, 126, 247, 0.16),
-    0 18px 32px rgba(15, 23, 42, 0.16);
-}
-
-.flow-rf-node.is-focus-related .flow-rf-node__visual {
-  border-color: rgba(31, 92, 188, 0.3);
-  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.1);
 }
 
 .flow-workspace__node.is-dragging .flow-rf-node,
@@ -4586,7 +4528,6 @@ button:hover {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 
-.flow-rf-node.is-selected .flow-rf-node__remove,
 .flow-rf-node:hover .flow-rf-node__remove {
   opacity: 1;
 }
@@ -4612,37 +4553,15 @@ button:hover {
   border: 1px solid rgba(0, 0, 0, 0.14);
   border-radius: 12px;
   background: #fff;
-  overflow: hidden;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.10);
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
   padding: calc(8px * var(--flow-scale));
   box-sizing: border-box;
 }
 
-.flow-rf-node.is-selected .flow-rf-node__visual {
-  border-color: rgba(47, 126, 247, 0.48);
-  box-shadow:
-    0 0 0 2px rgba(47, 126, 247, 0.14),
-    0 14px 28px rgba(15, 23, 42, 0.12);
-}
-
-.flow-rf-node:not(.is-selected):hover .flow-rf-node__visual {
+.flow-rf-node:hover .flow-rf-node__visual {
   border-color: rgba(99, 102, 241, 0.28);
   box-shadow: 0 10px 22px rgba(15, 23, 42, 0.08);
-}
-
-.flow-rf-node.is-selected:hover .flow-rf-node__visual {
-  border-color: rgba(47, 126, 247, 0.48);
-  box-shadow:
-    0 0 0 2px rgba(47, 126, 247, 0.14),
-    0 14px 28px rgba(15, 23, 42, 0.12);
-}
-
-.flow-rf-node.is-snap-target .flow-rf-node__visual {
-  border-color: rgba(15, 156, 95, 0.42);
-  box-shadow:
-    0 0 0 2px rgba(15, 156, 95, 0.14),
-    0 14px 28px rgba(15, 23, 42, 0.12);
 }
 
 .flow-workspace__node.is-dragging .flow-rf-node__visual,
@@ -4759,107 +4678,21 @@ button:hover {
   transform: scale(1.3);
 }
 
-.flow-rf-handle.is-snap-target {
-  opacity: 1;
-  border-color: rgba(15, 156, 95, 0.54) !important;
-  background: rgba(15, 156, 95, 0.12) !important;
-  transform: scale(1.24);
-}
-
-/* ── Design frame ref preview ─────────────────────────────── */
+/* ── Design frame ref (snapshot) ─────────────────────────── */
 
 .flow-rf-node__frame-preview {
   display: flex;
   flex-direction: column;
-  gap: 10px;
 }
 
-.flow-rf-node__frame-header {
-  display: flex;
-  align-items: start;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.flow-rf-node__frame-title-block {
-  display: grid;
-  gap: 3px;
-  min-width: 0;
-  padding: 8px 10px;
-  border-radius: 10px;
-  background: linear-gradient(180deg, rgba(248, 250, 252, 0.94), rgba(255, 255, 255, 0.98));
-  border: 1px solid rgba(148, 163, 184, 0.18);
-}
-
-.flow-rf-node__frame-kicker {
-  font-size: calc(9px * var(--flow-scale));
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: rgba(71, 85, 105, 0.66);
-}
-
-.flow-rf-node__frame-name {
-  font-size: calc(11px * var(--flow-scale));
-  font-weight: 700;
-  color: rgba(15, 23, 42, 0.9);
+.flow-rf-node__frame-title {
+  font-size: calc(10px * var(--flow-scale));
+  font-weight: 600;
+  color: rgba(0, 0, 0, 0.4);
+  padding: 0 0 6px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.flow-rf-node__frame-status {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 26px;
-  padding: 0 10px;
-  border-radius: 999px;
-  font-size: calc(9px * var(--flow-scale));
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-
-.flow-rf-node__frame-status--ready {
-  background: rgba(219, 234, 254, 0.82);
-  color: rgba(29, 78, 216, 0.9);
-}
-
-.flow-rf-node__frame-status--loading,
-.flow-rf-node__frame-status--retrying {
-  background: rgba(224, 231, 255, 0.86);
-  color: rgba(67, 56, 202, 0.88);
-}
-
-.flow-rf-node__frame-status--failed {
-  background: rgba(255, 237, 213, 0.92);
-  color: rgba(194, 65, 12, 0.9);
-}
-
-.flow-rf-node__frame-status--empty,
-.flow-rf-node__frame-status--missing {
-  background: rgba(241, 245, 249, 0.96);
-  color: rgba(71, 85, 105, 0.82);
-}
-
-.flow-rf-node__frame-live {
-  position: relative;
-  width: 100%;
-  overflow: hidden;
-  border-radius: 6px;
-  border: 1px solid rgba(148, 163, 184, 0.2);
-  background: linear-gradient(180deg, rgba(248, 250, 252, 0.92), rgba(255, 255, 255, 0.98));
-}
-
-.flow-rf-node__frame-live iframe {
-  border: 0;
-  width: 100%;
-  height: 100%;
-  display: block;
-  pointer-events: none;
-  background: #fff;
 }
 
 .flow-rf-node__frame-img {
@@ -4887,20 +4720,6 @@ button:hover {
   font-style: normal;
   border-color: rgba(234, 120, 36, 0.24);
   background: linear-gradient(180deg, rgba(255, 247, 237, 0.92), rgba(255, 251, 245, 0.98));
-}
-
-.flow-rf-node__frame-placeholder--retrying {
-  color: rgba(67, 56, 202, 0.86);
-  font-style: normal;
-  border-color: rgba(129, 140, 248, 0.28);
-  background: linear-gradient(180deg, rgba(238, 242, 255, 0.92), rgba(248, 250, 255, 0.98));
-}
-
-.flow-rf-node__frame-placeholder--missing {
-  color: rgba(71, 85, 105, 0.84);
-  font-style: normal;
-  border-color: rgba(148, 163, 184, 0.26);
-  background: linear-gradient(180deg, rgba(248, 250, 252, 0.92), rgba(255, 255, 255, 0.98));
 }
 
 /* ── Uploaded image ──────────────────────────────────────── */
@@ -5080,7 +4899,6 @@ button:hover {
   justify-content: center;
   cursor: pointer;
   opacity: 0;
-  pointer-events: none;
   transition: opacity 0.15s ease;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
@@ -5088,7 +4906,6 @@ button:hover {
 .flow-rf-edge__delete--visible,
 .flow-rf-edge__delete:hover {
   opacity: 1;
-  pointer-events: all;
 }
 
 .flow-rf-edge__delete:hover {
@@ -5103,19 +4920,14 @@ button:hover {
 
 .flow-slot-menu-anchor {
   position: absolute;
-  display: grid;
-  place-items: center;
-  width: 52px;
-  height: 52px;
   pointer-events: all;
   z-index: 12;
-  transform-origin: center center;
 }
 
 .flow-lane__add-btn {
-  width: calc(38px * var(--flow-scale));
-  height: calc(38px * var(--flow-scale));
-  border-radius: calc(10px * var(--flow-scale));
+  width: calc(30px * var(--flow-scale));
+  height: calc(30px * var(--flow-scale));
+  border-radius: calc(8px * var(--flow-scale));
   border: 1px dashed rgba(0, 0, 0, 0.12);
   background: rgba(255, 255, 255, 0.8);
   color: rgba(0, 0, 0, 0.25);
@@ -5124,7 +4936,7 @@ button:hover {
   justify-content: center;
   cursor: pointer;
   transition: all 0.15s ease;
-  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.10);
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
 }
 
 .flow-lane__add-btn:hover {
@@ -5142,37 +4954,15 @@ button:hover {
 .flow-lane__menu {
   position: absolute;
   top: 100%;
-  left: 50%;
+  left: 0;
   z-index: 20;
   margin-top: 4px;
-  transform: translateX(-50%);
   background: #fff;
   border: 1px solid rgba(0, 0, 0, 0.1);
   border-radius: 10px;
   padding: 4px;
   min-width: 170px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
-}
-
-.flow-workspace__add-column-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 34px;
-  padding: 0 12px;
-  border-radius: 999px;
-  border: 1px dashed rgba(47, 126, 247, 0.32);
-  background: rgba(255, 255, 255, 0.92);
-  color: rgba(31, 92, 188, 0.92);
-  font-size: 11px;
-  font-weight: 700;
-  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
-  pointer-events: all;
-}
-
-.flow-workspace__add-column-button:hover {
-  border-color: rgba(47, 126, 247, 0.46);
-  background: rgba(247, 250, 255, 0.98);
 }
 
 .flow-lane__menu button {
@@ -5306,67 +5096,4 @@ button:hover {
 .flow-frame-picker__item-meta {
   font-size: calc(10px * var(--flow-scale));
   color: rgba(0, 0, 0, 0.35);
-}
-
-.flow-workspace__confirm-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 26;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: rgba(15, 23, 42, 0.2);
-  backdrop-filter: blur(6px);
-}
-
-.flow-workspace__confirm-card {
-  width: min(360px, calc(100% - 32px));
-  border-radius: 16px;
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  background: rgba(255, 255, 255, 0.98);
-  box-shadow: 0 28px 60px rgba(15, 23, 42, 0.18);
-  padding: 20px;
-}
-
-.flow-workspace__confirm-card h3 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 700;
-  color: rgba(15, 23, 42, 0.94);
-}
-
-.flow-workspace__confirm-card p {
-  margin: 10px 0 0;
-  font-size: 13px;
-  line-height: 1.55;
-  color: rgba(51, 65, 85, 0.82);
-}
-
-.flow-workspace__confirm-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-  margin-top: 18px;
-}
-
-.flow-workspace__confirm-cancel,
-.flow-workspace__confirm-delete {
-  height: 36px;
-  border-radius: 10px;
-  padding: 0 14px;
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.flow-workspace__confirm-cancel {
-  border: 1px solid rgba(148, 163, 184, 0.28);
-  background: rgba(248, 250, 252, 0.92);
-  color: rgba(51, 65, 85, 0.86);
-}
-
-.flow-workspace__confirm-delete {
-  border: 1px solid rgba(220, 38, 38, 0.16);
-  background: rgba(220, 38, 38, 0.92);
-  color: #fff;
 }

@@ -3,12 +3,15 @@ import { createEmptyFlowDocument } from "@designer/shared";
 import type { RunHub } from "../../services/runHub.js";
 import type { ApiDeps } from "../deps.js";
 import { sendApiError } from "../errors.js";
+import { buildFlowDesignFrameContexts } from "../../services/pipeline/flowFrameContext.js";
 import { runFlowAction } from "../../services/pipeline/flowAction.js";
+import { generateFlowStory } from "../../services/pipeline/flowStory.js";
 import {
   parseAttachments,
   parseDesignSystemMode,
   parseDevicePreset,
   parseMode,
+  parseNonEmptyString,
   parseProvider,
   parseSelectedFrameContext,
   parseSurfaceTarget,
@@ -111,10 +114,6 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
     const frame = await deps.getFrame(request.params.id);
     if (!frame) {
       sendApiError(response, 404, "Frame not found.", "not_found");
-      return;
-    }
-    if (frame.frameKind === "flow") {
-      sendApiError(response, 400, "Flow boards are protected from deletion.", "validation_error");
       return;
     }
 
@@ -301,11 +300,9 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
       const model = typeof request.body?.model === "string" ? request.body.model : "gpt-5.4-mini";
       const apiKey = typeof request.body?.apiKey === "string" ? request.body.apiKey : undefined;
 
-      // Gather design frame names for the LLM context
+      // Gather design frame content summaries for the LLM context.
       const projectBundle = await deps.getProjectBundle(frame.projectId);
-      const designFrames = (projectBundle?.frames ?? [])
-        .filter((f) => f.frameKind !== "flow")
-        .map((f) => ({ id: f.id, name: f.name }));
+      const designFrames = buildFlowDesignFrameContexts(projectBundle?.frames ?? []);
 
       const result = await runFlowAction({
         prompt,
@@ -322,7 +319,7 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
       });
 
       // Persist the updated document
-      if (result.commands.length > 0) {
+      if (result.commands.length > 0 || !frame.flowDocument?.boardMemory) {
         await deps.updateFlowDocument(frame.id, result.updatedDocument);
       }
 
@@ -336,6 +333,50 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
     } catch (err) {
       console.error("[flow-action] Error:", err);
       sendApiError(response, 500, "Flow action failed.", "internal_error");
+    }
+  });
+
+  app.post("/frames/:id/flow-story", async (request, response) => {
+    const frame = await deps.getFrame(request.params.id);
+    if (!frame) {
+      sendApiError(response, 404, "Frame not found.", "not_found");
+      return;
+    }
+    if (frame.frameKind !== "flow") {
+      sendApiError(response, 400, "Frame is not a flow board.", "validation_error");
+      return;
+    }
+
+    try {
+      const provider = parseProvider(request.body?.provider);
+      const model = typeof request.body?.model === "string" ? request.body.model : "gpt-5.4-mini";
+      const apiKey = typeof request.body?.apiKey === "string" ? request.body.apiKey : undefined;
+      const prompt = parseNonEmptyString(request.body?.prompt);
+
+      const projectBundle = await deps.getProjectBundle(frame.projectId);
+      const designFrames = buildFlowDesignFrameContexts(projectBundle?.frames ?? []);
+
+      const result = await generateFlowStory({
+        prompt,
+        flowDocument: frame.flowDocument ?? createEmptyFlowDocument(),
+        designFrames,
+        provider,
+        model,
+        apiKey,
+      });
+
+      await deps.updateFlowDocument(frame.id, result.updatedDocument);
+
+      response.json({
+        ok: true,
+        frameId: frame.id,
+        story: result.story,
+        flowDocument: result.updatedDocument,
+        summary: result.summary,
+      });
+    } catch (err) {
+      console.error("[flow-story] Error:", err);
+      sendApiError(response, 500, "Flow story export failed.", "internal_error");
     }
   });
 }

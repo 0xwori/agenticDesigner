@@ -200,6 +200,52 @@ describe("flowAdapter", () => {
     expect(result.edges).toEqual([]);
   });
 
+  it("keeps screen refs connected to technical briefing when the source is a screen artifact", () => {
+    const doc = {
+      ...createEmptyFlowDocument(),
+      cells: [
+        {
+          id: "screen-ref",
+          laneId: "normal-flow" as const,
+          column: 0,
+          artifact: { type: "design-frame-ref" as const, frameId: "frame-1" },
+        },
+        {
+          id: "technical-step",
+          laneId: "technical-briefing" as const,
+          column: 0,
+          artifact: {
+            type: "technical-brief" as const,
+            title: "Contract",
+            language: "json",
+            body: "{}",
+          },
+        },
+      ],
+      connections: [
+        {
+          id: "allowed-edge",
+          fromCellId: "screen-ref",
+          toCellId: "technical-step",
+        },
+      ],
+    };
+
+    const result = buildFlowBoardLayout(doc, {
+      frameWidth: 1400,
+      frameHeight: 800,
+      headerHeight: 42,
+      allDesignFrames: [],
+    });
+
+    expect(result.edges).toHaveLength(1);
+    expect(result.edges[0]).toMatchObject({
+      id: "allowed-edge",
+      fromCellId: "screen-ref",
+      toCellId: "technical-step",
+    });
+  });
+
   it("treats inter-area gaps as non-droppable and maps slots inside later areas", () => {
     const doc = {
       ...createEmptyFlowDocument(),

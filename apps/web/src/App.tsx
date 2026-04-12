@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  ComposerAttachment,
   DesignSystemMode,
   DevicePreset,
   FlowDocument,
+  FlowStory,
   FrameVersion,
   PipelineEvent,
   ProjectSettings,
@@ -17,6 +19,7 @@ import {
   clearBoard,
   createManualFrame,
   deleteFrame,
+  generateFlowStory,
   getApiBaseUrl,
   getProjectBundle,
   resyncReference,
@@ -37,6 +40,7 @@ import {
 } from "./lib/flowMode";
 import { replaceFlowDocumentInBundle, rollbackFlowDocumentIfCurrent } from "./lib/flowDocumentState";
 import { PromptPanel } from "./components/PromptPanel";
+import { FlowStoryModal } from "./components/FlowStoryModal";
 import { WorkspaceSettingsModal } from "./components/WorkspaceSettingsModal";
 import { BrandPickerModal } from "./components/BrandPickerModal";
 import {
@@ -73,6 +77,46 @@ import { useComposerAttachments } from "./hooks/useComposerAttachments";
 import type { AppState, CopyState, PromptEntry, RunMode } from "./types/ui";
 
 type CopyStateMap = Record<string, { state: CopyState; logs: CaptureLogEntry[] }>;
+
+type FlowBoardTaskKind = "agent" | "story";
+
+type FlowBoardTaskState = {
+  frameId: string;
+  kind: FlowBoardTaskKind;
+};
+
+type FlowStoryModalState = {
+  open: boolean;
+  frameId: string | null;
+  busy: boolean;
+  error: string | null;
+  story: FlowStory | null;
+};
+
+const FLOW_BOARD_AGENT_PROMPT = "Review this entire flow board. Improve the user journey end to end, add missing happy-path and unhappy-path steps, and add short technical briefings for API, SDK, auth, session, cache, refresh-on-load, and recovery where useful. Edit only this selected board.";
+
+function buildFlowBoardScopedPrompt(prompt: string) {
+  const trimmedPrompt = prompt.trim();
+
+  return [
+    trimmedPrompt,
+    "",
+    "Board interaction requirements:",
+    "- Read the current board artifacts, linked screens, uploaded images, connections, and stored board memory before mutating anything.",
+    "- Keep changes scoped to the selected board only.",
+    "- Prefer improving existing structure over adding duplicates.",
+    "- If the request is broad, make a coherent end-to-end journey with concise technical notes where they materially help delivery.",
+  ].join("\n");
+}
+
+function buildFlowStoryClipboard(story: FlowStory) {
+  const acceptanceCriteria = story.acceptanceCriteria.map((criterion) => `- ${criterion}`).join("\n");
+  const technicalNotes = story.technicalNotes.length > 0
+    ? story.technicalNotes.map((note) => `- ${note}`).join("\n")
+    : "- None";
+
+  return [`# ${story.title}`, "", "## User Story", story.userStory, "", "## Acceptance Criteria", acceptanceCriteria, "", "## Technical Notes", technicalNotes].join("\n");
+}
 
 // ---------------------------------------------------------------------------
 // Module-level store — created once, survives hot-reload
@@ -251,6 +295,15 @@ function AppContent() {
   // Toast state for artboard import guidance
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [flowBoardTask, setFlowBoardTask] = useState<FlowBoardTaskState | null>(null);
+  const [flowStoryModal, setFlowStoryModal] = useState<FlowStoryModalState>({
+    open: false,
+    frameId: null,
+    busy: false,
+    error: null,
+    story: null,
+  });
+  const [flowStoryCopied, setFlowStoryCopied] = useState(false);
   const showToast = useCallback((msg: string, durationMs = 5000) => {
     setToastMessage(msg);
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -1043,55 +1096,13 @@ function AppContent() {
       }) &&
       activeFlowFrame
     ) {
-      const flowRunId = createLocalRunId("flow-action");
-      appendPromptTurn({ runId: flowRunId, prompt: promptValue });
-      setComposerPrompt("");
-      setComposerAttachments([]);
-
-      appendChatEvent({
-        runId: flowRunId,
-        stage: "system",
-        status: "info",
-        kind: "action",
-        message: "Running flow-action: asking the agent to update the flow board..."
+      await runFlowBoardAction({
+        frameId: activeFlowFrame.id,
+        prompt: cleanedPrompt,
+        rawPrompt: promptValue,
+        attachments: imageAttachment ? [imageAttachment] : undefined,
+        taskKind: "agent",
       });
-
-      try {
-        const result = await sendFlowAction(
-          getApiBaseUrl(preferences.apiBaseUrl),
-          activeFlowFrame.id,
-          {
-            prompt: cleanedPrompt,
-            provider: preferences.provider,
-            model: preferences.model,
-            apiKey: preferences.apiKey.trim() || undefined,
-            attachments: imageAttachment ? [imageAttachment] : undefined,
-            focusedAreaId: focusedFlowAreaId ?? undefined,
-          }
-        );
-
-        if (result.flowDocument) {
-          await handleFlowDocumentChange(activeFlowFrame.id, result.flowDocument);
-        }
-
-        appendChatEvent({
-          runId: flowRunId,
-          stage: "system",
-          status: "success",
-          kind: "summary",
-          message: result.summary || `Applied ${result.commands?.length ?? 0} flow mutation(s).`
-        });
-      } catch (reason) {
-        const message = reason instanceof Error ? reason.message : String(reason);
-        appendChatEvent({
-          runId: flowRunId,
-          stage: "system",
-          status: "error",
-          kind: "summary",
-          message: `Flow action failed: ${message}`
-        });
-        pushDebugLog("flow-action", reason, { frameId: activeFlowFrame.id }, "error");
-      }
       return;
     }
 
@@ -1913,6 +1924,208 @@ function AppContent() {
   );
   const filteredFrames = canvasMode === "flow" ? flowFrames : designFrames;
 
+  function applyFlowDocumentFromServer(frameId: string, doc: FlowDocument) {
+    setBundle((current) => replaceFlowDocumentInBundle(current, frameId, doc));
+  }
+
+  async function runFlowBoardAction(input: {
+    frameId: string;
+    prompt: string;
+    rawPrompt?: string;
+    attachments?: ComposerAttachment[];
+    taskKind?: FlowBoardTaskKind;
+    statusMessage?: string;
+  }) {
+    const frame = bundleRef.current?.frames.find((candidate) => candidate.id === input.frameId) ?? null;
+    if (!frame || frame.frameKind !== "flow") {
+      return;
+    }
+
+    if (selectedFrame?.id !== frame.id && canvasMode === "flow") {
+      await selectFrame(frame.id);
+    }
+
+    const visiblePrompt = input.rawPrompt?.trim().length ? input.rawPrompt.trim() : input.prompt.trim();
+    const flowRunId = createLocalRunId("flow-action");
+    appendPromptTurn({ runId: flowRunId, prompt: visiblePrompt });
+    setComposerPrompt("");
+    setComposerAttachments([]);
+    setFlowBoardTask({ frameId: frame.id, kind: input.taskKind ?? "agent" });
+
+    appendChatEvent({
+      runId: flowRunId,
+      stage: "system",
+      status: "info",
+      kind: "action",
+      message: input.statusMessage ?? "Running flow-action: asking the agent to update the flow board..."
+    });
+
+    try {
+      const result = await sendFlowAction(
+        getApiBaseUrl(preferences.apiBaseUrl),
+        frame.id,
+        {
+          prompt: buildFlowBoardScopedPrompt(input.prompt),
+          provider: preferences.provider,
+          model: preferences.model,
+          apiKey: preferences.apiKey.trim() || undefined,
+          attachments: input.attachments,
+          focusedAreaId: focusedFlowAreaId ?? undefined,
+        }
+      );
+
+      if (result.flowDocument) {
+        applyFlowDocumentFromServer(frame.id, result.flowDocument);
+      }
+
+      appendChatEvent({
+        runId: flowRunId,
+        stage: "system",
+        status: "success",
+        kind: "summary",
+        message: result.summary || `Applied ${result.commands?.length ?? 0} flow mutation(s).`
+      });
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      appendChatEvent({
+        runId: flowRunId,
+        stage: "system",
+        status: "error",
+        kind: "summary",
+        message: `Flow action failed: ${message}`
+      });
+      pushDebugLog("flow-action", reason, { frameId: frame.id }, "error");
+    } finally {
+      setFlowBoardTask((current) => (current?.frameId === frame.id ? null : current));
+    }
+  }
+
+  async function handleDeleteFlowBoard(frameId: string) {
+    const currentBundle = bundleRef.current;
+    if (!currentBundle) {
+      return;
+    }
+
+    const frame = currentBundle.frames.find((candidate) => candidate.id === frameId) ?? null;
+    if (!frame || frame.frameKind !== "flow") {
+      return;
+    }
+
+    const remainingFlowFrames = currentBundle.frames.filter(
+      (candidate) => candidate.frameKind === "flow" && candidate.id !== frameId,
+    );
+    const nextFlowTarget = resolveFlowModeTarget(
+      remainingFlowFrames,
+      lastFlowFrameId === frameId ? null : lastFlowFrameId,
+    );
+    const nextSelectedFlowFrameId = nextFlowTarget.selectedFlowFrameId;
+
+    try {
+      await deleteFrame(getApiBaseUrl(preferences.apiBaseUrl), frameId);
+      setFlowStoryModal((current) =>
+        current.frameId === frameId
+          ? { open: false, frameId: null, busy: false, error: null, story: null }
+          : current,
+      );
+      const refreshed = await getProjectBundle(getApiBaseUrl(preferences.apiBaseUrl), currentBundle.project.id);
+
+      if (nextSelectedFlowFrameId) {
+        setBundle({
+          ...refreshed,
+          frames: refreshed.frames.map((candidate) => ({
+            ...candidate,
+            selected: candidate.id === nextSelectedFlowFrameId,
+          })),
+        });
+        setLastFlowFrameId(nextSelectedFlowFrameId);
+        await updateFrameLayout(getApiBaseUrl(preferences.apiBaseUrl), nextSelectedFlowFrameId, {
+          selected: true,
+        }).catch((reason) => {
+          pushDebugLog("select-frame", reason, { frameId: nextSelectedFlowFrameId, mode: "flow-delete-select" }, "warn");
+        });
+      } else {
+        setBundle({
+          ...refreshed,
+          frames: refreshed.frames.map((candidate) => ({
+            ...candidate,
+            selected: false,
+          })),
+        });
+        setLastFlowFrameId(null);
+        setFocusedFlowAreaId(null);
+        setCanvasMode("design");
+        setRunMode("new-frame");
+      }
+
+      showToast(`${frame.name} deleted`, 2600);
+    } catch (reason) {
+      pushDebugLog("delete-flow-board", reason, { frameId }, "error");
+      showToast("Flow board delete failed.", 3200);
+    }
+  }
+
+  async function openFlowStoryExport(frameId: string) {
+    const frame = bundleRef.current?.frames.find((candidate) => candidate.id === frameId) ?? null;
+    if (!frame || frame.frameKind !== "flow") {
+      return;
+    }
+
+    setFlowStoryCopied(false);
+    setFlowStoryModal({
+      open: true,
+      frameId,
+      busy: true,
+      error: null,
+      story: frame.flowDocument?.story ?? null,
+    });
+    setFlowBoardTask({ frameId, kind: "story" });
+
+    try {
+      const result = await generateFlowStory(getApiBaseUrl(preferences.apiBaseUrl), frameId, {
+        prompt: "Export this board as a user story with acceptance criteria and concise technical notes.",
+        provider: preferences.provider,
+        model: preferences.model,
+        apiKey: preferences.apiKey.trim() || undefined,
+      });
+
+      applyFlowDocumentFromServer(frameId, result.flowDocument);
+      setFlowStoryModal({
+        open: true,
+        frameId,
+        busy: false,
+        error: null,
+        story: result.story,
+      });
+      showToast("Flow story updated", 2400);
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      pushDebugLog("flow-story", reason, { frameId }, "error");
+      setFlowStoryModal((current) => ({
+        open: true,
+        frameId,
+        busy: false,
+        error: message,
+        story: current.story ?? frame.flowDocument?.story ?? null,
+      }));
+    } finally {
+      setFlowBoardTask((current) => (current?.frameId === frameId && current.kind === "story" ? null : current));
+    }
+  }
+
+  async function copyFlowStoryToClipboard() {
+    if (!flowStoryModal.story) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(buildFlowStoryClipboard(flowStoryModal.story));
+      setFlowStoryCopied(true);
+      window.setTimeout(() => setFlowStoryCopied(false), 1200);
+    } catch (reason) {
+      pushDebugLog("flow-story-copy", reason, { frameId: flowStoryModal.frameId }, "warn");
+    }
+  }
+
   const createFlowBoard = useCallback(async () => {
     if (!bundle) {
       return null;
@@ -2096,6 +2309,8 @@ function AppContent() {
         canSubmit={canSubmit}
         selectedFrameContextLabel={selectedFrameContextLabel}
         eventCapReached={chatEvents.length >= 420}
+        canvasMode={canvasMode}
+        activeFlowBoardName={activeFlowFrame?.name ?? null}
       />
 
       <WorkspaceSettingsModal
@@ -2170,6 +2385,27 @@ function AppContent() {
         onAddImageReferences={addImageReferencesFromDesignSystemModal}
       />
 
+      <FlowStoryModal
+        open={flowStoryModal.open}
+        boardName={flowStoryModal.frameId ? (bundle?.frames.find((frame) => frame.id === flowStoryModal.frameId)?.name ?? null) : null}
+        busy={flowStoryModal.busy}
+        error={flowStoryModal.error}
+        story={flowStoryModal.story}
+        copied={flowStoryCopied}
+        onClose={() => {
+          setFlowStoryCopied(false);
+          setFlowStoryModal((current) => ({ ...current, open: false, busy: false, error: null }));
+        }}
+        onCopy={() => {
+          void copyFlowStoryToClipboard();
+        }}
+        onRegenerate={() => {
+          if (flowStoryModal.frameId) {
+            void openFlowStoryExport(flowStoryModal.frameId);
+          }
+        }}
+      />
+
       <ArtboardPane
         interactionType={isViewportPanning ? "pan" : interaction?.type ?? null}
         artboardBackgroundStyle={artboardBackgroundStyle}
@@ -2210,6 +2446,17 @@ function AppContent() {
         onFocusedFlowAreaChange={setFocusedFlowAreaId}
         onSelectFlowBoard={selectFrame}
         onCreateFlowBoard={handleCreateFlowBoard}
+        onDeleteFlowBoard={handleDeleteFlowBoard}
+        onAskAgentForFlowBoard={async (frameId) => {
+          await runFlowBoardAction({
+            frameId,
+            prompt: FLOW_BOARD_AGENT_PROMPT,
+            taskKind: "agent",
+            statusMessage: "Running flow-action: asking the journey agent to review the whole board...",
+          });
+        }}
+        onOpenFlowStory={openFlowStoryExport}
+        activeFlowBoardTask={activeFlowFrame && flowBoardTask?.frameId === activeFlowFrame.id ? flowBoardTask.kind : null}
       />
 
       {captureFrame ? (
