@@ -214,6 +214,33 @@ describe("flow area helpers", () => {
     expect(doc.cells[0]?.areaId).toBe(FLOW_DEFAULT_AREA_ID);
   });
 
+  it("normalizes persisted screen preview settings", () => {
+    const doc = normalizeFlowDocument({
+      ...createEmptyFlowDocument(),
+      cells: [
+        {
+          id: "screen-1",
+          laneId: "normal-flow",
+          column: 0,
+          artifact: {
+            type: "design-frame-ref",
+            frameId: "frame-1",
+            previewMode: "manual",
+            previewHeight: 72,
+          },
+        },
+      ],
+      connections: [],
+    });
+
+    expect(doc.cells[0]?.artifact).toEqual({
+      type: "design-frame-ref",
+      frameId: "frame-1",
+      previewMode: "manual",
+      previewHeight: 120,
+    });
+  });
+
   it("computes global columns and next offsets from area spans", () => {
     const doc = normalizeFlowDocument({
       ...createEmptyFlowDocument(),

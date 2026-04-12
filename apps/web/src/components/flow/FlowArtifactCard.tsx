@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type {
+  DesignFrameRefArtifact,
   FlowArtifact,
   FlowHandleSide,
   FrameVersion,
   FrameWithVersions,
   JourneyStepShape,
 } from "@designer/shared";
-import { FLOW_HANDLE_SIDES } from "@designer/shared";
+import { FLOW_HANDLE_SIDES, isMobilePreset } from "@designer/shared";
 import { X } from "lucide-react";
 
 type FlowArtifactCardProps = {
@@ -78,6 +79,29 @@ function resolveRefFrameVersion(refFrame?: FrameWithVersions): FrameVersion | un
   return refFrame.versions[refFrame.versions.length - 1];
 }
 
+type FlowScreenPreviewMode = NonNullable<DesignFrameRefArtifact["previewMode"]>;
+
+function getStandardFrameSize(devicePreset?: FrameWithVersions["devicePreset"]) {
+  if (devicePreset === "iphone-15-pro-max") {
+    return { width: 430, height: 932 };
+  }
+  if (devicePreset === "iphone-15-pro" || devicePreset === "iphone-15" || devicePreset === "iphone" || isMobilePreset(devicePreset ?? "desktop")) {
+    return { width: 393, height: 852 };
+  }
+  return { width: 1240, height: 880 };
+}
+
+function resolveScreenPreviewMode(artifact: DesignFrameRefArtifact): FlowScreenPreviewMode {
+  if (artifact.previewMode === "content" || artifact.previewMode === "manual") {
+    return artifact.previewMode;
+  }
+  return "standard";
+}
+
+function clampManualPreviewHeight(value: number): number {
+  return Math.max(140, Math.round(value));
+}
+
 export function FlowArtifactCard({
   cellId,
   artifact,
@@ -100,6 +124,7 @@ export function FlowArtifactCard({
 }: FlowArtifactCardProps) {
   const contentRef = useRef<HTMLDivElement | null>(null);
   const shape = artifact.type === "journey-step" ? (artifact.shape ?? "rectangle") : "rectangle";
+  const isMediaArtifact = artifact.type === "design-frame-ref" || artifact.type === "uploaded-image";
 
   const reportMeasurement = useCallback(() => {
     const element = contentRef.current;
@@ -188,16 +213,32 @@ export function FlowArtifactCard({
       </button>
 
       <div className="flow-rf-node__shell">
-        <div className={`flow-rf-node__visual ${shape === "diamond" ? "flow-rf-node__visual--diamond" : ""}`}>
+        <div
+          className={[
+            "flow-rf-node__visual",
+            shape === "diamond" ? "flow-rf-node__visual--diamond" : "",
+            isMediaArtifact ? "flow-rf-node__visual--media" : "",
+          ]
+            .filter(Boolean)
+            .join(" ")}
+        >
           <div
             ref={contentRef}
-            className={`flow-rf-node__content ${shape === "diamond" ? "flow-rf-node__content--diamond" : ""}`}
+            className={[
+              "flow-rf-node__content",
+              shape === "diamond" ? "flow-rf-node__content--diamond" : "",
+              isMediaArtifact ? "flow-rf-node__content--media" : "",
+            ]
+              .filter(Boolean)
+              .join(" ")}
           >
             {artifact.type === "design-frame-ref" ? (
               <DesignFrameRefContent
+                artifact={artifact}
                 refFrame={refFrame}
                 buildPreviewDocument={buildPreviewDocument}
                 onLoad={reportMeasurement}
+                onChangeArtifact={(nextArtifact) => onUpdateArtifact?.(cellId, nextArtifact)}
               />
             ) : null}
             {artifact.type === "uploaded-image" ? (
@@ -238,18 +279,30 @@ export function FlowArtifactCard({
 }
 
 function DesignFrameRefContent({
+  artifact,
   refFrame,
   buildPreviewDocument,
   onLoad,
+  onChangeArtifact,
 }: {
+  artifact: DesignFrameRefArtifact;
   refFrame?: FrameWithVersions;
   buildPreviewDocument: (frameId: string, version?: FrameVersion, isBuilding?: boolean) => string;
   onLoad: () => void;
+  onChangeArtifact?: (artifact: DesignFrameRefArtifact) => void;
 }) {
   const previewFrameRef = useRef<HTMLDivElement | null>(null);
-  const [previewScale, setPreviewScale] = useState(1);
+  const resizeStateRef = useRef<{ pointerId: number; startClientY: number; startHeight: number } | null>(null);
   const previewWidth = Math.max(refFrame?.size.width ?? 1, 1);
   const previewHeight = Math.max(refFrame?.size.height ?? 1, 1);
+  const [previewScale, setPreviewScale] = useState(() => 220 / previewWidth);
+  const [previewWidthPx, setPreviewWidthPx] = useState(220);
+  const [reportedContentHeight, setReportedContentHeight] = useState<number | null>(null);
+  const [isResizing, setIsResizing] = useState(false);
+  const previewVersion = resolveRefFrameVersion(refFrame);
+  const standardFrameSize = getStandardFrameSize(refFrame?.devicePreset);
+  const previewMode = resolveScreenPreviewMode(artifact);
+  const intrinsicIframeHeight = Math.max(reportedContentHeight ?? previewHeight, previewHeight);
 
   const updatePreviewScale = useCallback(() => {
     const element = previewFrameRef.current;
@@ -257,16 +310,26 @@ function DesignFrameRefContent({
       return;
     }
 
-    const nextScale = Math.min(
-      element.clientWidth / previewWidth,
-      element.clientHeight / previewHeight,
-    );
+    const nextWidth = Math.max(element.clientWidth, 1);
+    const nextScale = nextWidth / previewWidth;
     if (!Number.isFinite(nextScale) || nextScale <= 0) {
       return;
     }
 
+    setPreviewWidthPx((current) => (Math.abs(current - nextWidth) < 1 ? current : nextWidth));
     setPreviewScale((current) => (Math.abs(current - nextScale) < 0.01 ? current : nextScale));
-  }, [previewHeight, previewWidth]);
+  }, [previewWidth]);
+
+  const standardDisplayHeight = Math.max(
+    140,
+    Math.round((previewWidthPx * standardFrameSize.height) / standardFrameSize.width),
+  );
+  const contentDisplayHeight = Math.max(140, Math.round(intrinsicIframeHeight * previewScale));
+  const resolvedDisplayHeight = previewMode === "manual"
+    ? clampManualPreviewHeight(artifact.previewHeight ?? standardDisplayHeight)
+    : previewMode === "content"
+      ? contentDisplayHeight
+      : standardDisplayHeight;
 
   useEffect(() => {
     if (!refFrame) {
@@ -289,16 +352,89 @@ function DesignFrameRefContent({
     return () => observer.disconnect();
   }, [refFrame, updatePreviewScale]);
 
+  useEffect(() => {
+    setReportedContentHeight(null);
+  }, [refFrame?.id, previewVersion?.id]);
+
+  useEffect(() => {
+    if (!refFrame || !previewVersion) {
+      return;
+    }
+
+    const handleMessage = (event: MessageEvent) => {
+      const payload = event.data as {
+        type?: string;
+        frameId?: string;
+        versionId?: string;
+        height?: number;
+      } | null;
+
+      if (!payload || payload.type !== "designer.frame-content-height") {
+        return;
+      }
+
+      const reportedHeight = typeof payload.height === "number" ? payload.height : null;
+
+      if (payload.frameId !== refFrame.id || payload.versionId !== previewVersion.id || reportedHeight === null) {
+        return;
+      }
+
+      if (!Number.isFinite(reportedHeight) || reportedHeight < 120) {
+        return;
+      }
+
+      setReportedContentHeight((current) => {
+        const nextHeight = Math.ceil(reportedHeight);
+        return current !== null && Math.abs(current - nextHeight) < 2 ? current : nextHeight;
+      });
+    };
+
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
+  }, [previewVersion, refFrame]);
+
+  useEffect(() => {
+    if (!isResizing || !onChangeArtifact) {
+      return;
+    }
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const resizeState = resizeStateRef.current;
+      if (!resizeState || event.pointerId !== resizeState.pointerId) {
+        return;
+      }
+
+      onChangeArtifact({
+        ...artifact,
+        previewMode: "manual",
+        previewHeight: clampManualPreviewHeight(resizeState.startHeight + (event.clientY - resizeState.startClientY)),
+      });
+    };
+
+    const stopResize = (event: PointerEvent) => {
+      const resizeState = resizeStateRef.current;
+      if (!resizeState || event.pointerId !== resizeState.pointerId) {
+        return;
+      }
+
+      resizeStateRef.current = null;
+      setIsResizing(false);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", stopResize);
+    window.addEventListener("pointercancel", stopResize);
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", stopResize);
+      window.removeEventListener("pointercancel", stopResize);
+    };
+  }, [artifact, isResizing, onChangeArtifact]);
+
   if (!refFrame) {
     return (
-      <div className="flow-rf-node__frame-preview">
-        <div className="flow-rf-node__frame-header">
-          <div className="flow-rf-node__frame-title-block">
-            <span className="flow-rf-node__frame-kicker">Screen</span>
-            <span className="flow-rf-node__frame-name">Referenced screen</span>
-          </div>
-          <span className="flow-rf-node__frame-status flow-rf-node__frame-status--missing">Missing</span>
-        </div>
+      <div className="flow-rf-node__frame-preview flow-rf-node__frame-preview--minimal">
         <div className="flow-rf-node__frame-placeholder flow-rf-node__frame-placeholder--missing">
           Referenced screen is no longer available.
         </div>
@@ -306,46 +442,90 @@ function DesignFrameRefContent({
     );
   }
 
-  const previewVersion = resolveRefFrameVersion(refFrame);
   const previewHtml = buildPreviewDocument(refFrame.id, previewVersion, refFrame.status === "building");
-  const previewAspectRatio = refFrame.size.width > 0 && refFrame.size.height > 0
-    ? `${refFrame.size.width} / ${refFrame.size.height}`
-    : "16 / 10";
   const statusTone = refFrame.status === "building" ? "loading" : previewVersion ? "ready" : "empty";
-  const statusLabel = refFrame.status === "building" ? "Building" : previewVersion ? "Live" : "Empty";
 
   return (
-    <div className="flow-rf-node__frame-preview">
-      <div className="flow-rf-node__frame-header">
-        <div className="flow-rf-node__frame-title-block">
-          <span className="flow-rf-node__frame-kicker">Screen</span>
-          <span className="flow-rf-node__frame-name">{refFrame.name}</span>
+    <div className="flow-rf-node__frame-preview flow-rf-node__frame-preview--minimal">
+      <div className="flow-rf-node__frame-stage">
+        {onChangeArtifact ? (
+          <div className="flow-rf-node__frame-toolbar" data-flow-node-interactive="true">
+            <button
+              type="button"
+              className={`flow-rf-node__frame-toolbar-btn ${previewMode === "standard" ? "is-active" : ""}`}
+              title="Use the standard device ratio"
+              onClick={(event) => {
+                event.stopPropagation();
+                onChangeArtifact({ ...artifact, previewMode: "standard" });
+              }}
+            >
+              Std
+            </button>
+            <button
+              type="button"
+              className={`flow-rf-node__frame-toolbar-btn ${previewMode === "content" ? "is-active" : ""}`}
+              title="Show the screen until the end of the content"
+              onClick={(event) => {
+                event.stopPropagation();
+                onChangeArtifact({ ...artifact, previewMode: "content" });
+              }}
+            >
+              Full
+            </button>
+          </div>
+        ) : null}
+
+        {statusTone === "ready" ? (
+          <span className="flow-rf-node__frame-live-dot" title="Live" aria-label="Live preview" />
+        ) : null}
+
+        <div ref={previewFrameRef} className="flow-rf-node__frame-live" style={{ height: resolvedDisplayHeight }}>
+          <div className="flow-rf-node__frame-live-stage">
+            <iframe
+              key={previewVersion?.id ?? refFrame.id}
+              srcDoc={previewHtml}
+              title={refFrame.name}
+              sandbox="allow-scripts"
+              loading="lazy"
+              tabIndex={-1}
+              aria-hidden="true"
+              style={{
+                width: previewWidth,
+                height: intrinsicIframeHeight,
+                transform: `scale(${previewScale})`,
+                transformOrigin: "top left",
+              }}
+              onLoad={() => {
+                updatePreviewScale();
+                onLoad();
+              }}
+            />
+          </div>
         </div>
-        <span className={`flow-rf-node__frame-status flow-rf-node__frame-status--${statusTone}`}>
-          {statusLabel}
-        </span>
-      </div>
-      <div ref={previewFrameRef} className="flow-rf-node__frame-live" style={{ aspectRatio: previewAspectRatio }}>
-        <div className="flow-rf-node__frame-live-stage">
-          <iframe
-            key={previewVersion?.id ?? refFrame.id}
-            srcDoc={previewHtml}
-            title={refFrame.name}
-            sandbox="allow-scripts"
-            loading="lazy"
-            tabIndex={-1}
-            aria-hidden="true"
-            style={{
-              width: previewWidth,
-              height: previewHeight,
-              transform: `translate(-50%, -50%) scale(${previewScale})`,
+
+        {onChangeArtifact ? (
+          <button
+            type="button"
+            className={`flow-rf-node__frame-resize ${isResizing ? "is-active" : ""}`}
+            data-flow-node-interactive="true"
+            aria-label="Resize screen preview height"
+            title="Drag to set a custom preview height"
+            onPointerDown={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              resizeStateRef.current = {
+                pointerId: event.pointerId,
+                startClientY: event.clientY,
+                startHeight: resolvedDisplayHeight,
+              };
+              setIsResizing(true);
             }}
-            onLoad={() => {
-              updatePreviewScale();
-              onLoad();
-            }}
-          />
-        </div>
+          >
+            <span />
+            <span />
+            <span />
+          </button>
+        ) : null}
       </div>
     </div>
   );
@@ -361,9 +541,8 @@ function UploadedImageContent({
   onLoad: () => void;
 }) {
   return (
-    <div className="flow-rf-node__image">
+    <div className="flow-rf-node__image" title={label ?? "Uploaded image"}>
       <img src={dataUrl} alt={label ?? "uploaded"} draggable={false} onLoad={onLoad} />
-      {label ? <span className="flow-rf-node__image-label">{label}</span> : null}
     </div>
   );
 }

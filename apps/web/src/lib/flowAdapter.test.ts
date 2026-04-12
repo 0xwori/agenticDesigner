@@ -4,6 +4,7 @@ import { createEmptyFlowDocument } from "@designer/shared";
 import {
   buildFlowBoardLayout,
   createFlowLayoutMetrics,
+  estimateFlowArtifactHeight,
   getFlowDocumentBounds,
   getFlowSlotCenter,
   getFlowSlotLeft,
@@ -129,6 +130,40 @@ describe("flowAdapter", () => {
 
     expect(metrics.laneHeights[0]).toBeGreaterThan(180);
     expect(metrics.contentHeight).toBeGreaterThanOrEqual(metrics.laneHeights[0] + 180 * 3);
+  });
+
+  it("uses standard screen ratios by default and honors manual screen preview heights", () => {
+    const referencedFrames = [
+      {
+        id: "frame-1",
+        projectId: "project-1",
+        name: "Desktop screen",
+        devicePreset: "desktop" as const,
+        mode: "high-fidelity" as const,
+        selected: false,
+        position: { x: 0, y: 0 },
+        size: { width: 1240, height: 2000 },
+        currentVersionId: null,
+        status: "ready" as const,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        versions: [],
+      },
+    ];
+
+    const standardHeight = estimateFlowArtifactHeight(
+      { type: "design-frame-ref", frameId: "frame-1" },
+      240,
+      referencedFrames,
+    );
+    const manualHeight = estimateFlowArtifactHeight(
+      { type: "design-frame-ref", frameId: "frame-1", previewMode: "manual", previewHeight: 320 },
+      240,
+      referencedFrames,
+    );
+
+    expect(standardHeight).toBeLessThan(260);
+    expect(manualHeight).toBeGreaterThan(standardHeight);
   });
 
   it("normalizes legacy edge handles when building board edges", () => {

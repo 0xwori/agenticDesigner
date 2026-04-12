@@ -56,6 +56,8 @@ export const FLOW_TARGET_HANDLE_IDS: Record<FlowHandleSide, string> = {
 export interface DesignFrameRefArtifact {
   type: "design-frame-ref";
   frameId: string;
+  previewMode?: "standard" | "content" | "manual";
+  previewHeight?: number;
 }
 
 export interface UploadedImageArtifact {
@@ -537,6 +539,7 @@ export function normalizeFlowDocument(doc: FlowDocument): FlowDocument {
     boardMemory: normalizeFlowBoardMemoryState(doc.boardMemory),
     cells: doc.cells.map((cell) => ({
       ...cell,
+      artifact: normalizeFlowArtifact(cell.artifact),
       column: normalizeFlowColumn(cell.column),
       areaId:
         typeof cell.areaId === "string" && areaIds.has(cell.areaId)
@@ -545,6 +548,44 @@ export function normalizeFlowDocument(doc: FlowDocument): FlowDocument {
     })),
     connections: doc.connections.map((connection) => ({ ...connection })),
   };
+}
+
+function normalizeFlowArtifact(artifact: FlowArtifact): FlowArtifact {
+  switch (artifact.type) {
+    case "design-frame-ref": {
+      const previewMode =
+        artifact.previewMode === "content" || artifact.previewMode === "manual" || artifact.previewMode === "standard"
+          ? artifact.previewMode
+          : undefined;
+      const previewHeight =
+        typeof artifact.previewHeight === "number" && Number.isFinite(artifact.previewHeight)
+          ? Math.max(120, Math.round(artifact.previewHeight))
+          : undefined;
+
+      return {
+        ...artifact,
+        previewMode,
+        previewHeight,
+      };
+    }
+
+    case "uploaded-image": {
+      return {
+        ...artifact,
+        width:
+          typeof artifact.width === "number" && Number.isFinite(artifact.width) && artifact.width > 0
+            ? Math.round(artifact.width)
+            : undefined,
+        height:
+          typeof artifact.height === "number" && Number.isFinite(artifact.height) && artifact.height > 0
+            ? Math.round(artifact.height)
+            : undefined,
+      };
+    }
+
+    default:
+      return { ...artifact };
+  }
 }
 
 // ── Connection rules ───────────────────────────────────────

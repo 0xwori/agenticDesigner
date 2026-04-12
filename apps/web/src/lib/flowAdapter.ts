@@ -11,6 +11,7 @@ import {
   FLOW_AREA_MIN_COLUMNS,
   FLOW_LANE_LABELS,
   FLOW_LANE_ORDER,
+  isMobilePreset,
   getFlowAreaColumnSpan,
   getFlowAreas,
   getFlowCellAreaId,
@@ -202,6 +203,16 @@ function scaleLayoutValue(value: number, scale: number) {
   return Math.max(1, Math.round(value * scale));
 }
 
+function getStandardPreviewAspectRatio(devicePreset?: FrameWithVersions["devicePreset"]): number {
+  if (devicePreset === "iphone-15-pro-max") {
+    return 932 / 430;
+  }
+  if (devicePreset === "iphone-15-pro" || devicePreset === "iphone-15" || devicePreset === "iphone" || isMobilePreset(devicePreset ?? "desktop")) {
+    return 852 / 393;
+  }
+  return 880 / 1240;
+}
+
 function getFlowAreaMetric(
   metrics: FlowLayoutMetrics,
   areaId?: string | null,
@@ -227,16 +238,24 @@ export function estimateFlowArtifactHeight(
 
   switch (artifact.type) {
     case "design-frame-ref": {
+      if (artifact.previewMode === "manual" && typeof artifact.previewHeight === "number") {
+        return Math.max(scaleLayoutValue(120, layoutScale), Math.round(artifact.previewHeight) + scaleLayoutValue(8, layoutScale));
+      }
+
       const ref = allDesignFrames.find((frame) => frame.id === artifact.frameId);
-      const aspect = ref ? ref.size.height / Math.max(ref.size.width, 1) : 0.65;
-      return Math.max(scaleLayoutValue(120, layoutScale), Math.round(contentWidth * aspect) + scaleLayoutValue(32, layoutScale));
+      const aspect = artifact.previewMode === "content"
+        ? ref
+          ? ref.size.height / Math.max(ref.size.width, 1)
+          : 0.65
+        : getStandardPreviewAspectRatio(ref?.devicePreset);
+      return Math.max(scaleLayoutValue(120, layoutScale), Math.round(contentWidth * aspect) + scaleLayoutValue(12, layoutScale));
     }
 
     case "uploaded-image": {
       if (typeof artifact.width === "number" && typeof artifact.height === "number" && artifact.width > 0) {
         return Math.max(
           scaleLayoutValue(120, layoutScale),
-          Math.round((contentWidth * artifact.height) / artifact.width) + scaleLayoutValue(28, layoutScale),
+          Math.round((contentWidth * artifact.height) / artifact.width) + scaleLayoutValue(12, layoutScale),
         );
       }
       return scaleLayoutValue(180, layoutScale);
