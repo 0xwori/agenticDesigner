@@ -12,15 +12,38 @@ describe("generateFlowStory", () => {
   it("builds and persists a story payload onto the flow document", async () => {
     vi.mocked(requestCompletion).mockResolvedValue({
       content: JSON.stringify({
-        title: "Checkout completion",
-        userStory: "As a shopper, I want to finish checkout so that I can place my order.",
-        acceptanceCriteria: [
-          "Given a ready cart, when the user submits payment, then the order is confirmed.",
-          "Given a payment failure, when the provider rejects the charge, then the user sees recovery options.",
+        title: "[Platform: APP] Checkout completion",
+        goal: "Help the shopper finish checkout and recover from payment failures.",
+        userContext: {
+          startingPoint: [
+            "The shopper is on the checkout screen with a ready cart.",
+          ],
+        },
+        design: {
+          reference: "Not available in board context",
+        },
+        acceptanceCriteriaSections: [
+          {
+            section: "Checkout Behavior",
+            items: [
+              "If the shopper submits a valid payment, then the order is confirmed.",
+              "If the payment provider rejects the charge, then show recovery options.",
+            ],
+          },
         ],
-        technicalNotes: [
+        phraseKeys: [
+          "checkout_title: \"Checkout\"",
+          "checkout_submit_button: \"Place order\"",
+          "general_retry_button: \"Try again\"",
+          "accessibility_checkout_close_button: \"Close checkout\"",
+        ],
+        technicalBriefing: [
           "Refresh the cart and payment intent on load.",
           "Persist the checkout state between retries.",
+        ],
+        accessibilityRequirements: [
+          "Support dynamic font sizing up to the maximum system size.",
+          "Support dark mode, landscape, and VoiceOver/TalkBack labels for image-only buttons.",
         ],
       }),
       usedProvider: "openai",
@@ -59,6 +82,16 @@ describe("generateFlowStory", () => {
             column: 0,
             artifact: { type: "design-frame-ref", frameId: "frame-1" },
           },
+          {
+            id: "image-1",
+            laneId: "normal-flow",
+            column: 1,
+            artifact: {
+              type: "uploaded-image",
+              label: "Checkout screenshot",
+              dataUrl: "data:image/png;base64,checkout-image",
+            },
+          },
         ],
         connections: [
           {
@@ -68,21 +101,50 @@ describe("generateFlowStory", () => {
           },
         ],
       },
-      designFrames: [{ id: "frame-1", name: "Checkout screen" }],
+      designFrames: [{ id: "frame-1", name: "Checkout screen", summary: "Visible content: Checkout / Place order. Actions: Place order, Try again." }],
       provider: "openai",
       model: "gpt-5.4-mini",
     });
 
-    expect(result.story.title).toBe("Checkout completion");
+    expect(result.story.title).toBe("[Platform: APP] Checkout completion");
+    expect(result.story.goal).toContain("finish checkout");
+    expect(result.story.startingPoint).toEqual([
+      "The shopper is on the checkout screen with a ready cart.",
+    ]);
+    expect(result.story.designReference).toBe("Not available in board context");
     expect(result.story.acceptanceCriteria).toHaveLength(2);
+    expect(result.story.acceptanceCriteriaGroups).toEqual([
+      {
+        title: "Checkout Behavior",
+        items: [
+          "If the shopper submits a valid payment, then the order is confirmed.",
+          "If the payment provider rejects the charge, then show recovery options.",
+        ],
+      },
+    ]);
+    expect(result.story.phraseKeys).toContain("general_retry_button: \"Try again\"");
+    expect(result.story.technicalBriefing).toContain("Refresh the cart and payment intent on load.");
+    expect(result.story.accessibilityRequirements).toHaveLength(2);
     expect(result.updatedDocument.story).toEqual(result.story);
     expect(result.summary).toContain("Generated story");
 
     const input = vi.mocked(requestCompletion).mock.calls[0][0];
-    expect(input.system).toContain("Return ONLY valid JSON");
+    expect(input.system).toContain("Technical Product Manager (TPM)");
+    expect(input.system).toContain("Politie MMA Team");
+    expect(input.system).toContain("acceptanceCriteriaSections");
+    expect(input.system).toContain('key_name: "Visible text"');
     expect(input.prompt).toContain("Checkout screen");
+    expect(input.prompt).toContain("summary: Visible content: Checkout / Place order.");
+    expect(input.prompt).toContain('image attachment id: flow-story-image-image-1');
     expect(input.prompt).toContain("Board memory:");
     expect(input.prompt).toContain("goals=1");
     expect(input.prompt).toContain("User request: Export this board as a story.");
+    expect(input.attachments).toEqual([
+      expect.objectContaining({
+        id: "flow-story-image-image-1",
+        type: "image",
+        dataUrl: "data:image/png;base64,checkout-image",
+      }),
+    ]);
   });
 });

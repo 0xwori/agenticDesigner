@@ -21,6 +21,24 @@ function formatGeneratedAt(value: string) {
   return new Date(parsed).toLocaleString();
 }
 
+function getAcceptanceCriteriaGroups(story: FlowStory) {
+  if (story.acceptanceCriteriaGroups && story.acceptanceCriteriaGroups.length > 0) {
+    return story.acceptanceCriteriaGroups;
+  }
+
+  if (story.acceptanceCriteria.length === 0) {
+    return [];
+  }
+
+  return [{ title: "Acceptance Criteria", items: story.acceptanceCriteria }];
+}
+
+function getTechnicalBriefing(story: FlowStory) {
+  return story.technicalBriefing && story.technicalBriefing.length > 0
+    ? story.technicalBriefing
+    : story.technicalNotes;
+}
+
 export function FlowStoryModal({
   open,
   boardName,
@@ -35,6 +53,9 @@ export function FlowStoryModal({
   if (!open) {
     return null;
   }
+
+  const acceptanceCriteriaGroups = story ? getAcceptanceCriteriaGroups(story) : [];
+  const technicalBriefing = story ? getTechnicalBriefing(story) : [];
 
   return (
     <div className="workspace-modal-overlay" role="dialog" aria-modal="true">
@@ -88,29 +109,79 @@ export function FlowStoryModal({
               </section>
 
               <section className="workspace-modal__section">
-                <h3>User Story</h3>
-                <p className="flow-story-modal__story">{story.userStory}</p>
+                <h3>Goal</h3>
+                <p className="flow-story-modal__story">{story.goal ?? story.userStory}</p>
+              </section>
+
+              <section className="workspace-modal__section">
+                <h3>User Context</h3>
+                <strong>Starting Point</strong>
+                {story.startingPoint && story.startingPoint.length > 0 ? (
+                  <ul className="flow-story-modal__list flow-story-modal__list--unordered">
+                    {story.startingPoint.map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="workspace-modal__hint">No explicit starting point was captured for this export.</p>
+                )}
+              </section>
+
+              <section className="workspace-modal__section">
+                <h3>Design</h3>
+                <p className="flow-story-modal__story">{story.designReference?.trim() || "Not available in board context"}</p>
               </section>
 
               <section className="workspace-modal__section">
                 <h3>Acceptance Criteria</h3>
-                <ol className="flow-story-modal__list">
-                  {story.acceptanceCriteria.map((criterion) => (
-                    <li key={criterion}>{criterion}</li>
-                  ))}
-                </ol>
+                {acceptanceCriteriaGroups.map((group) => (
+                  <div key={group.title} className="flow-story-modal__group">
+                    <strong>{group.title}</strong>
+                    <ul className="flow-story-modal__list flow-story-modal__list--unordered">
+                      {group.items.map((criterion) => (
+                        <li key={`${group.title}-${criterion}`}>{criterion}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
               </section>
 
               <section className="workspace-modal__section">
-                <h3>Technical Notes</h3>
-                {story.technicalNotes.length > 0 ? (
+                <h3>Phrase Keys</h3>
+                {story.phraseKeys && story.phraseKeys.length > 0 ? (
                   <ul className="flow-story-modal__list flow-story-modal__list--unordered">
-                    {story.technicalNotes.map((note) => (
+                    {story.phraseKeys.map((key) => (
+                      <li key={key}>{key}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="workspace-modal__hint">No specific phrase keys were needed for this export.</p>
+                )}
+              </section>
+
+              <section className="workspace-modal__section">
+                <h3>Technical Briefing</h3>
+                {technicalBriefing.length > 0 ? (
+                  <ul className="flow-story-modal__list flow-story-modal__list--unordered">
+                    {technicalBriefing.map((note) => (
                       <li key={note}>{note}</li>
                     ))}
                   </ul>
                 ) : (
-                  <p className="workspace-modal__hint">No additional technical notes were needed for this export.</p>
+                  <p className="workspace-modal__hint">No additional technical briefing was needed for this export.</p>
+                )}
+              </section>
+
+              <section className="workspace-modal__section">
+                <h3>Accessibility Requirements</h3>
+                {story.accessibilityRequirements && story.accessibilityRequirements.length > 0 ? (
+                  <ul className="flow-story-modal__list flow-story-modal__list--unordered">
+                    {story.accessibilityRequirements.map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="workspace-modal__hint">No extra accessibility requirements were captured for this export.</p>
                 )}
               </section>
             </>

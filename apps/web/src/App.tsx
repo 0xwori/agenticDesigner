@@ -121,12 +121,55 @@ function buildFlowBoardScopedPrompt(prompt: string) {
 }
 
 function buildFlowStoryClipboard(story: FlowStory) {
-  const acceptanceCriteria = story.acceptanceCriteria.map((criterion) => `- ${criterion}`).join("\n");
-  const technicalNotes = story.technicalNotes.length > 0
-    ? story.technicalNotes.map((note) => `- ${note}`).join("\n")
+  const acceptanceCriteriaGroups = story.acceptanceCriteriaGroups && story.acceptanceCriteriaGroups.length > 0
+    ? story.acceptanceCriteriaGroups
+    : story.acceptanceCriteria.length > 0
+      ? [{ title: "Acceptance Criteria", items: story.acceptanceCriteria }]
+      : [];
+  const acceptanceCriteria = acceptanceCriteriaGroups.length > 0
+    ? acceptanceCriteriaGroups
+      .map((group) => [`**${group.title}**`, ...group.items.map((item) => `- ${item}`)].join("\n"))
+      .join("\n\n")
+    : "- None";
+  const startingPoint = story.startingPoint && story.startingPoint.length > 0
+    ? story.startingPoint.map((item) => `- ${item}`).join("\n")
+    : "- Not specified";
+  const phraseKeys = story.phraseKeys && story.phraseKeys.length > 0
+    ? story.phraseKeys.map((item) => `- ${item}`).join("\n")
+    : "- None";
+  const technicalBriefing = (story.technicalBriefing && story.technicalBriefing.length > 0 ? story.technicalBriefing : story.technicalNotes)
+    .map((item) => `- ${item}`)
+    .join("\n") || "- None";
+  const accessibilityRequirements = story.accessibilityRequirements && story.accessibilityRequirements.length > 0
+    ? story.accessibilityRequirements.map((item) => `- ${item}`).join("\n")
     : "- None";
 
-  return [`# ${story.title}`, "", "## User Story", story.userStory, "", "## Acceptance Criteria", acceptanceCriteria, "", "## Technical Notes", technicalNotes].join("\n");
+  return [
+    `#Title: ${story.title}`,
+    "",
+    "### Goal",
+    story.goal ?? story.userStory,
+    "",
+    "### User Context",
+    "",
+    "**Starting Point:**",
+    startingPoint,
+    "",
+    "### Design",
+    `- **Design Reference**: ${story.designReference?.trim() || "Not available in board context"}`,
+    "",
+    "### Acceptance Criteria",
+    acceptanceCriteria,
+    "",
+    "### Phrase Keys (Localization)",
+    phraseKeys,
+    "",
+    "### Technical Briefing",
+    technicalBriefing,
+    "",
+    "### Accessibility Requirements",
+    accessibilityRequirements,
+  ].join("\n");
 }
 
 function formatMemoryYamlValue(value: unknown): string {
@@ -2444,7 +2487,7 @@ function AppContent() {
 
     try {
       const result = await generateFlowStory(getApiBaseUrl(preferences.apiBaseUrl), frameId, {
-        prompt: "Export this board as a user story with acceptance criteria and concise technical notes.",
+        prompt: "Export this board using the Politie MMA TPM user story template.",
         provider: preferences.provider,
         model: preferences.model,
         apiKey: preferences.apiKey.trim() || undefined,

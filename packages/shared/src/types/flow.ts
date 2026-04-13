@@ -109,11 +109,23 @@ export interface FlowConnection {
   targetHandle?: string;
 }
 
+export interface FlowStoryAcceptanceCriteriaGroup {
+  title: string;
+  items: string[];
+}
+
 export interface FlowStory {
   title: string;
   userStory: string;
+  goal?: string;
+  startingPoint?: string[];
+  designReference?: string | null;
   acceptanceCriteria: string[];
+  acceptanceCriteriaGroups?: FlowStoryAcceptanceCriteriaGroup[];
+  phraseKeys?: string[];
   technicalNotes: string[];
+  technicalBriefing?: string[];
+  accessibilityRequirements?: string[];
   generatedAt: string;
   sourcePrompt: string;
 }

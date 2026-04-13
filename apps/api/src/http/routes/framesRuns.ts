@@ -516,7 +516,7 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
       const projectBundle = await deps.getProjectBundle(frame.projectId);
       const designFrames = (projectBundle?.frames ?? [])
         .filter((candidate) => candidate.frameKind !== "flow")
-        .map((candidate) => ({ id: candidate.id, name: candidate.name }));
+        .map((candidate) => ({ id: candidate.id, name: candidate.name, summary: buildDesignFrameSummary(candidate) }));
 
       const result = await generateFlowStory({
         prompt,

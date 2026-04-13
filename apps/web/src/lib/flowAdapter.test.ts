@@ -215,6 +215,27 @@ describe("flowAdapter", () => {
     expect(chromeAreas[0]?.gridColumns[0]?.left).toBe(chromeAreas[0]?.gutterWidth);
   });
 
+  it("keeps the first visible column centered within the same half-gap rhythm as later columns", () => {
+    const metrics = createFlowLayoutMetrics(createEmptyFlowDocument(), {
+      frameWidth: 1600,
+      frameHeight: 900,
+      headerHeight: 0,
+      allDesignFrames: [],
+    });
+
+    const area = metrics.areas[0];
+    expect(area).toBeDefined();
+    if (!area) {
+      throw new Error("Expected a visible area");
+    }
+
+    const firstCenter = getFlowSlotCenter({ areaId: area.id, laneId: "user-journey", column: 0 }, metrics).x;
+    const secondCenter = getFlowSlotCenter({ areaId: area.id, laneId: "user-journey", column: 1 }, metrics).x;
+    const leftTrackBoundary = area.slotLeft - metrics.nodeGap / 2;
+
+    expect(firstCenter - leftTrackBoundary).toBeCloseTo((secondCenter - firstCenter) / 2, 5);
+  });
+
   it("top-aligns screens and images inside taller lane cells", () => {
     const referencedFrames = [
       {

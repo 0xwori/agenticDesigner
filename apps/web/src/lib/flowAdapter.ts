@@ -341,7 +341,7 @@ export function createFlowLayoutMetrics(
   const layoutScale = input.layoutScale ?? 1;
   const labelWidth = scaleLayoutValue(LANE_LABEL_WIDTH, layoutScale);
   const baseNodeGap = scaleLayoutValue(NODE_GAP, layoutScale);
-  const nodePaddingLeft = scaleLayoutValue(NODE_PADDING_LEFT, layoutScale);
+  const minimumNodeEdgeGap = Math.max(scaleLayoutValue(NODE_PADDING_LEFT, layoutScale), baseNodeGap / 2);
   const boardPaddingX = scaleLayoutValue(FLOW_BOARD_PADDING_X, layoutScale);
   const areaGap = scaleLayoutValue(FLOW_AREA_GAP, layoutScale);
   const areaFramePaddingX = scaleLayoutValue(FLOW_AREA_FRAME_PADDING_X, layoutScale);
@@ -374,8 +374,8 @@ export function createFlowLayoutMetrics(
     };
   });
 
-  const totalColumnGapCount = areaDefinitions.reduce(
-    (sum, area) => sum + Math.max(0, area.localColumnCount - 1),
+  const totalGapCount = areaDefinitions.reduce(
+    (sum, area) => sum + Math.max(1, area.localColumnCount),
     0,
   );
   const minimumContentWidth =
@@ -387,20 +387,20 @@ export function createFlowLayoutMetrics(
             sum +
             areaFramePaddingX * 2 +
             labelWidth +
-            nodePaddingLeft +
             area.localColumnCount * nodeWidth +
-            Math.max(0, area.localColumnCount - 1) * baseNodeGap,
+            area.localColumnCount * baseNodeGap,
           0,
         )
-      : boardPaddingX * 2 + labelWidth + nodePaddingLeft + nodeWidth;
+      : boardPaddingX * 2 + labelWidth + nodeWidth + minimumNodeEdgeGap * 2;
   const nodeGap = distributeExtraWidthAcrossColumnGaps(
     baseNodeGap,
-    totalColumnGapCount,
+    totalGapCount,
     input.frameWidth,
     minimumContentWidth,
   );
+  const nodeEdgeGap = Math.max(minimumNodeEdgeGap, nodeGap / 2);
   const slotStep = nodeWidth + nodeGap;
-  const availableWidth = Math.max(0, Math.max(input.frameWidth, minimumContentWidth) - boardPaddingX * 2);
+  const contentWidth = Math.max(input.frameWidth, minimumContentWidth);
 
   const sizedAreas = areaDefinitions.map((area) => {
     const slotWidth =
@@ -415,8 +415,8 @@ export function createFlowLayoutMetrics(
   let areaCursorX = boardPaddingX;
   const areas = sizedAreas.map((area) => {
     const left = areaCursorX;
-    const slotLeft = left + areaFramePaddingX + labelWidth + nodePaddingLeft;
-    const width = areaFramePaddingX * 2 + labelWidth + nodePaddingLeft + area.slotWidth;
+    const slotLeft = left + areaFramePaddingX + labelWidth + nodeEdgeGap;
+    const width = areaFramePaddingX * 2 + labelWidth + nodeEdgeGap * 2 + area.slotWidth;
     areaCursorX += width + areaGap;
 
     return {
@@ -429,11 +429,6 @@ export function createFlowLayoutMetrics(
 
   const maxColumn = areas.reduce((current, area) => Math.max(current, area.endColumn), MIN_VISIBLE_COLUMNS - 1);
   const columnCount = Math.max(MIN_VISIBLE_COLUMNS, maxColumn + 1);
-  const contentWidth =
-    areas.length > 0
-      ? Math.max(areaCursorX - areaGap + boardPaddingX, input.frameWidth)
-      : Math.max(input.frameWidth, boardPaddingX * 2 + labelWidth + nodePaddingLeft + nodeWidth);
-
   let laneHeights = FLOW_LANE_ORDER.map((laneId) => {
     const tallestNode = doc.cells
       .filter((cell) => cell.laneId === laneId)
@@ -467,18 +462,18 @@ export function createFlowLayoutMetrics(
   const visibleBodyHeight = Math.min(contentHeight, maxVisibleBodyHeight);
   const frameHeight = input.headerHeight + visibleBodyHeight;
   const lastArea = areas[areas.length - 1];
-  const nodeMinX = areas[0]?.slotLeft ?? boardPaddingX + labelWidth + nodePaddingLeft;
+  const nodeMinX = areas[0]?.slotLeft ?? boardPaddingX + areaFramePaddingX + labelWidth + minimumNodeEdgeGap;
   const nodeMaxX = lastArea
     ? lastArea.slotLeft + Math.max(0, lastArea.localColumnCount - 1) * slotStep
     : nodeMinX;
 
   return {
-    frameWidth: Math.max(input.frameWidth, contentWidth),
+    frameWidth: contentWidth,
     frameHeight,
     headerHeight: input.headerHeight,
     layoutScale,
     availableHeight: visibleBodyHeight,
-    availableWidth,
+    availableWidth: Math.max(0, contentWidth - boardPaddingX * 2),
     visibleBodyHeight,
     maxVisibleBodyHeight,
     contentHeight,
@@ -488,7 +483,7 @@ export function createFlowLayoutMetrics(
     columnCount,
     labelWidth,
     nodeGap,
-    nodePaddingLeft,
+    nodePaddingLeft: nodeEdgeGap,
     boardPaddingX,
     areaGap,
     laneInnerPadding,
