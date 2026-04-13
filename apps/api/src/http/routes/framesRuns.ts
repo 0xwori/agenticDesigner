@@ -1,9 +1,24 @@
 import type { Express } from "express";
-import { createEmptyFlowDocument, type FrameVersion, type FrameWithVersions } from "@designer/shared";
+import {
+  applyFlowMutations,
+  createEmptyFlowDocument,
+  describeFlowMutations,
+  type FlowDocument,
+  type FlowMutationCommand,
+} from "@designer/shared";
 import type { RunHub } from "../../services/runHub.js";
 import type { ApiDeps } from "../deps.js";
 import { sendApiError } from "../errors.js";
-import { runFlowAction } from "../../services/pipeline/flowAction.js";
+import {
+  REVIEW_REQUIRED_FLOW_MUTATION_OPS,
+  runFlowAction,
+} from "../../services/pipeline/flowAction.js";
+import {
+  FlowBoardMemoryParseError,
+  parseFlowBoardMemoryText,
+  syncFlowDocumentWithBoardMemory,
+} from "../../services/pipeline/flowBoardMemory.js";
+import { buildDesignFrameSummary } from "../../services/pipeline/designFrameSummary.js";
 import { generateFlowStory } from "../../services/pipeline/flowStory.js";
 import {
   parseAttachments,
@@ -18,102 +33,53 @@ import {
   parseVariation
 } from "../parsers.js";
 
-function resolveLatestFrameVersion(frame: FrameWithVersions): FrameVersion | null {
-  if (frame.currentVersionId) {
-    const currentVersion = frame.versions.find((version) => version.id === frame.currentVersionId);
-    if (currentVersion) {
-      return currentVersion;
+function isFlowMutationCommand(value: unknown): value is FlowMutationCommand {
+  return typeof value === "object" && value !== null && typeof (value as { op?: unknown }).op === "string";
+}
+
+function splitFlowMutationCommands(commands: FlowMutationCommand[]) {
+  const autoAppliedCommands: FlowMutationCommand[] = [];
+  const reviewRequiredCommands: FlowMutationCommand[] = [];
+
+  for (const command of commands) {
+    if (REVIEW_REQUIRED_FLOW_MUTATION_OPS.has(command.op)) {
+      reviewRequiredCommands.push(command);
+      continue;
     }
+    autoAppliedCommands.push(command);
   }
 
-  return frame.versions.length > 0 ? frame.versions[frame.versions.length - 1] : null;
+  return {
+    autoAppliedCommands,
+    reviewRequiredCommands,
+  };
 }
 
-function stripMarkupForSummary(value: string): string {
-  return value
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+function buildFlowActionSummary(input: {
+  sourceDocument: FlowDocument;
+  autoAppliedCommands: FlowMutationCommand[];
+  reviewRequiredCommands: FlowMutationCommand[];
+  fallbackSummary: string;
+}) {
+  const autoSummary = input.autoAppliedCommands.length > 0
+    ? describeFlowMutations(input.autoAppliedCommands, input.sourceDocument)
+    : "";
+  const reviewSummary = input.reviewRequiredCommands.length > 0
+    ? input.reviewRequiredCommands.length === 1
+      ? "1 change is waiting for confirmation. The board will stay unchanged until you apply it."
+      : `${input.reviewRequiredCommands.length} changes are waiting for confirmation. The board will stay unchanged until you apply them.`
+    : "";
 
-function trimSummary(value: string, maxLength = 360): string {
-  if (value.length <= maxLength) {
-    return value;
+  if (autoSummary && reviewSummary) {
+    return `${autoSummary} ${reviewSummary}`;
   }
-  return `${value.slice(0, maxLength - 1).trimEnd()}…`;
-}
-
-function extractTagText(html: string, tagName: string, limit: number): string[] {
-  const matches = Array.from(html.matchAll(new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "gi")));
-  return matches
-    .map((match) => stripMarkupForSummary(match[1] ?? ""))
-    .filter((value) => value.length > 0)
-    .slice(0, limit);
-}
-
-function extractFieldHints(html: string, limit: number): string[] {
-  const matches = Array.from(
-    html.matchAll(/<(?:input|textarea|select)\b[^>]*(?:placeholder|aria-label|name|id)=["']([^"']+)["'][^>]*>/gi),
-  );
-  return matches
-    .map((match) => match[1]?.trim() ?? "")
-    .filter((value) => value.length > 0)
-    .slice(0, limit);
-}
-
-function buildDesignFrameSummary(frame: FrameWithVersions): string | undefined {
-  const version = resolveLatestFrameVersion(frame);
-  if (!version) {
-    return undefined;
+  if (autoSummary) {
+    return autoSummary;
   }
-
-  const visibleContent = stripMarkupForSummary(version.exportHtml);
-  const visibleSnippets = visibleContent
-    .split(/(?<=[.!?])\s+|\s{2,}/)
-    .map((value) => value.trim())
-    .filter((value) => value.length >= 3)
-    .slice(0, 3);
-  const headings = [
-    ...extractTagText(version.exportHtml, "h1", 1),
-    ...extractTagText(version.exportHtml, "h2", 2),
-    ...extractTagText(version.exportHtml, "h3", 2),
-  ].slice(0, 3);
-  const buttons = extractTagText(version.exportHtml, "button", 3);
-  const fieldHints = extractFieldHints(version.exportHtml, 3);
-  const combinedSignals = `${version.exportHtml}\n${version.sourceCode}`;
-  const signals: string[] = [];
-
-  if (headings.length > 0) {
-    signals.push(`Headings: ${headings.join(", ")}`);
+  if (reviewSummary) {
+    return reviewSummary;
   }
-  if (buttons.length > 0) {
-    signals.push(`Actions: ${buttons.join(", ")}`);
-  }
-  if (fieldHints.length > 0) {
-    signals.push(`Fields: ${fieldHints.join(", ")}`);
-  }
-  if (/fetch\(|axios|graphql|mutation|query|api/i.test(version.sourceCode)) {
-    signals.push("Includes API or data-fetching logic");
-  }
-  if (/auth|session|token|password|login|sign in/i.test(combinedSignals)) {
-    signals.push("Contains auth or session-related UI");
-  }
-  if (/error|retry|failed|invalid|empty state/i.test(combinedSignals)) {
-    signals.push("Shows error, retry, or validation handling");
-  }
-
-  const parts = [
-    visibleSnippets.length > 0 ? `Visible content: ${visibleSnippets.join(" / ")}` : null,
-    ...signals,
-  ].filter((value): value is string => Boolean(value));
-
-  if (parts.length === 0) {
-    return undefined;
-  }
-
-  return trimSummary(parts.join(". "));
+  return input.fallbackSummary;
 }
 
 export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunHub) {
@@ -193,6 +159,48 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
       }
       response.json(updated);
     } catch (error) {
+      sendApiError(response, 500, error instanceof Error ? error.message : String(error), "internal_error");
+    }
+  });
+
+  app.patch("/frames/:id/board-memory", async (request, response) => {
+    const existing = await deps.getFrame(request.params.id);
+    if (!existing) {
+      sendApiError(response, 404, "Frame not found.", "not_found");
+      return;
+    }
+    if (existing.frameKind !== "flow") {
+      sendApiError(response, 400, "Frame is not a flow board.", "validation_error");
+      return;
+    }
+
+    const authoredText = typeof request.body?.authoredText === "string" ? request.body.authoredText : "";
+
+    try {
+      const parsedMemory = parseFlowBoardMemoryText(authoredText);
+      const synced = syncFlowDocumentWithBoardMemory(
+        existing.flowDocument ?? createEmptyFlowDocument(),
+        parsedMemory,
+      );
+      const updated = await deps.updateFlowDocument(request.params.id, synced.flowDocument);
+      if (!updated) {
+        sendApiError(response, 404, "Frame not found.", "not_found");
+        return;
+      }
+
+      response.json({
+        ok: true,
+        frameId: existing.id,
+        flowDocument: updated.flowDocument ?? synced.flowDocument,
+        memoryText: synced.flowDocument.boardMemory?.authoredText ?? authoredText,
+        summary: "Board memory saved and synchronized with the selected board.",
+      });
+    } catch (error) {
+      if (error instanceof FlowBoardMemoryParseError) {
+        sendApiError(response, 400, error.message, "validation_error");
+        return;
+      }
+
       sendApiError(response, 500, error instanceof Error ? error.message : String(error), "internal_error");
     }
   });
@@ -417,21 +425,74 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
             : undefined,
       });
 
-      // Persist the updated document
-      if (result.commands.length > 0) {
-        await deps.updateFlowDocument(frame.id, result.updatedDocument);
+      const sourceDocument = frame.flowDocument ?? createEmptyFlowDocument();
+      const { autoAppliedCommands, reviewRequiredCommands } = splitFlowMutationCommands(result.commands);
+      const nextFlowDocument = autoAppliedCommands.length > 0
+        ? applyFlowMutations(sourceDocument, autoAppliedCommands)
+        : sourceDocument;
+      const reviewDetails = reviewRequiredCommands.map((command) => ({
+        command,
+        summary: describeFlowMutations([command], sourceDocument),
+        severity: command.op === "remove-cell" || command.op === "remove-connection" ? "remove" : "modify",
+      }));
+
+      if (autoAppliedCommands.length > 0) {
+        await deps.updateFlowDocument(frame.id, nextFlowDocument);
       }
 
       response.json({
         ok: true,
         frameId: frame.id,
         commands: result.commands,
-        flowDocument: result.updatedDocument,
-        summary: result.summary,
+        autoAppliedCommands,
+        reviewRequiredCommands: reviewDetails,
+        flowDocument: nextFlowDocument,
+        summary: buildFlowActionSummary({
+          sourceDocument,
+          autoAppliedCommands,
+          reviewRequiredCommands,
+          fallbackSummary: result.summary,
+        }),
       });
     } catch (err) {
       console.error("[flow-action] Error:", err);
       sendApiError(response, 500, "Flow action failed.", "internal_error");
+    }
+  });
+
+  app.post("/frames/:id/flow-action/apply", async (request, response) => {
+    const frame = await deps.getFrame(request.params.id);
+    if (!frame) {
+      sendApiError(response, 404, "Frame not found.", "not_found");
+      return;
+    }
+    if (frame.frameKind !== "flow") {
+      sendApiError(response, 400, "Frame is not a flow board.", "validation_error");
+      return;
+    }
+
+    const commands = Array.isArray(request.body?.commands)
+      ? request.body.commands.filter(isFlowMutationCommand)
+      : [];
+    if (commands.length === 0) {
+      sendApiError(response, 400, "commands are required.", "validation_error");
+      return;
+    }
+
+    try {
+      const sourceDocument = frame.flowDocument ?? createEmptyFlowDocument();
+      const updatedDocument = applyFlowMutations(sourceDocument, commands);
+      await deps.updateFlowDocument(frame.id, updatedDocument);
+
+      response.json({
+        ok: true,
+        frameId: frame.id,
+        appliedCommands: commands,
+        flowDocument: updatedDocument,
+        summary: describeFlowMutations(commands, sourceDocument),
+      });
+    } catch (error) {
+      sendApiError(response, 500, error instanceof Error ? error.message : String(error), "internal_error");
     }
   });
 

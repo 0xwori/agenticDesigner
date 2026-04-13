@@ -3,6 +3,7 @@ import {
   applyFlowMutations,
   createEmptyFlowBoardMemoryDocument,
   findNextFreeFlowColumn,
+  describeFlowMutations,
   FLOW_AREA_COLUMN_GAP,
   FLOW_AREA_MIN_COLUMNS,
   FLOW_DEFAULT_AREA_ID,
@@ -645,5 +646,37 @@ describe("applyFlowMutations", () => {
 
     expect(moved.cells.find((cell) => cell.id === "step-b")?.areaId).toBe("area-2");
     expect(moved.connections).toEqual([]);
+  });
+
+  it("describes update-cell mutations using the replacement artifact details", () => {
+    const doc = applyFlowMutations(createEmptyFlowDocument(), [
+      {
+        op: "add-cell",
+        cellId: "brief-1",
+        laneId: "technical-briefing",
+        column: 0,
+        artifact: {
+          type: "technical-brief",
+          title: "Legacy API",
+          language: "http",
+          body: "GET /legacy",
+        },
+      },
+    ]);
+
+    const summary = describeFlowMutations([
+      {
+        op: "update-cell",
+        cellId: "brief-1",
+        artifact: {
+          type: "technical-brief",
+          title: "Checkout API",
+          language: "http",
+          body: "POST /checkout",
+        },
+      },
+    ], doc);
+
+    expect(summary).toBe('Updated technical brief "Checkout API"');
   });
 });

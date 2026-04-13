@@ -14,7 +14,7 @@ import {
   isFlowCellOccupied,
   resolveFlowInsertColumn,
 } from "@designer/shared";
-import { Code, Download, FileText, LayoutDashboard, MoreHorizontal, Plus, Sparkles, Trash2, Upload, Workflow, X } from "lucide-react";
+import { Code, Download, FileText, MoreHorizontal, Plus, Sparkles, Trash2, Upload, Workflow, X } from "lucide-react";
 
 import { FlowChromeLayer } from "./flow/FlowChrome";
 import { FlowArtifactCard } from "./flow/FlowArtifactCard";
@@ -61,6 +61,12 @@ type FlowWorkspaceProps = {
   onOpenBoardMemory?: (frameId: string) => Promise<void> | void;
   onOpenFlowStory?: (frameId: string) => Promise<void> | void;
   boardBusyState?: "agent" | "story" | null;
+  onBeginFrameResize?: (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    frameId: string,
+    pointerScale: number,
+    visibleSize: { width: number; height: number },
+  ) => void;
 };
 
 type NodeDragMode = "move" | "duplicate";
@@ -115,6 +121,8 @@ const FLOW_WORKSPACE_MIN_ZOOM = 0.35;
 const FLOW_WORKSPACE_MAX_ZOOM = 1.8;
 const FLOW_EDGE_HIT_WIDTH_PX = 24;
 const FLOW_CONNECTION_SNAP_RADIUS_PX = 68;
+const FLOW_WORKSPACE_MIN_FRAME_WIDTH = 960;
+const FLOW_WORKSPACE_MIN_FRAME_HEIGHT = 640;
 
 function newCellId() {
   return crypto.randomUUID();
@@ -174,6 +182,18 @@ function isInteractiveElement(target: EventTarget | null): boolean {
   return Boolean(
     target.closest(
       "button, input, textarea, select, label, [data-flow-node-interactive='true'], .flow-frame-picker, .flow-lane__menu",
+    ),
+  );
+}
+
+function shouldIgnoreGlobalFlowZoomTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+
+  return Boolean(
+    target.closest(
+      "input, textarea, select, [contenteditable='true'], [role='textbox'], .workspace-modal, .workspace-modal-overlay",
     ),
   );
 }
@@ -294,6 +314,7 @@ function FlowWorkspaceInner({
   onOpenBoardMemory,
   onOpenFlowStory,
   boardBusyState,
+  onBeginFrameResize,
 }: FlowWorkspaceProps) {
   const doc = flowDocument ?? createEmptyFlowDocument();
   const docRef = useRef(doc);
@@ -428,17 +449,26 @@ function FlowWorkspaceInner({
   const layout = useMemo(
     () =>
       buildFlowBoardLayout(doc, {
-        frameWidth: Math.max(viewportWidth - 48, 1240),
-        frameHeight: Math.max(viewportHeight - 96, 760),
+        frameWidth: Math.max(frame.size.width, FLOW_WORKSPACE_MIN_FRAME_WIDTH),
+        frameHeight: Math.max(frame.size.height, FLOW_WORKSPACE_MIN_FRAME_HEIGHT),
         headerHeight: 0,
         layoutScale: 1,
-        maxVisibleBodyHeight: Math.max(viewportHeight - 160, 640),
+        maxVisibleBodyHeight: Math.max(viewportHeight - 160, frame.size.height, 640),
         measuredNodeHeights,
         extraAreaColumns,
         allDesignFrames,
         editingCellId,
       }),
-    [allDesignFrames, doc, editingCellId, extraAreaColumns, measuredNodeHeights, viewportHeight, viewportWidth],
+    [
+      allDesignFrames,
+      doc,
+      editingCellId,
+      extraAreaColumns,
+      frame.size.height,
+      frame.size.width,
+      measuredNodeHeights,
+      viewportHeight,
+    ],
   );
 
   const metrics = layout.metrics;
@@ -479,6 +509,21 @@ function FlowWorkspaceInner({
       height: Math.max(1, element?.clientHeight ?? viewportHeight),
     };
   }, [viewportHeight, viewportWidth]);
+
+  const getClampedShellLocalPoint = useCallback(
+    (clientX: number, clientY: number) => {
+      const shellRect = shellRef.current?.getBoundingClientRect();
+      const fallbackSize = getCanvasSize();
+      const shellWidth = Math.max(1, shellRect?.width ?? fallbackSize.width);
+      const shellHeight = Math.max(1, shellRect?.height ?? fallbackSize.height);
+
+      return {
+        x: clamp(clientX - (shellRect?.left ?? 0), 0, shellWidth),
+        y: clamp(clientY - (shellRect?.top ?? 0), 0, shellHeight),
+      };
+    },
+    [getCanvasSize],
+  );
 
   const setClampedViewport = useCallback(
     (nextViewport: ViewportState | ((current: ViewportState) => ViewportState), lockAutoFit = true) => {
@@ -666,6 +711,17 @@ function FlowWorkspaceInner({
   const clearFocusMode = useCallback(() => {
     setFocusedCellId(null);
   }, []);
+
+  const handleBeginFrameResize = useCallback(
+    (event: ReactPointerEvent<HTMLButtonElement>) => {
+      autoFitEnabledRef.current = false;
+      onBeginFrameResize?.(event, frame.id, viewport.zoom, {
+        width: metrics.contentWidth,
+        height: metrics.contentHeight,
+      });
+    },
+    [frame.id, metrics.contentHeight, metrics.contentWidth, onBeginFrameResize, viewport.zoom],
+  );
 
   const enterFocusMode = useCallback(
     (cellId: string, areaId: string) => {
@@ -1050,16 +1106,16 @@ function FlowWorkspaceInner({
 
   const handleCanvasWheel = useCallback(
     (event: React.WheelEvent<HTMLDivElement>) => {
+      if (event.defaultPrevented) {
+        return;
+      }
+
       event.preventDefault();
       event.stopPropagation();
       autoFitEnabledRef.current = false;
       event.currentTarget.focus({ preventScroll: true });
 
-      const shellRect = shellRef.current?.getBoundingClientRect();
-      const localPoint = {
-        x: event.clientX - (shellRect?.left ?? 0),
-        y: event.clientY - (shellRect?.top ?? 0),
-      };
+      const localPoint = getClampedShellLocalPoint(event.clientX, event.clientY);
 
       const canvasSize = getCanvasSize();
       const gesture = resolveFlowWheelGesture({
@@ -1091,7 +1147,7 @@ function FlowWorkspaceInner({
         true,
       );
     },
-    [getCanvasSize, setClampedViewport, zoomByFactor],
+    [getCanvasSize, getClampedShellLocalPoint, setClampedViewport, zoomByFactor],
   );
 
   const handleCanvasDragOver = useCallback(
@@ -1176,7 +1232,46 @@ function FlowWorkspaceInner({
       suppressWheelZoomUntilRef.current = performance.now() + 260;
     };
 
+    const handleGlobalWheel = (event: WheelEvent) => {
+      if (event.defaultPrevented || shouldIgnoreGlobalFlowZoomTarget(event.target)) {
+        return;
+      }
+
+      const canvasSize = getCanvasSize();
+      const gesture = resolveFlowWheelGesture({
+        deltaX: event.deltaX,
+        deltaY: event.deltaY,
+        deltaZ: event.deltaZ,
+        deltaMode: event.deltaMode,
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+        shiftKey: event.shiftKey,
+        viewportWidth: canvasSize.width,
+        viewportHeight: canvasSize.height,
+      });
+
+      if (gesture.kind !== "zoom") {
+        return;
+      }
+
+      if (performance.now() < suppressWheelZoomUntilRef.current) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+
+      autoFitEnabledRef.current = false;
+      shellElement.focus({ preventScroll: true });
+      event.preventDefault();
+      event.stopPropagation();
+      zoomByFactor(gesture.factor, getClampedShellLocalPoint(event.clientX, event.clientY));
+    };
+
     const handleGestureStart = (event: Event) => {
+      if (shouldIgnoreGlobalFlowZoomTarget(event.target)) {
+        return;
+      }
+
       previousScale = 1;
       suppressWheelZoom();
       autoFitEnabledRef.current = false;
@@ -1185,34 +1280,40 @@ function FlowWorkspaceInner({
     };
 
     const handleGestureChange = (event: Event) => {
+      if (shouldIgnoreGlobalFlowZoomTarget(event.target)) {
+        return;
+      }
+
       const gestureEvent = event as WebKitGestureEvent;
-      const shellRect = shellElement.getBoundingClientRect();
       const nextScale = Number.isFinite(gestureEvent.scale) && gestureEvent.scale > 0 ? gestureEvent.scale : 1;
       const factor = nextScale / Math.max(previousScale, 0.0001);
       previousScale = nextScale;
       suppressWheelZoom();
-      zoomByFactor(factor, {
-        x: gestureEvent.clientX - shellRect.left,
-        y: gestureEvent.clientY - shellRect.top,
-      });
+      zoomByFactor(factor, getClampedShellLocalPoint(gestureEvent.clientX, gestureEvent.clientY));
       event.preventDefault();
     };
 
-    const handleGestureEnd = () => {
+    const handleGestureEnd = (event: Event) => {
+      if (shouldIgnoreGlobalFlowZoomTarget(event.target)) {
+        return;
+      }
+
       previousScale = 1;
       suppressWheelZoom();
     };
 
-    shellElement.addEventListener("gesturestart", handleGestureStart as EventListener, { passive: false });
-    shellElement.addEventListener("gesturechange", handleGestureChange as EventListener, { passive: false });
-    shellElement.addEventListener("gestureend", handleGestureEnd as EventListener);
+    window.addEventListener("wheel", handleGlobalWheel, { passive: false, capture: true });
+    window.addEventListener("gesturestart", handleGestureStart as EventListener, { passive: false, capture: true });
+    window.addEventListener("gesturechange", handleGestureChange as EventListener, { passive: false, capture: true });
+    window.addEventListener("gestureend", handleGestureEnd as EventListener, { capture: true });
 
     return () => {
-      shellElement.removeEventListener("gesturestart", handleGestureStart as EventListener);
-      shellElement.removeEventListener("gesturechange", handleGestureChange as EventListener);
-      shellElement.removeEventListener("gestureend", handleGestureEnd as EventListener);
+      window.removeEventListener("wheel", handleGlobalWheel, true);
+      window.removeEventListener("gesturestart", handleGestureStart as EventListener, true);
+      window.removeEventListener("gesturechange", handleGestureChange as EventListener, true);
+      window.removeEventListener("gestureend", handleGestureEnd as EventListener, true);
     };
-  }, [zoomByFactor]);
+  }, [getCanvasSize, getClampedShellLocalPoint, zoomByFactor]);
 
   useEffect(() => {
     if (!panState) {
@@ -1590,6 +1691,26 @@ function FlowWorkspaceInner({
     [inverseViewportScale],
   );
 
+  const getFloatingInsetSideRightStyle = useCallback(
+    (point: { x: number; y: number }) => ({
+      left: point.x,
+      top: point.y,
+      transform: `translate(-100%, -50%) scale(${inverseViewportScale})`,
+      transformOrigin: "center right",
+    }),
+    [inverseViewportScale],
+  );
+
+  const getFloatingBottomRightStyle = useCallback(
+    (point: { x: number; y: number }) => ({
+      left: point.x,
+      top: point.y,
+      transform: `translate(-100%, -100%) scale(${inverseViewportScale})`,
+      transformOrigin: "bottom right",
+    }),
+    [inverseViewportScale],
+  );
+
   const boardBusyLabel = boardBusyState === "agent"
     ? "Agent working"
     : boardBusyState === "story"
@@ -1697,32 +1818,38 @@ function FlowWorkspaceInner({
             <span>{boardSubtitle}</span>
           </div>
           <div className="flow-workspace__toolbar-actions">
-            {onExitToDesign ? (
-              <button type="button" onClick={onExitToDesign} aria-label="Design mode">
-                <LayoutDashboard size={13} /> Design
+            <div className="flow-workspace__toolbar-group flow-workspace__toolbar-group--general" aria-label="General canvas controls">
+              <button type="button" onClick={() => zoomByFactor(1 / 1.12)} aria-label="Zoom out">
+                -
               </button>
+              <button type="button" onClick={() => zoomByFactor(1.12)} aria-label="Zoom in">
+                +
+              </button>
+              <button type="button" onClick={resetViewport}>
+                Reset
+              </button>
+              <button type="button" onClick={() => fitWorkspace(true)}>
+                Fit
+              </button>
+            </div>
+            {focusContext ? (
+              <div className="flow-workspace__toolbar-group flow-workspace__toolbar-group--focus" aria-label="Focus mode controls">
+                <button type="button" className="flow-workspace__focus-btn" onClick={clearFocusMode}>
+                  Exit focus
+                </button>
+              </div>
             ) : null}
-            <button type="button" onClick={() => zoomByFactor(1 / 1.12)} aria-label="Zoom out">
-              -
-            </button>
-            <button type="button" onClick={() => zoomByFactor(1.12)} aria-label="Zoom in">
-              +
-            </button>
-            <button type="button" onClick={resetViewport}>
-              Reset
-            </button>
-            <button type="button" onClick={() => fitWorkspace(true)}>
-              Fit
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                void onCreateFlowBoard?.();
-              }}
-              className="flow-workspace__new-board-btn"
-            >
-              <Plus size={13} /> New board
-            </button>
+            <div className="flow-workspace__toolbar-group flow-workspace__toolbar-group--board" aria-label="Flow board controls">
+              <button
+                type="button"
+                onClick={() => {
+                  void onCreateFlowBoard?.();
+                }}
+                className="flow-workspace__new-board-btn"
+              >
+                <Plus size={13} /> New board
+              </button>
+            </div>
           </div>
         </div>
         <div className="flow-workspace__toolbar-secondary">
@@ -2061,8 +2188,8 @@ function FlowWorkspaceInner({
                       key={`extend-${area.id}`}
                       type="button"
                       className="flow-workspace__add-column-button"
-                      style={getFloatingSideAnchorStyle({
-                        x: areaMetric.left + areaMetric.width + 18,
+                      style={getFloatingInsetSideRightStyle({
+                        x: areaMetric.left + areaMetric.width - 18,
                         y: metrics.contentHeight / 2,
                       })}
                       onClick={(event) => {
@@ -2160,6 +2287,20 @@ function FlowWorkspaceInner({
                       }}
                     />
                   </svg>
+                ) : null}
+
+                {onBeginFrameResize ? (
+                  <button
+                    type="button"
+                    className="flow-workspace__frame-resize"
+                    style={getFloatingBottomRightStyle({
+                      x: metrics.contentWidth - 10,
+                      y: metrics.contentHeight - 10,
+                    })}
+                    onPointerDown={handleBeginFrameResize}
+                    aria-label="Resize flow board frame"
+                    title="Resize flow board frame"
+                  />
                 ) : null}
               </div>
             </div>

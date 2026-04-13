@@ -82,9 +82,9 @@ export function FlowChromeLayer({
                     className="flow-chrome-grid-cell"
                     style={{
                       left: column.left,
-                      top: lane.top + 10,
+                      top: lane.top + 12,
                       width: column.width,
-                      height: Math.max(36, lane.height - 20),
+                      height: Math.max(36, lane.height - 24),
                     }}
                   />
                 )),

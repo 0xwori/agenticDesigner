@@ -1,13 +1,21 @@
+import crypto from "node:crypto";
+
 import type {
   FlowBoardMemoryDocument,
   FlowBoardMemoryJourneyLaneId,
   FlowBoardMemoryState,
+  FlowDocument,
+  FlowLaneId,
+  FlowCell,
   JourneyStepArtifact,
   TechnicalBriefArtifact,
 } from "@designer/shared";
 import {
   createEmptyFlowBoardMemoryDocument,
   normalizeFlowBoardMemoryDocument,
+  normalizeFlowDocument,
+  resolveFlowArea,
+  resolveFlowInsertColumn,
 } from "@designer/shared";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
@@ -44,6 +52,11 @@ export interface FlowBoardMemoryProjection {
     artifact: TechnicalBriefArtifact;
     tags: string[];
   }>;
+}
+
+export interface FlowBoardMemorySyncResult {
+  flowDocument: FlowDocument;
+  snapshot: FlowBoardMemoryDocument;
 }
 
 export class FlowBoardMemoryParseError extends Error {
@@ -134,6 +147,141 @@ function parseJourneyKind(value: unknown, path: string): "step" | "decision" {
     return "decision";
   }
   throw new FlowBoardMemoryParseError("Journey kind must be either step or decision.", path);
+}
+
+function truncateInline(value: string, maxLength = 220): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
+}
+
+function appendDetailSection(lines: string[], label: string, values: string[], maxItems = 4) {
+  if (values.length === 0) {
+    return;
+  }
+
+  lines.push(`${label}:`);
+  for (const value of values.slice(0, maxItems)) {
+    lines.push(`  - ${truncateInline(value)}`);
+  }
+
+  if (values.length > maxItems) {
+    lines.push(`  - +${values.length - maxItems} more`);
+  }
+}
+
+function formatAuthoredYamlExcerpt(authoredText: string, maxLines = 18): string[] {
+  const trimmed = authoredText.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  const rawLines = trimmed.split(/\r?\n/).map((line) => line.slice(0, 220));
+  const excerpt = rawLines.slice(0, maxLines).map((line) => `  ${line}`);
+  if (rawLines.length > maxLines) {
+    excerpt.push(`  # ... ${rawLines.length - maxLines} more lines`);
+  }
+  return excerpt;
+}
+
+function isJourneyCell(cell: FlowCell): boolean {
+  return cell.artifact.type === "journey-step";
+}
+
+function isTechnicalCell(cell: FlowCell): boolean {
+  return cell.artifact.type === "technical-brief";
+}
+
+function isDesignFrameRefCell(cell: FlowCell): boolean {
+  return cell.artifact.type === "design-frame-ref";
+}
+
+function hasSameCellId(left?: { cellId?: string }, right?: { cellId?: string }) {
+  return typeof left?.cellId === "string" && left.cellId === right?.cellId;
+}
+
+function normalizeArtifactMappings(snapshot: FlowBoardMemoryDocument): FlowBoardMemoryDocument["artifactMappings"] {
+  const knownMemoryIds = new Set<string>([
+    ...snapshot.screens.map((screen) => screen.id),
+    ...snapshot.journey.map((node) => node.id),
+    ...snapshot.technicalNotes.map((note) => note.id),
+  ]);
+  const seen = new Set<string>();
+
+  return snapshot.artifactMappings.filter((mapping) => {
+    if (!knownMemoryIds.has(mapping.memoryId)) {
+      return false;
+    }
+    if (seen.has(mapping.memoryId)) {
+      return false;
+    }
+    seen.add(mapping.memoryId);
+    return true;
+  });
+}
+
+function buildProjectedMemoryCells(input: {
+  flowDocument: FlowDocument;
+  snapshot: FlowBoardMemoryDocument;
+}): Array<{
+  memoryId: string;
+  laneId: FlowLaneId;
+  artifact: JourneyStepArtifact | TechnicalBriefArtifact;
+  cellId: string;
+  preferredColumn?: number;
+  areaId: string;
+}> {
+  const normalizedDoc = normalizeFlowDocument(input.flowDocument);
+  const snapshot = normalizeFlowBoardMemoryDocument(input.snapshot);
+  const mappingByMemoryId = new Map(normalizeArtifactMappings(snapshot).map((mapping) => [mapping.memoryId, mapping]));
+  const existingCellsById = new Map(normalizedDoc.cells.map((cell) => [cell.id, cell]));
+  const fallbackAreaId = resolveFlowArea(normalizedDoc, undefined).id;
+
+  const projected = projectFlowBoardMemoryToArtifacts(snapshot);
+  const projectedCells: Array<{
+    memoryId: string;
+    laneId: FlowLaneId;
+    artifact: JourneyStepArtifact | TechnicalBriefArtifact;
+    cellId: string;
+    preferredColumn?: number;
+    areaId: string;
+  }> = [];
+
+  for (const item of projected.journeyArtifacts) {
+    const mappedCell = mappingByMemoryId.get(item.memoryId)?.cellId
+      ? existingCellsById.get(mappingByMemoryId.get(item.memoryId)?.cellId as string)
+      : undefined;
+    const existingCell = mappedCell && isJourneyCell(mappedCell) ? mappedCell : undefined;
+
+    projectedCells.push({
+      memoryId: item.memoryId,
+      laneId: item.laneId,
+      artifact: item.artifact,
+      cellId: existingCell?.id ?? crypto.randomUUID(),
+      preferredColumn: existingCell?.column,
+      areaId: existingCell?.areaId ?? fallbackAreaId,
+    });
+  }
+
+  for (const item of projected.technicalArtifacts) {
+    const mappedCell = mappingByMemoryId.get(item.memoryId)?.cellId
+      ? existingCellsById.get(mappingByMemoryId.get(item.memoryId)?.cellId as string)
+      : undefined;
+    const existingCell = mappedCell && isTechnicalCell(mappedCell) ? mappedCell : undefined;
+
+    projectedCells.push({
+      memoryId: item.memoryId,
+      laneId: "technical-briefing",
+      artifact: item.artifact,
+      cellId: existingCell?.id ?? crypto.randomUUID(),
+      preferredColumn: existingCell?.column,
+      areaId: existingCell?.areaId ?? fallbackAreaId,
+    });
+  }
+
+  return projectedCells;
 }
 
 export function parseFlowBoardMemoryText(authoredText: string): FlowBoardMemoryDocument {
@@ -314,15 +462,114 @@ export function projectFlowBoardMemoryToArtifacts(doc: FlowBoardMemoryDocument):
   };
 }
 
+export function syncFlowDocumentWithBoardMemory(
+  flowDocument: FlowDocument,
+  memoryDocument: FlowBoardMemoryDocument,
+): FlowBoardMemorySyncResult {
+  const normalizedDoc = normalizeFlowDocument(flowDocument);
+  const normalizedSnapshot = normalizeFlowBoardMemoryDocument(memoryDocument);
+  const sanitizedMappings = normalizeArtifactMappings(normalizedSnapshot);
+  const baseCells = normalizedDoc.cells.filter((cell) => !isJourneyCell(cell) && !isTechnicalCell(cell));
+  const projectedCells = buildProjectedMemoryCells({
+    flowDocument: normalizedDoc,
+    snapshot: {
+      ...normalizedSnapshot,
+      artifactMappings: sanitizedMappings,
+    },
+  });
+
+  let nextDoc: FlowDocument = {
+    ...normalizedDoc,
+    cells: [...baseCells],
+    connections: [...normalizedDoc.connections],
+  };
+
+  const nextMappings: FlowBoardMemoryDocument["artifactMappings"] = [];
+  const existingCellsById = new Map(normalizedDoc.cells.map((cell) => [cell.id, cell]));
+  const mappingByMemoryId = new Map(sanitizedMappings.map((mapping) => [mapping.memoryId, mapping]));
+
+  for (const screen of normalizedSnapshot.screens) {
+    const mapped = mappingByMemoryId.get(screen.id);
+    const mappedCell = mapped?.cellId ? existingCellsById.get(mapped.cellId) : undefined;
+    const inferredFrameRefCell = screen.frameId
+      ? normalizedDoc.cells.find(
+          (cell) => cell.artifact.type === "design-frame-ref" && cell.artifact.frameId === screen.frameId,
+        )
+      : undefined;
+    const cellId = mappedCell && isDesignFrameRefCell(mappedCell)
+      ? mappedCell.id
+      : inferredFrameRefCell?.id;
+
+    nextMappings.push({
+      memoryId: screen.id,
+      cellId,
+      frameId: screen.frameId,
+    });
+  }
+
+  for (const projectedCell of projectedCells) {
+    const column = resolveFlowInsertColumn(
+      nextDoc,
+      projectedCell.laneId,
+      projectedCell.preferredColumn,
+      undefined,
+      projectedCell.areaId,
+    );
+
+    nextDoc = {
+      ...nextDoc,
+      cells: [
+        ...nextDoc.cells,
+        {
+          id: projectedCell.cellId,
+          laneId: projectedCell.laneId,
+          column,
+          areaId: projectedCell.areaId,
+          artifact: projectedCell.artifact,
+        },
+      ],
+    };
+
+    nextMappings.push({
+      memoryId: projectedCell.memoryId,
+      cellId: projectedCell.cellId,
+    });
+  }
+
+  const survivingCellIds = new Set(nextDoc.cells.map((cell) => cell.id));
+  nextDoc = {
+    ...nextDoc,
+    connections: nextDoc.connections.filter(
+      (connection) => survivingCellIds.has(connection.fromCellId) && survivingCellIds.has(connection.toCellId),
+    ),
+  };
+
+  const nextSnapshot = normalizeFlowBoardMemoryDocument({
+    ...normalizedSnapshot,
+    artifactMappings: nextMappings.filter((mapping, index, array) =>
+      array.findIndex((candidate) => candidate.memoryId === mapping.memoryId && hasSameCellId(candidate, mapping)) === index,
+    ),
+  });
+  const nextState = createFlowBoardMemoryState({ snapshot: nextSnapshot });
+
+  return {
+    snapshot: nextSnapshot,
+    flowDocument: {
+      ...nextDoc,
+      boardMemory: nextState,
+    },
+  };
+}
+
 export function buildFlowBoardMemoryContext(memory?: FlowBoardMemoryState): string {
   if (!memory) {
     return "Board memory: (none)";
   }
 
   const snapshot = normalizeFlowBoardMemoryDocument(memory.snapshot);
-
-  return [
+  const lines = [
     "Board memory:",
+    `- updatedAt=${memory.updatedAt}`,
     `- goals=${snapshot.goals.length}`,
     `- assumptions=${snapshot.assumptions.length}`,
     `- entities=${snapshot.entities.length}`,
@@ -330,5 +577,80 @@ export function buildFlowBoardMemoryContext(memory?: FlowBoardMemoryState): stri
     `- journey=${snapshot.journey.length}`,
     `- technicalNotes=${snapshot.technicalNotes.length}`,
     `- openQuestions=${snapshot.openQuestions.length}`,
-  ].join("\n");
+    `- artifactMappings=${snapshot.artifactMappings.length}`,
+  ];
+
+  appendDetailSection(lines, "Goals", snapshot.goals);
+  appendDetailSection(lines, "Assumptions", snapshot.assumptions);
+  appendDetailSection(
+    lines,
+    "Screens",
+    snapshot.screens.map((screen) => {
+      const parts = [`${screen.id}: \"${screen.title}\"`];
+      if (screen.frameId) {
+        parts.push(`frameId=${screen.frameId}`);
+      }
+      if (screen.summary) {
+        parts.push(`summary=${screen.summary}`);
+      }
+      if (screen.notes.length > 0) {
+        parts.push(`notes=${screen.notes.join("; ")}`);
+      }
+      return parts.join(" | ");
+    }),
+  );
+  appendDetailSection(
+    lines,
+    "Journey",
+    snapshot.journey.map((node) => {
+      const parts = [`${node.id}: lane=${node.laneId}`, `kind=${node.kind}`, `title=\"${node.title}\"`];
+      if (node.screenId) {
+        parts.push(`screenId=${node.screenId}`);
+      }
+      if (node.notes.length > 0) {
+        parts.push(`notes=${node.notes.join("; ")}`);
+      }
+      return parts.join(" | ");
+    }),
+  );
+  appendDetailSection(
+    lines,
+    "Technical notes",
+    snapshot.technicalNotes.map((note) => {
+      const parts = [`${note.id}: title=\"${note.title}\"`];
+      if (note.language) {
+        parts.push(`language=${note.language}`);
+      }
+      if (note.tags.length > 0) {
+        parts.push(`tags=${note.tags.join(", ")}`);
+      }
+      if (note.body.trim().length > 0) {
+        parts.push(`body=${truncateInline(note.body, 160)}`);
+      }
+      return parts.join(" | ");
+    }),
+  );
+  appendDetailSection(lines, "Open questions", snapshot.openQuestions);
+  appendDetailSection(
+    lines,
+    "Artifact mappings",
+    snapshot.artifactMappings.map((mapping) => {
+      const parts = [`memoryId=${mapping.memoryId}`];
+      if (mapping.cellId) {
+        parts.push(`cellId=${mapping.cellId}`);
+      }
+      if (mapping.frameId) {
+        parts.push(`frameId=${mapping.frameId}`);
+      }
+      return parts.join(" | ");
+    }),
+  );
+
+  const authoredExcerpt = formatAuthoredYamlExcerpt(memory.authoredText);
+  if (authoredExcerpt.length > 0) {
+    lines.push("Authored YAML excerpt:");
+    lines.push(...authoredExcerpt);
+  }
+
+  return lines.join("\n");
 }

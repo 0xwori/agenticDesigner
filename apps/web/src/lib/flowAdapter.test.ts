@@ -3,6 +3,7 @@ import { createEmptyFlowDocument } from "@designer/shared";
 
 import {
   buildFlowBoardLayout,
+  buildFlowChromeAreas,
   createFlowLayoutMetrics,
   estimateFlowArtifactHeight,
   getFlowDocumentBounds,
@@ -132,6 +133,41 @@ describe("flowAdapter", () => {
     expect(metrics.contentHeight).toBeGreaterThanOrEqual(metrics.laneHeights[0] + 180 * 3);
   });
 
+  it("distributes extra frame height across all swimlanes", () => {
+    const metrics = createFlowLayoutMetrics(createEmptyFlowDocument(), {
+      frameWidth: 1400,
+      frameHeight: 1040,
+      headerHeight: 0,
+      allDesignFrames: [],
+    });
+
+    expect(metrics.contentHeight).toBe(1040);
+    expect(metrics.laneHeights).toEqual([260, 260, 260, 260]);
+    expect(getFlowLaneTop("normal-flow", metrics)).toBe(260);
+    expect(getFlowLaneTop("technical-briefing", metrics)).toBe(780);
+  });
+
+  it("distributes extra frame width across visible columns", () => {
+    const compactMetrics = createFlowLayoutMetrics(createEmptyFlowDocument(), {
+      frameWidth: 1200,
+      frameHeight: 900,
+      headerHeight: 0,
+      allDesignFrames: [],
+    });
+    const wideMetrics = createFlowLayoutMetrics(createEmptyFlowDocument(), {
+      frameWidth: 1600,
+      frameHeight: 900,
+      headerHeight: 0,
+      allDesignFrames: [],
+    });
+
+    expect(compactMetrics.nodeGap).toBe(32);
+    expect(wideMetrics.nodeGap).toBeGreaterThan(compactMetrics.nodeGap);
+    expect(wideMetrics.contentWidth).toBe(1600);
+    expect(wideMetrics.areas[0]?.width).toBeGreaterThan(compactMetrics.areas[0]?.width ?? 0);
+    expect(getFlowSlotLeft(1, wideMetrics, "area-1")).toBeGreaterThan(getFlowSlotLeft(1, compactMetrics, "area-1"));
+  });
+
   it("uses standard screen ratios by default and honors manual screen preview heights", () => {
     const referencedFrames = [
       {
@@ -164,6 +200,125 @@ describe("flowAdapter", () => {
 
     expect(standardHeight).toBeLessThan(260);
     expect(manualHeight).toBeGreaterThan(standardHeight);
+  });
+
+  it("keeps the first visible column aligned with the gutter boundary", () => {
+    const metrics = createFlowLayoutMetrics(createEmptyFlowDocument(), {
+      frameWidth: 1440,
+      frameHeight: 900,
+      headerHeight: 0,
+      allDesignFrames: [],
+    });
+    const chromeAreas = buildFlowChromeAreas(metrics);
+
+    expect(chromeAreas[0]?.gutterWidth).toBe(metrics.areas[0]?.slotLeft - metrics.areas[0]?.left);
+    expect(chromeAreas[0]?.gridColumns[0]?.left).toBe(chromeAreas[0]?.gutterWidth);
+  });
+
+  it("top-aligns screens and images inside taller lane cells", () => {
+    const referencedFrames = [
+      {
+        id: "frame-1",
+        projectId: "project-1",
+        name: "Desktop screen",
+        devicePreset: "desktop" as const,
+        mode: "high-fidelity" as const,
+        selected: false,
+        position: { x: 0, y: 0 },
+        size: { width: 1240, height: 1600 },
+        currentVersionId: null,
+        status: "ready" as const,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        versions: [],
+      },
+    ];
+
+    const result = buildFlowBoardLayout(
+      {
+        ...createEmptyFlowDocument(),
+        cells: [
+          {
+            id: "screen-ref",
+            laneId: "normal-flow" as const,
+            column: 0,
+            artifact: { type: "design-frame-ref" as const, frameId: "frame-1" },
+          },
+          {
+            id: "image-ref",
+            laneId: "unhappy-path" as const,
+            column: 0,
+            artifact: {
+              type: "uploaded-image" as const,
+              dataUrl: "data:image/png;base64,abc",
+              width: 1200,
+              height: 900,
+            },
+          },
+        ],
+      },
+      {
+        frameWidth: 1440,
+        frameHeight: 1280,
+        headerHeight: 0,
+        allDesignFrames: referencedFrames,
+      },
+    );
+
+    const screenCell = result.cells.find((cell) => cell.cellId === "screen-ref");
+    const imageCell = result.cells.find((cell) => cell.cellId === "image-ref");
+
+    expect(screenCell?.y).toBe(result.metrics.laneTops[1] + result.metrics.laneInnerPadding);
+    expect(imageCell?.y).toBe(result.metrics.laneTops[2] + result.metrics.laneInnerPadding);
+  });
+
+  it("ignores stale measured heights for manual screen previews", () => {
+    const referencedFrames = [
+      {
+        id: "frame-1",
+        projectId: "project-1",
+        name: "Desktop screen",
+        devicePreset: "desktop" as const,
+        mode: "high-fidelity" as const,
+        selected: false,
+        position: { x: 0, y: 0 },
+        size: { width: 1240, height: 2000 },
+        currentVersionId: null,
+        status: "ready" as const,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        versions: [],
+      },
+    ];
+    const manualArtifact = {
+      type: "design-frame-ref" as const,
+      frameId: "frame-1",
+      previewMode: "manual" as const,
+      previewHeight: 320,
+    };
+
+    const result = buildFlowBoardLayout(
+      {
+        ...createEmptyFlowDocument(),
+        cells: [
+          {
+            id: "screen-ref",
+            laneId: "normal-flow" as const,
+            column: 0,
+            artifact: manualArtifact,
+          },
+        ],
+      },
+      {
+        frameWidth: 1400,
+        frameHeight: 800,
+        headerHeight: 42,
+        measuredNodeHeights: { "screen-ref": 140 },
+        allDesignFrames: referencedFrames,
+      },
+    );
+
+    expect(result.cells[0]?.height).toBe(estimateFlowArtifactHeight(manualArtifact, 240, referencedFrames));
   });
 
   it("normalizes legacy edge handles when building board edges", () => {

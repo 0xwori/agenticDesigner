@@ -62,6 +62,12 @@ type ArtboardPaneProps = {
   onOpenFlowBoardMemory?: (frameId: string) => Promise<void> | void;
   onOpenFlowStory?: (frameId: string) => Promise<void>;
   activeFlowBoardTask?: "agent" | "story" | null;
+  onBeginFlowFrameResize?: (
+    event: PointerEvent<HTMLButtonElement>,
+    frameId: string,
+    pointerScale: number,
+    visibleSize: { width: number; height: number },
+  ) => void;
 };
 
 export function ArtboardPane(props: ArtboardPaneProps) {
@@ -108,6 +114,7 @@ export function ArtboardPane(props: ArtboardPaneProps) {
     onOpenFlowBoardMemory,
     onOpenFlowStory,
     activeFlowBoardTask,
+    onBeginFlowFrameResize,
   } = props;
 
   const [showImportPopover, setShowImportPopover] = useState(false);
@@ -314,6 +321,7 @@ export function ArtboardPane(props: ArtboardPaneProps) {
               onOpenBoardMemory={onOpenFlowBoardMemory}
               onOpenFlowStory={onOpenFlowStory}
               boardBusyState={activeFlowBoardTask}
+              onBeginFrameResize={onBeginFlowFrameResize}
             />
           ) : null
         ) : (

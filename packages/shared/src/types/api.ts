@@ -76,6 +76,36 @@ export interface FlowStoryResponse {
   summary: string;
 }
 
+export type FlowActionReviewSeverity = "modify" | "remove";
+
+export interface FlowActionReviewCommand {
+  command: FlowMutationCommand;
+  summary: string;
+  severity: FlowActionReviewSeverity;
+}
+
+export interface FlowActionResponse {
+  ok: boolean;
+  frameId: string;
+  commands: FlowMutationCommand[];
+  autoAppliedCommands: FlowMutationCommand[];
+  reviewRequiredCommands: FlowActionReviewCommand[];
+  flowDocument: FlowDocument;
+  summary: string;
+}
+
+export interface ApplyFlowActionRequest {
+  commands: FlowMutationCommand[];
+}
+
+export interface ApplyFlowActionResponse {
+  ok: boolean;
+  frameId: string;
+  appliedCommands: FlowMutationCommand[];
+  flowDocument: FlowDocument;
+  summary: string;
+}
+
 export type FlowAgentMode = "review" | "auto-apply";
 
 export type FlowAgentPhase =

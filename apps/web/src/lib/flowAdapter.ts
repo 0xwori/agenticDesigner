@@ -203,6 +203,30 @@ function scaleLayoutValue(value: number, scale: number) {
   return Math.max(1, Math.round(value * scale));
 }
 
+function distributeExtraHeightAcrossLanes(laneHeights: number[], targetContentHeight: number): number[] {
+  const currentHeight = laneHeights.reduce((sum, laneHeight) => sum + laneHeight, 0);
+  const extraHeight = Math.max(0, targetContentHeight - currentHeight);
+
+  if (extraHeight === 0 || laneHeights.length === 0) {
+    return laneHeights;
+  }
+
+  const baseExtraPerLane = Math.floor(extraHeight / laneHeights.length);
+  const remainder = extraHeight % laneHeights.length;
+
+  return laneHeights.map((laneHeight, index) => laneHeight + baseExtraPerLane + (index < remainder ? 1 : 0));
+}
+
+function distributeExtraWidthAcrossColumnGaps(baseGap: number, totalGapCount: number, targetContentWidth: number, minimumContentWidth: number): number {
+  const extraWidth = Math.max(0, targetContentWidth - minimumContentWidth);
+
+  if (extraWidth === 0 || totalGapCount === 0) {
+    return baseGap;
+  }
+
+  return baseGap + extraWidth / totalGapCount;
+}
+
 function getStandardPreviewAspectRatio(devicePreset?: FrameWithVersions["devicePreset"]): number {
   if (devicePreset === "iphone-15-pro-max") {
     return 932 / 430;
@@ -285,6 +309,28 @@ export function estimateFlowArtifactHeight(
   }
 }
 
+function resolveFlowArtifactNodeHeight(
+  cellId: string,
+  artifact: FlowArtifact,
+  nodeWidth: number,
+  measuredNodeHeights: MeasuredNodeHeights,
+  allDesignFrames: FrameWithVersions[] = [],
+  layoutScale = 1,
+): number {
+  const estimatedHeight = estimateFlowArtifactHeight(artifact, nodeWidth, allDesignFrames, layoutScale);
+
+  if (artifact.type === "design-frame-ref" && artifact.previewMode === "manual" && typeof artifact.previewHeight === "number") {
+    return estimatedHeight;
+  }
+
+  const measuredHeight = readMeasuredHeight(measuredNodeHeights, cellId);
+  return typeof measuredHeight === "number" && Number.isFinite(measuredHeight) ? measuredHeight : estimatedHeight;
+}
+
+function isTopAnchoredFlowArtifact(artifact: FlowArtifact): boolean {
+  return artifact.type === "design-frame-ref" || artifact.type === "uploaded-image";
+}
+
 export function createFlowLayoutMetrics(
   doc: Pick<FlowDocument, "areas" | "cells">,
   input: Pick<
@@ -294,7 +340,7 @@ export function createFlowLayoutMetrics(
 ): FlowLayoutMetrics {
   const layoutScale = input.layoutScale ?? 1;
   const labelWidth = scaleLayoutValue(LANE_LABEL_WIDTH, layoutScale);
-  const nodeGap = scaleLayoutValue(NODE_GAP, layoutScale);
+  const baseNodeGap = scaleLayoutValue(NODE_GAP, layoutScale);
   const nodePaddingLeft = scaleLayoutValue(NODE_PADDING_LEFT, layoutScale);
   const boardPaddingX = scaleLayoutValue(FLOW_BOARD_PADDING_X, layoutScale);
   const areaGap = scaleLayoutValue(FLOW_AREA_GAP, layoutScale);
@@ -302,11 +348,9 @@ export function createFlowLayoutMetrics(
   const laneInnerPadding = scaleLayoutValue(12, layoutScale);
   const minLaneHeight = scaleLayoutValue(MIN_FLOW_LANE_HEIGHT, layoutScale);
   const laneVerticalPadding = scaleLayoutValue(FLOW_LANE_VERTICAL_PADDING, layoutScale);
-  const availableWidth = Math.max(0, input.frameWidth - boardPaddingX * 2);
   const nodeWidth = scaleLayoutValue(NODE_WIDTH, layoutScale);
-  const slotStep = nodeWidth + nodeGap;
 
-  const sizedAreas = getFlowAreas(doc).map((area) => {
+  const areaDefinitions = getFlowAreas(doc).map((area) => {
     const sharedSpan = getFlowAreaColumnSpan(doc, area.id);
     const maxLocalColumn = doc.cells.reduce((current, cell) => {
       if (getFlowCellAreaId(doc, cell) !== area.id) {
@@ -317,8 +361,6 @@ export function createFlowLayoutMetrics(
     const extraColumns = Math.max(0, Math.floor(input.extraAreaColumns?.[area.id] ?? 0));
     const visibleColumnCount = Math.max(MIN_VISIBLE_COLUMNS, maxLocalColumn + 1);
     const localColumnCount = visibleColumnCount + extraColumns;
-    const slotWidth =
-      localColumnCount * nodeWidth + Math.max(0, localColumnCount - 1) * nodeGap;
     const endColumn = Math.max(sharedSpan.endColumn, area.columnOffset + Math.max(0, localColumnCount - 1));
     const startColumn = sharedSpan.startColumn;
 
@@ -329,6 +371,43 @@ export function createFlowLayoutMetrics(
       startColumn,
       endColumn,
       localColumnCount,
+    };
+  });
+
+  const totalColumnGapCount = areaDefinitions.reduce(
+    (sum, area) => sum + Math.max(0, area.localColumnCount - 1),
+    0,
+  );
+  const minimumContentWidth =
+    areaDefinitions.length > 0
+      ? boardPaddingX * 2 +
+        Math.max(0, areaDefinitions.length - 1) * areaGap +
+        areaDefinitions.reduce(
+          (sum, area) =>
+            sum +
+            areaFramePaddingX * 2 +
+            labelWidth +
+            nodePaddingLeft +
+            area.localColumnCount * nodeWidth +
+            Math.max(0, area.localColumnCount - 1) * baseNodeGap,
+          0,
+        )
+      : boardPaddingX * 2 + labelWidth + nodePaddingLeft + nodeWidth;
+  const nodeGap = distributeExtraWidthAcrossColumnGaps(
+    baseNodeGap,
+    totalColumnGapCount,
+    input.frameWidth,
+    minimumContentWidth,
+  );
+  const slotStep = nodeWidth + nodeGap;
+  const availableWidth = Math.max(0, Math.max(input.frameWidth, minimumContentWidth) - boardPaddingX * 2);
+
+  const sizedAreas = areaDefinitions.map((area) => {
+    const slotWidth =
+      area.localColumnCount * nodeWidth + Math.max(0, area.localColumnCount - 1) * nodeGap;
+
+    return {
+      ...area,
       slotWidth,
     };
   });
@@ -355,20 +434,26 @@ export function createFlowLayoutMetrics(
       ? Math.max(areaCursorX - areaGap + boardPaddingX, input.frameWidth)
       : Math.max(input.frameWidth, boardPaddingX * 2 + labelWidth + nodePaddingLeft + nodeWidth);
 
-  const laneHeights = FLOW_LANE_ORDER.map((laneId) => {
+  let laneHeights = FLOW_LANE_ORDER.map((laneId) => {
     const tallestNode = doc.cells
       .filter((cell) => cell.laneId === laneId)
       .reduce((maxHeight, cell) => {
-        const measuredHeight = readMeasuredHeight(input.measuredNodeHeights, cell.id);
-        const nextHeight =
-          typeof measuredHeight === "number" && Number.isFinite(measuredHeight)
-            ? measuredHeight
-            : estimateFlowArtifactHeight(cell.artifact, nodeWidth, input.allDesignFrames, layoutScale);
+        const nextHeight = resolveFlowArtifactNodeHeight(
+          cell.id,
+          cell.artifact,
+          nodeWidth,
+          input.measuredNodeHeights,
+          input.allDesignFrames,
+          layoutScale,
+        );
         return Math.max(maxHeight, nextHeight);
       }, 0);
 
     return Math.max(minLaneHeight, tallestNode + laneVerticalPadding);
   });
+
+  const minimumContentHeight = Math.max(input.frameHeight - input.headerHeight, FLOW_BODY_MIN_HEIGHT);
+  laneHeights = distributeExtraHeightAcrossLanes(laneHeights, minimumContentHeight);
 
   const laneTops: number[] = [];
   let contentHeight = 0;
@@ -583,7 +668,7 @@ export function buildFlowChromeAreas(metrics: FlowLayoutMetrics): FlowAreaChrome
     left: area.left,
     width: area.width,
     height: metrics.contentHeight,
-    gutterWidth: Math.max(metrics.labelWidth, area.slotLeft - area.left - Math.round(metrics.nodePaddingLeft / 2)),
+    gutterWidth: Math.max(metrics.labelWidth, area.slotLeft - area.left),
     gridColumns: Array.from({ length: area.localColumnCount }, (_, columnIndex) => ({
       left: area.slotLeft - area.left + columnIndex * metrics.slotStep,
       width: metrics.nodeWidth,
@@ -616,11 +701,18 @@ export function buildFlowBoardLayout(
     const globalColumn = getFlowGlobalColumn(doc, cell);
     const laneTop = getFlowLaneTop(cell.laneId, metrics);
     const laneHeight = getFlowLaneHeight(cell.laneId, metrics);
-    const nodeHeight =
-      readMeasuredHeight(options.measuredNodeHeights, cell.id) ??
-      estimateFlowArtifactHeight(artifact, metrics.nodeWidth, allDesignFrames, metrics.layoutScale);
+    const nodeHeight = resolveFlowArtifactNodeHeight(
+      cell.id,
+      artifact,
+      metrics.nodeWidth,
+      options.measuredNodeHeights,
+      allDesignFrames,
+      metrics.layoutScale,
+    );
     const x = getFlowSlotLeft(cell.column, metrics, areaId);
-    const y = laneTop + Math.max(metrics.laneInnerPadding, (laneHeight - nodeHeight) / 2);
+    const y = isTopAnchoredFlowArtifact(artifact)
+      ? laneTop + metrics.laneInnerPadding
+      : laneTop + Math.max(metrics.laneInnerPadding, (laneHeight - nodeHeight) / 2);
 
     cells.push({
       cellId: cell.id,

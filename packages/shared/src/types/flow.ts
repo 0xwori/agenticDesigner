@@ -964,6 +964,27 @@ export function applyFlowMutations(
   return result;
 }
 
+function truncateFlowMutationSummaryText(value: string, maxLength = 52): string {
+  const normalized = value.replace(/\s+/g, " ").trim().replace(/"/g, "'");
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
+}
+
+function describeFlowArtifactForSummary(artifact: FlowArtifact): string {
+  switch (artifact.type) {
+    case "journey-step":
+      return `journey step \"${truncateFlowMutationSummaryText(artifact.text || "Untitled step")}\"`;
+    case "technical-brief":
+      return `technical brief \"${truncateFlowMutationSummaryText(artifact.title || artifact.language || "Untitled brief")}\"`;
+    case "design-frame-ref":
+      return `linked screen \"${truncateFlowMutationSummaryText(artifact.frameId)}\"`;
+    case "uploaded-image":
+      return `uploaded image \"${truncateFlowMutationSummaryText(artifact.label || "image")}\"`;
+  }
+}
+
 /**
  * Build a human-readable summary of mutation commands.
  */
@@ -1001,7 +1022,7 @@ export function describeFlowMutations(
         parts.push(`Moved cell to column ${cmd.toColumn}`);
         break;
       case "update-cell":
-        parts.push(`Updated cell content`);
+        parts.push(`Updated ${describeFlowArtifactForSummary(cmd.artifact)}`);
         break;
     }
   }

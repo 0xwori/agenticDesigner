@@ -1,8 +1,10 @@
 import type {
+  ApplyFlowActionResponse,
   ComposerAttachment,
   DesignMode,
   DesignSystemMode,
   DevicePreset,
+  FlowActionResponse,
   FlowDocument,
   FlowStoryResponse,
   Frame,
@@ -364,6 +366,23 @@ export function updateFlowDocument(
   });
 }
 
+export function saveFlowBoardMemory(
+  apiBaseUrl: string,
+  frameId: string,
+  authoredText: string,
+) {
+  return request<{
+    ok: boolean;
+    frameId: string;
+    flowDocument: FlowDocument;
+    memoryText: string;
+    summary: string;
+  }>(apiBaseUrl, `/frames/${encodeURIComponent(frameId)}/board-memory`, {
+    method: "PATCH",
+    body: JSON.stringify({ authoredText })
+  });
+}
+
 export function sendFlowAction(
   apiBaseUrl: string,
   frameId: string,
@@ -376,15 +395,20 @@ export function sendFlowAction(
     focusedAreaId?: string;
   }
 ) {
-  return request<{
-    ok: boolean;
-    frameId: string;
-    commands: unknown[];
-    flowDocument: FlowDocument;
-    summary: string;
-  }>(apiBaseUrl, `/frames/${encodeURIComponent(frameId)}/flow-action`, {
+  return request<FlowActionResponse>(apiBaseUrl, `/frames/${encodeURIComponent(frameId)}/flow-action`, {
     method: "POST",
     body: JSON.stringify(payload)
+  });
+}
+
+export function applyFlowActionReview(
+  apiBaseUrl: string,
+  frameId: string,
+  reviewCommands: FlowActionResponse["reviewRequiredCommands"],
+) {
+  return request<ApplyFlowActionResponse>(apiBaseUrl, `/frames/${encodeURIComponent(frameId)}/flow-action/apply`, {
+    method: "POST",
+    body: JSON.stringify({ commands: reviewCommands.map((item) => item.command) })
   });
 }
 

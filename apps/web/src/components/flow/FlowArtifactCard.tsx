@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type {
   DesignFrameRefArtifact,
   FlowArtifact,
@@ -64,6 +64,19 @@ function getIntrinsicElementHeight(contentElement: HTMLElement): number {
   return Math.max(visibleContentHeight + getVerticalBoxModelHeight(visualElement), minimumDiamondHeight);
 }
 
+function getFramePreviewCardHeight(frameElement: HTMLElement): number {
+  const frameHeight = Math.max(
+    Math.ceil(frameElement.offsetHeight || 0),
+    Math.ceil(frameElement.clientHeight || 0),
+  );
+  const visualElement = frameElement.closest(".flow-rf-node__visual");
+  if (!(visualElement instanceof HTMLElement)) {
+    return frameHeight;
+  }
+
+  return Math.max(frameHeight + getVerticalBoxModelHeight(visualElement), 120);
+}
+
 function resolveRefFrameVersion(refFrame?: FrameWithVersions): FrameVersion | undefined {
   if (!refFrame) {
     return undefined;
@@ -125,6 +138,16 @@ export function FlowArtifactCard({
   const contentRef = useRef<HTMLDivElement | null>(null);
   const shape = artifact.type === "journey-step" ? (artifact.shape ?? "rectangle") : "rectangle";
   const isMediaArtifact = artifact.type === "design-frame-ref" || artifact.type === "uploaded-image";
+  const reportResolvedPreviewHeight = useCallback(
+    (height: number) => {
+      if (height <= 0) {
+        return;
+      }
+
+      onMeasure?.(cellId, height);
+    },
+    [cellId, onMeasure],
+  );
 
   const reportMeasurement = useCallback(() => {
     const element = contentRef.current;
@@ -238,6 +261,7 @@ export function FlowArtifactCard({
                 refFrame={refFrame}
                 buildPreviewDocument={buildPreviewDocument}
                 onLoad={reportMeasurement}
+                onResolvedHeightChange={reportResolvedPreviewHeight}
                 onChangeArtifact={(nextArtifact) => onUpdateArtifact?.(cellId, nextArtifact)}
               />
             ) : null}
@@ -283,12 +307,14 @@ function DesignFrameRefContent({
   refFrame,
   buildPreviewDocument,
   onLoad,
+  onResolvedHeightChange,
   onChangeArtifact,
 }: {
   artifact: DesignFrameRefArtifact;
   refFrame?: FrameWithVersions;
   buildPreviewDocument: (frameId: string, version?: FrameVersion, isBuilding?: boolean) => string;
   onLoad: () => void;
+  onResolvedHeightChange?: (height: number) => void;
   onChangeArtifact?: (artifact: DesignFrameRefArtifact) => void;
 }) {
   const previewFrameRef = useRef<HTMLDivElement | null>(null);
@@ -330,6 +356,19 @@ function DesignFrameRefContent({
     : previewMode === "content"
       ? contentDisplayHeight
       : standardDisplayHeight;
+
+  useLayoutEffect(() => {
+    if (!refFrame || !onResolvedHeightChange) {
+      return;
+    }
+
+    const frameElement = previewFrameRef.current;
+    if (!frameElement) {
+      return;
+    }
+
+    onResolvedHeightChange(getFramePreviewCardHeight(frameElement));
+  }, [onResolvedHeightChange, refFrame, resolvedDisplayHeight]);
 
   useEffect(() => {
     if (!refFrame) {

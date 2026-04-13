@@ -11,10 +11,11 @@ import type {
   ReferenceSource,
   SurfaceTarget
 } from "@designer/shared";
-import { createEmptyFlowDocument, isMobilePreset, normalizeFlowDocument } from "@designer/shared";
+import { createEmptyFlowDocument, FLOW_LANE_ORDER, isMobilePreset, normalizeFlowDocument } from "@designer/shared";
 import { select, type Selection } from "d3-selection";
 import { zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
 import {
+  applyFlowActionReview,
   calibrateProjectDesignSystem,
   clearBoard,
   createManualFrame,
@@ -23,6 +24,7 @@ import {
   getApiBaseUrl,
   getProjectBundle,
   resyncReference,
+  saveFlowBoardMemory,
   startEditRun,
   startGenerateRun,
   sendFlowAction,
@@ -75,7 +77,7 @@ import { AppStoreContext, createStore, useInputState, useProjectState, useRunSta
 import { usePipelineEvents } from "./hooks/usePipelineEvents";
 import { useDesignSystemWorkspace } from "./hooks/useDesignSystemWorkspace";
 import { useComposerAttachments } from "./hooks/useComposerAttachments";
-import type { AppState, CopyState, PromptEntry, RunMode } from "./types/ui";
+import type { AppState, CopyState, FlowMutationReviewState, PromptEntry, RunMode } from "./types/ui";
 
 type CopyStateMap = Record<string, { state: CopyState; logs: CaptureLogEntry[] }>;
 
@@ -100,6 +102,7 @@ type FlowBoardMemoryModalState = {
 };
 
 const FLOW_BOARD_AGENT_PROMPT = "Review this entire flow board. Improve the user journey end to end, add missing happy-path and unhappy-path steps, and add short technical briefings for API, SDK, auth, session, cache, refresh-on-load, and recovery where useful. Edit only this selected board.";
+const FRAME_AUTOFIT_SETTLE_MS = 700;
 
 function buildFlowBoardScopedPrompt(prompt: string) {
   const trimmedPrompt = prompt.trim();
@@ -111,6 +114,8 @@ function buildFlowBoardScopedPrompt(prompt: string) {
     "- Read the current board artifacts, linked screens, uploaded images, connections, and stored board memory before mutating anything.",
     "- Keep changes scoped to the selected board only.",
     "- Prefer improving existing structure over adding duplicates.",
+    "- When the request edits an existing card or code block, update the matching existing artifact in place instead of adding a duplicate.",
+    "- Use the existing cell id from the board context for in-place edits whenever possible.",
     "- If the request is broad, make a coherent end-to-end journey with concise technical notes where they materially help delivery.",
   ].join("\n");
 }
@@ -160,12 +165,23 @@ function buildFlowBoardMemoryPreview(flowDocument?: FlowDocument): { text: strin
     return { text: authoredText, persisted: true };
   }
 
+  const orderedCells = [...doc.cells].sort((left, right) => {
+    if (left.column !== right.column) {
+      return left.column - right.column;
+    }
+    const laneDelta = FLOW_LANE_ORDER.indexOf(left.laneId) - FLOW_LANE_ORDER.indexOf(right.laneId);
+    if (laneDelta !== 0) {
+      return laneDelta;
+    }
+    return left.id.localeCompare(right.id);
+  });
+
   const snapshot = doc.boardMemory?.snapshot ?? {
     version: 1 as const,
     goals: [],
     assumptions: [],
     entities: [],
-    screens: doc.cells.flatMap((cell) => {
+    screens: orderedCells.flatMap((cell) => {
       if (cell.artifact.type === "design-frame-ref") {
         return [{
           id: `screen-${cell.id}`,
@@ -187,23 +203,23 @@ function buildFlowBoardMemoryPreview(flowDocument?: FlowDocument): { text: strin
 
       return [];
     }),
-    journey: doc.cells
+    journey: orderedCells
       .flatMap((cell) =>
         cell.artifact.type === "journey-step"
           ? [{
               id: `journey-${cell.id}`,
               title: cell.artifact.text.trim() || `Step ${cell.column + 1}`,
-              laneId: cell.laneId,
+              lane: cell.laneId,
               kind: cell.artifact.shape === "diamond" ? "decision" : "step",
               notes: [],
             }]
           : [],
       )
       .sort((left, right) => left.id.localeCompare(right.id)),
-    technicalNotes: doc.cells.flatMap((cell) =>
+    technicalNotes: orderedCells.flatMap((cell) =>
       cell.artifact.type === "technical-brief"
         ? [{
-            id: `note-${cell.id}`,
+            id: `technical-note-${cell.id}`,
             title: cell.artifact.title.trim() || `Note ${cell.id}`,
             body: cell.artifact.body,
             language: cell.artifact.language,
@@ -212,7 +228,7 @@ function buildFlowBoardMemoryPreview(flowDocument?: FlowDocument): { text: strin
         : [],
     ),
     openQuestions: [],
-    artifactMappings: doc.cells.flatMap((cell) => {
+    artifactMappings: orderedCells.flatMap((cell) => {
       if (cell.artifact.type === "design-frame-ref") {
         return [{ memoryId: `screen-${cell.id}`, cellId: cell.id, frameId: cell.artifact.frameId }];
       }
@@ -223,7 +239,7 @@ function buildFlowBoardMemoryPreview(flowDocument?: FlowDocument): { text: strin
         return [{ memoryId: `journey-${cell.id}`, cellId: cell.id }];
       }
       if (cell.artifact.type === "technical-brief") {
-        return [{ memoryId: `note-${cell.id}`, cellId: cell.id }];
+        return [{ memoryId: `technical-note-${cell.id}`, cellId: cell.id }];
       }
       return [];
     }),
@@ -371,6 +387,8 @@ function AppContent() {
 
   const bundleRef = useRef(bundle);
   bundleRef.current = bundle;
+  const interactionRef = useRef(interaction);
+  interactionRef.current = interaction;
   const artboardViewportRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef(VIEWPORT_DEFAULT);
   const zoomBehaviorRef = useRef<ZoomBehavior<HTMLDivElement, unknown> | null>(null);
@@ -380,16 +398,38 @@ function AppContent() {
   const autoFitAppliedVersionsRef = useRef<Set<string>>(new Set());
   const autoFitSuppressedVersionsRef = useRef<Set<string>>(new Set());
   const autoFitPendingVersionsRef = useRef<Set<string>>(new Set());
+  const autoFitSettleTimersRef = useRef<Map<string, number>>(new Map());
   const contentHeightsRef = useRef<Map<string, number>>(new Map());
   const frameHeightModeRef = useRef<Map<string, "standard" | "content">>(new Map());
   const framePromptsRef = useRef<Map<string, string>>(new Map());
   const [framePromptsVersion, setFramePromptsVersion] = useState(0);
   const [focusedFlowAreaId, setFocusedFlowAreaId] = useState<string | null>(null);
 
+  const clearAutoFitTimer = useCallback((versionKey: string) => {
+    const timerId = autoFitSettleTimersRef.current.get(versionKey);
+    if (typeof timerId === "number") {
+      window.clearTimeout(timerId);
+      autoFitSettleTimersRef.current.delete(versionKey);
+    }
+  }, []);
+
+  const clearAllAutoFitTimers = useCallback(() => {
+    for (const timerId of autoFitSettleTimersRef.current.values()) {
+      window.clearTimeout(timerId);
+    }
+    autoFitSettleTimersRef.current.clear();
+  }, []);
+
   // Stable ref for openProjectDesignSystem — written after dsWorkspace is created
   const openProjectDesignSystemRef = useRef<() => Promise<void>>(async () => {});
 
   const projectId = bundle?.project.id ?? null;
+
+  useEffect(() => {
+    return () => {
+      clearAllAutoFitTimers();
+    };
+  }, [clearAllAutoFitTimers]);
 
   // ---------------------------------------------------------------------------
   // Feature hooks
@@ -430,6 +470,7 @@ function AppContent() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [flowBoardTask, setFlowBoardTask] = useState<FlowBoardTaskState | null>(null);
+  const [flowMutationReviews, setFlowMutationReviews] = useState<Record<string, FlowMutationReviewState>>({});
   const [flowStoryModal, setFlowStoryModal] = useState<FlowStoryModalState>({
     open: false,
     frameId: null,
@@ -443,6 +484,9 @@ function AppContent() {
     frameId: null,
   });
   const [flowBoardMemoryCopied, setFlowBoardMemoryCopied] = useState(false);
+  const [flowBoardMemoryDraft, setFlowBoardMemoryDraft] = useState("");
+  const [flowBoardMemorySaving, setFlowBoardMemorySaving] = useState(false);
+  const [flowBoardMemoryError, setFlowBoardMemoryError] = useState<string | null>(null);
   const showToast = useCallback((msg: string, durationMs = 5000) => {
     setToastMessage(msg);
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -541,60 +585,120 @@ function AppContent() {
       contentHeightsRef.current.set(frameId, computedContentHeight);
 
       const versionKey = `${frameId}:${versionId}`;
+      const currentMode = frameHeightModeRef.current.get(frameId) ?? "content";
+      if (currentMode !== "content") {
+        clearAutoFitTimer(versionKey);
+        return;
+      }
+
+      const activeInteraction = interactionRef.current;
+      if (activeInteraction?.type === "resize" && activeInteraction.frameId === frameId) {
+        clearAutoFitTimer(versionKey);
+        return;
+      }
+
+      if (autoFitSuppressedVersionsRef.current.has(versionKey)) {
+        clearAutoFitTimer(versionKey);
+        return;
+      }
+
       if (
-        autoFitSuppressedVersionsRef.current.has(versionKey) ||
+        autoFitAppliedVersionsRef.current.has(versionKey) ||
         autoFitPendingVersionsRef.current.has(versionKey)
       ) {
         return;
       }
 
-      const nextHeight = computedContentHeight;
-      const currentHeight = frame.size.height;
-      autoFitAppliedVersionsRef.current.add(versionKey);
+      clearAutoFitTimer(versionKey);
+      const timerId = window.setTimeout(() => {
+        autoFitSettleTimersRef.current.delete(versionKey);
 
-      if (Math.abs(nextHeight - currentHeight) < 8) {
-        return;
-      }
-
-      autoFitPendingVersionsRef.current.add(versionKey);
-      setBundle((current) => {
-        if (!current) {
-          return current;
+        const settledBundle = bundleRef.current;
+        if (!settledBundle) {
+          return;
         }
-        return {
-          ...current,
-          frames: current.frames.map((item) =>
-            item.id === frameId
-              ? {
-                  ...item,
-                  size: {
-                    ...item.size,
-                    height: nextHeight
+
+        const settledFrame = settledBundle.frames.find((item) => item.id === frameId);
+        if (!settledFrame) {
+          return;
+        }
+
+        const settledVersion = settledFrame.versions[settledFrame.versions.length - 1];
+        if (!settledVersion || settledVersion.id !== versionId) {
+          return;
+        }
+
+        if ((frameHeightModeRef.current.get(frameId) ?? "content") !== "content") {
+          return;
+        }
+
+        const currentInteraction = interactionRef.current;
+        if (currentInteraction?.type === "resize" && currentInteraction.frameId === frameId) {
+          return;
+        }
+
+        if (
+          autoFitSuppressedVersionsRef.current.has(versionKey) ||
+          autoFitAppliedVersionsRef.current.has(versionKey) ||
+          autoFitPendingVersionsRef.current.has(versionKey)
+        ) {
+          return;
+        }
+
+        const nextHeight = contentHeightsRef.current.get(frameId);
+        if (typeof nextHeight !== "number" || !Number.isFinite(nextHeight)) {
+          return;
+        }
+
+        const currentHeight = settledFrame.size.height;
+        autoFitAppliedVersionsRef.current.add(versionKey);
+
+        if (Math.abs(nextHeight - currentHeight) < 8) {
+          return;
+        }
+
+        autoFitPendingVersionsRef.current.add(versionKey);
+        setBundle((current) => {
+          if (!current) {
+            return current;
+          }
+          return {
+            ...current,
+            frames: current.frames.map((item) =>
+              item.id === frameId
+                ? {
+                    ...item,
+                    size: {
+                      ...item.size,
+                      height: nextHeight
+                    }
                   }
-                }
-              : item
-          )
-        };
-      });
-
-      void updateFrameLayout(getApiBaseUrl(preferences.apiBaseUrl), frameId, {
-        size: {
-          width: frame.size.width,
-          height: nextHeight
-        }
-      })
-        .catch((reason) => {
-          autoFitAppliedVersionsRef.current.delete(versionKey);
-          pushDebugLog("frame-autofit", reason, { frameId, versionId, nextHeight }, "warn");
-        })
-        .finally(() => {
-          autoFitPendingVersionsRef.current.delete(versionKey);
+                : item
+            )
+          };
         });
+
+        void updateFrameLayout(getApiBaseUrl(preferences.apiBaseUrl), frameId, {
+          size: {
+            width: settledFrame.size.width,
+            height: nextHeight
+          }
+        })
+          .catch((reason) => {
+            autoFitAppliedVersionsRef.current.delete(versionKey);
+            pushDebugLog("frame-autofit", reason, { frameId, versionId, nextHeight }, "warn");
+          })
+          .finally(() => {
+            autoFitPendingVersionsRef.current.delete(versionKey);
+          });
+      }, FRAME_AUTOFIT_SETTLE_MS);
+
+      autoFitSettleTimersRef.current.set(versionKey, timerId);
     };
 
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [preferences.apiBaseUrl, pushDebugLog]);
+  }, [clearAutoFitTimer, preferences.apiBaseUrl, pushDebugLog]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -696,7 +800,9 @@ function AppContent() {
     }
 
     const onPointerMove = (event: PointerEvent) => {
-      const scale = Math.max(0.001, viewportRef.current.scale);
+      const scale = interaction.type === "resize"
+        ? Math.max(0.001, interaction.pointerScale)
+        : Math.max(0.001, viewportRef.current.scale);
       setBundle((current) => {
         if (!current) {
           return current;
@@ -725,13 +831,14 @@ function AppContent() {
             return {
               ...frame,
               size: {
-                width: isMobilePreset(frame.devicePreset)
+                width: frame.frameKind === "flow"
+                  ? Math.max(960, interaction.originWidth + scaledDeltaX)
+                  : isMobilePreset(frame.devicePreset)
                   ? frame.size.width
                   : Math.max(220, interaction.originWidth + scaledDeltaX),
-                height:
-                  frame.frameKind === "flow"
-                    ? frame.size.height
-                    : Math.max(260, interaction.originHeight + scaledDeltaY)
+                height: frame.frameKind === "flow"
+                  ? Math.max(640, interaction.originHeight + scaledDeltaY)
+                  : Math.max(260, interaction.originHeight + scaledDeltaY)
               }
             };
           })
@@ -954,6 +1061,7 @@ function AppContent() {
       autoFitAppliedVersionsRef.current.clear();
       autoFitSuppressedVersionsRef.current.clear();
       autoFitPendingVersionsRef.current.clear();
+      clearAllAutoFitTimers();
       pushDebugLog("clear-board", "Board cleared", { projectId }, "info");
     } catch (reason) {
       pushDebugLog("clear-board", reason, { projectId }, "error");
@@ -1663,20 +1771,33 @@ function AppContent() {
     });
   }
 
-  function beginResize(event: React.PointerEvent, frameId: string) {
+  function beginResize(
+    event: React.PointerEvent,
+    frameId: string,
+    pointerScale = viewportRef.current.scale,
+    visibleSize?: { width: number; height: number },
+  ) {
     event.preventDefault();
     event.stopPropagation();
     const frame = bundle?.frames.find((item) => item.id === frameId);
     if (!frame) {
       return;
     }
+
+    const currentVersionId = frame.currentVersionId || frame.versions[frame.versions.length - 1]?.id;
+    if (currentVersionId) {
+      clearAutoFitTimer(`${frame.id}:${currentVersionId}`);
+      autoFitSuppressedVersionsRef.current.add(`${frame.id}:${currentVersionId}`);
+    }
+
     setInteraction({
       type: "resize",
       frameId,
-      originWidth: frame.size.width,
-      originHeight: frame.size.height,
+      originWidth: Math.max(frame.size.width, Math.round(visibleSize?.width ?? frame.size.width)),
+      originHeight: Math.max(frame.size.height, Math.round(visibleSize?.height ?? frame.size.height)),
       startX: event.clientX,
-      startY: event.clientY
+      startY: event.clientY,
+      pointerScale: Math.max(0.001, pointerScale)
     });
   }
 
@@ -1707,6 +1828,7 @@ function AppContent() {
     const latestVersion = frame.versions[frame.versions.length - 1];
     if (latestVersion) {
       const versionKey = `${frameId}:${latestVersion.id}`;
+      clearAutoFitTimer(versionKey);
       if (nextMode === "standard") {
         autoFitSuppressedVersionsRef.current.add(versionKey);
       } else {
@@ -2073,9 +2195,86 @@ function AppContent() {
     () => (flowBoardMemoryFrame ? buildFlowBoardMemoryPreview(flowBoardMemoryFrame.flowDocument) : null),
     [flowBoardMemoryFrame],
   );
+  const flowBoardMemoryBaseline = flowBoardMemoryPreview?.text ?? "";
+  const flowBoardMemoryDirty = flowBoardMemoryModal.open && flowBoardMemoryDraft !== flowBoardMemoryBaseline;
 
   function applyFlowDocumentFromServer(frameId: string, doc: FlowDocument) {
     setBundle((current) => replaceFlowDocumentInBundle(current, frameId, doc));
+  }
+
+  function setFlowMutationReview(
+    runId: string,
+    updater: (current: FlowMutationReviewState | null) => FlowMutationReviewState | null,
+  ) {
+    setFlowMutationReviews((current) => {
+      const nextValue = updater(current[runId] ?? null);
+      if (!nextValue) {
+        if (!(runId in current)) {
+          return current;
+        }
+
+        const { [runId]: _removed, ...rest } = current;
+        return rest;
+      }
+
+      return {
+        ...current,
+        [runId]: nextValue,
+      };
+    });
+  }
+
+  async function approveFlowMutationReview(runId: string) {
+    const review = flowMutationReviews[runId];
+    if (!review || review.status !== "pending") {
+      return;
+    }
+
+    setFlowMutationReview(runId, (current) => current ? { ...current, status: "applying", error: null } : current);
+
+    try {
+      const result = await applyFlowActionReview(
+        getApiBaseUrl(preferences.apiBaseUrl),
+        review.frameId,
+        review.commands,
+      );
+      applyFlowDocumentFromServer(review.frameId, result.flowDocument);
+      appendChatEvent({
+        runId,
+        stage: "system",
+        status: "success",
+        kind: "action",
+        message: result.summary,
+      });
+      setFlowMutationReview(runId, (current) => current ? { ...current, status: "applied", error: null } : current);
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      setFlowMutationReview(runId, (current) => current ? { ...current, status: "failed", error: message } : current);
+      appendChatEvent({
+        runId,
+        stage: "system",
+        status: "error",
+        kind: "action",
+        message: `Flow review apply failed: ${message}`,
+      });
+      pushDebugLog("flow-action-apply", reason, { runId, frameId: review.frameId }, "error");
+    }
+  }
+
+  function rejectFlowMutationReview(runId: string) {
+    const review = flowMutationReviews[runId];
+    if (!review || review.status !== "pending") {
+      return;
+    }
+
+    setFlowMutationReview(runId, (current) => current ? { ...current, status: "rejected", error: null } : current);
+    appendChatEvent({
+      runId,
+      stage: "system",
+      status: "info",
+      kind: "action",
+      message: "Pending board changes were discarded.",
+    });
   }
 
   async function runFlowBoardAction(input: {
@@ -2126,6 +2325,19 @@ function AppContent() {
 
       if (result.flowDocument) {
         applyFlowDocumentFromServer(frame.id, result.flowDocument);
+      }
+
+      if (result.reviewRequiredCommands.length > 0) {
+        setFlowMutationReview(flowRunId, () => ({
+          runId: flowRunId,
+          frameId: frame.id,
+          summary: result.summary,
+          commands: result.reviewRequiredCommands,
+          status: "pending",
+          error: null,
+        }));
+      } else {
+        setFlowMutationReview(flowRunId, () => null);
       }
 
       appendChatEvent({
@@ -2277,18 +2489,45 @@ function AppContent() {
   }
 
   async function copyFlowBoardMemoryToClipboard() {
-    const frameId = flowBoardMemoryModal.frameId;
-    const frame = bundleRef.current?.frames.find((candidate) => candidate.id === frameId) ?? null;
-    if (!frame || frame.frameKind !== "flow") {
+    if (!flowBoardMemoryDraft.trim()) {
       return;
     }
 
     try {
-      await navigator.clipboard.writeText(buildFlowBoardMemoryPreview(frame.flowDocument).text);
+      await navigator.clipboard.writeText(flowBoardMemoryDraft);
       setFlowBoardMemoryCopied(true);
       window.setTimeout(() => setFlowBoardMemoryCopied(false), 1200);
     } catch (reason) {
-      pushDebugLog("flow-board-memory-copy", reason, { frameId }, "warn");
+      pushDebugLog("flow-board-memory-copy", reason, { frameId: flowBoardMemoryModal.frameId }, "warn");
+    }
+  }
+
+  async function saveFlowBoardMemoryDraftToServer() {
+    const frameId = flowBoardMemoryModal.frameId;
+    if (!frameId) {
+      return;
+    }
+
+    setFlowBoardMemorySaving(true);
+    setFlowBoardMemoryError(null);
+
+    try {
+      const result = await saveFlowBoardMemory(
+        getApiBaseUrl(preferences.apiBaseUrl),
+        frameId,
+        flowBoardMemoryDraft,
+      );
+      applyFlowDocumentFromServer(frameId, result.flowDocument);
+      setFlowBoardMemoryDraft(
+        result.memoryText || result.flowDocument.boardMemory?.authoredText || buildFlowBoardMemoryPreview(result.flowDocument).text,
+      );
+      showToast("Board memory saved", 2400);
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      setFlowBoardMemoryError(message);
+      pushDebugLog("flow-board-memory-save", reason, { frameId }, "error");
+    } finally {
+      setFlowBoardMemorySaving(false);
     }
   }
 
@@ -2477,6 +2716,9 @@ function AppContent() {
         eventCapReached={chatEvents.length >= 420}
         canvasMode={canvasMode}
         activeFlowBoardName={activeFlowFrame?.name ?? null}
+        flowMutationReviews={flowMutationReviews}
+        onApproveFlowMutationReview={approveFlowMutationReview}
+        onRejectFlowMutationReview={rejectFlowMutationReview}
       />
 
       <WorkspaceSettingsModal
@@ -2575,15 +2817,24 @@ function AppContent() {
       <FlowBoardMemoryModal
         open={flowBoardMemoryModal.open}
         boardName={flowBoardMemoryFrame?.name ?? null}
-        memoryText={flowBoardMemoryPreview?.text ?? ""}
+        memoryText={flowBoardMemoryDraft}
         copied={flowBoardMemoryCopied}
         persisted={flowBoardMemoryPreview?.persisted ?? false}
+        dirty={flowBoardMemoryDirty}
+        saving={flowBoardMemorySaving}
+        error={flowBoardMemoryError}
         onClose={() => {
           setFlowBoardMemoryCopied(false);
+          setFlowBoardMemoryError(null);
+          setFlowBoardMemorySaving(false);
           setFlowBoardMemoryModal({ open: false, frameId: null });
         }}
         onCopy={() => {
           void copyFlowBoardMemoryToClipboard();
+        }}
+        onChangeMemoryText={setFlowBoardMemoryDraft}
+        onSave={() => {
+          void saveFlowBoardMemoryDraftToServer();
         }}
       />
 
@@ -2637,11 +2888,17 @@ function AppContent() {
           });
         }}
         onOpenFlowBoardMemory={(frameId) => {
+          const frame = bundleRef.current?.frames.find((candidate) => candidate.id === frameId && candidate.frameKind === "flow") ?? null;
+          const preview = frame ? buildFlowBoardMemoryPreview(frame.flowDocument) : null;
           setFlowBoardMemoryCopied(false);
+          setFlowBoardMemoryError(null);
+          setFlowBoardMemorySaving(false);
+          setFlowBoardMemoryDraft(preview?.text ?? "version: 1\n");
           setFlowBoardMemoryModal({ open: true, frameId });
         }}
         onOpenFlowStory={openFlowStoryExport}
         activeFlowBoardTask={activeFlowFrame && flowBoardTask?.frameId === activeFlowFrame.id ? flowBoardTask.kind : null}
+        onBeginFlowFrameResize={beginResize}
       />
 
       {captureFrame ? (

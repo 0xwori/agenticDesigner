@@ -1,5 +1,16 @@
 import type { CaptureLogEntry } from "../lib/figmaCapture";
-import type { ComposerAttachment, DesignMode, DesignSystemMode, DevicePreset, FrameKind, PipelineEvent, ProviderId, ProjectBundle, SurfaceTarget } from "@designer/shared";
+import type {
+  ComposerAttachment,
+  DesignMode,
+  DesignSystemMode,
+  DevicePreset,
+  FlowActionReviewCommand,
+  FrameKind,
+  PipelineEvent,
+  ProviderId,
+  ProjectBundle,
+  SurfaceTarget,
+} from "@designer/shared";
 
 export type CanvasMode = "design" | "flow";
 export type RunMode = "new-frame" | "edit-selected";
@@ -64,7 +75,17 @@ export type InteractionState =
       originHeight: number;
       startX: number;
       startY: number;
+      pointerScale: number;
     };
+
+export type FlowMutationReviewState = {
+  runId: string;
+  frameId: string;
+  summary: string;
+  commands: FlowActionReviewCommand[];
+  status: "pending" | "applying" | "applied" | "rejected" | "failed";
+  error?: string | null;
+};
 
 export type PendingCanvasCard = {
   id: string;

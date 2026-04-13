@@ -7,8 +7,10 @@ import {
   parseFlowBoardMemoryText,
   projectFlowBoardMemoryToArtifacts,
   serializeFlowBoardMemoryDocument,
+  syncFlowDocumentWithBoardMemory,
   updateFlowBoardMemoryStateFromText,
 } from "./flowBoardMemory.js";
+import { createEmptyFlowDocument } from "@designer/shared";
 
 describe("flowBoardMemory", () => {
   it("parses a YAML-like board memory document into a canonical snapshot", () => {
@@ -117,5 +119,89 @@ journey:
       kind: "step",
     });
     expect(buildFlowBoardMemoryContext(updated)).toContain("journey=1");
+    expect(buildFlowBoardMemoryContext(updated)).toContain("Reduce drop-off before payment");
+    expect(buildFlowBoardMemoryContext(updated)).toContain('title="Review cart"');
+  });
+
+  it("syncs board-memory artifacts back into the flow document with stable mappings", () => {
+    const synced = syncFlowDocumentWithBoardMemory(
+      {
+        ...createEmptyFlowDocument(),
+        cells: [
+          {
+            id: "design-1",
+            laneId: "normal-flow",
+            column: 0,
+            artifact: { type: "design-frame-ref", frameId: "frame-1" },
+          },
+          {
+            id: "journey-cell",
+            laneId: "user-journey",
+            column: 0,
+            artifact: { type: "journey-step", text: "Legacy browse" },
+          },
+          {
+            id: "tech-cell",
+            laneId: "technical-briefing",
+            column: 1,
+            artifact: { type: "technical-brief", title: "Legacy API", language: "http", body: "GET /legacy" },
+          },
+        ],
+        connections: [
+          {
+            id: "conn-1",
+            fromCellId: "journey-cell",
+            toCellId: "design-1",
+          },
+        ],
+      },
+      parseFlowBoardMemoryText(`
+version: 1
+screens:
+  - id: browse-screen
+    title: Browse products
+    frameId: frame-1
+journey:
+  - id: browse-step
+    title: Browse products
+    lane: user-journey
+technicalNotes:
+  - id: api-brief
+    title: Browse API
+    body: GET /products
+    language: http
+artifactMappings:
+  - memoryId: browse-step
+    cellId: journey-cell
+  - memoryId: api-brief
+    cellId: tech-cell
+`),
+    );
+
+    expect(synced.flowDocument.cells).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "journey-cell",
+          laneId: "user-journey",
+          artifact: expect.objectContaining({ type: "journey-step", text: "Browse products" }),
+        }),
+        expect.objectContaining({
+          id: "tech-cell",
+          laneId: "technical-briefing",
+          artifact: expect.objectContaining({ type: "technical-brief", title: "Browse API", body: "GET /products" }),
+        }),
+      ]),
+    );
+    expect(synced.flowDocument.connections).toEqual([
+      expect.objectContaining({ id: "conn-1", fromCellId: "journey-cell", toCellId: "design-1" }),
+    ]);
+    expect(synced.snapshot.artifactMappings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ memoryId: "browse-screen", cellId: "design-1", frameId: "frame-1" }),
+        expect.objectContaining({ memoryId: "browse-step", cellId: "journey-cell" }),
+        expect.objectContaining({ memoryId: "api-brief", cellId: "tech-cell" }),
+      ]),
+    );
+    expect(synced.flowDocument.boardMemory?.authoredText).toContain("artifactMappings:");
   });
 });

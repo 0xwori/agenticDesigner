@@ -6,8 +6,13 @@ type FlowBoardMemoryModalProps = {
   memoryText: string;
   copied: boolean;
   persisted: boolean;
+  dirty: boolean;
+  saving: boolean;
+  error: string | null;
   onClose: () => void;
   onCopy: () => void;
+  onChangeMemoryText: (value: string) => void;
+  onSave: () => void;
 };
 
 export function FlowBoardMemoryModal({
@@ -16,8 +21,13 @@ export function FlowBoardMemoryModal({
   memoryText,
   copied,
   persisted,
+  dirty,
+  saving,
+  error,
   onClose,
   onCopy,
+  onChangeMemoryText,
+  onSave,
 }: FlowBoardMemoryModalProps) {
   if (!open) {
     return null;
@@ -48,13 +58,37 @@ export function FlowBoardMemoryModal({
               <strong>{persisted ? "Saved board memory" : "Derived preview from current board"}</strong>
             </div>
             <div className="flow-story-modal__meta-actions">
+              <span>{dirty ? "Unsaved changes" : persisted ? "Synced" : "Preview"}</span>
               {copied ? <span className="flow-story-modal__copied">Copied</span> : null}
+              <button
+                type="button"
+                className="flow-board-memory-modal__save-btn"
+                onClick={onSave}
+                disabled={saving || !dirty}
+              >
+                {saving ? "Saving..." : dirty ? "Save and sync" : "Saved"}
+              </button>
             </div>
           </section>
 
+          {error ? (
+            <section className="workspace-modal__section flow-story-modal__error">
+              <h3>Board memory save failed</h3>
+              <p className="workspace-modal__hint">{error}</p>
+            </section>
+          ) : null}
+
           <section className="workspace-modal__section">
             <h3>YAML</h3>
-            <pre className="flow-board-memory-modal__code">{memoryText || "# No board memory available yet."}</pre>
+            <p className="workspace-modal__hint">
+              Saving updates the board-scoped memory document and resynchronizes mapped journey and technical notes on this board.
+            </p>
+            <textarea
+              className="flow-board-memory-modal__textarea"
+              value={memoryText}
+              onChange={(event) => onChangeMemoryText(event.target.value)}
+              spellCheck={false}
+            />
           </section>
         </div>
       </div>

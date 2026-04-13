@@ -160,8 +160,12 @@ body{font-family:ui-sans-serif,system-ui,sans-serif;display:grid;place-items:cen
         <script type="text/babel" data-presets="typescript,react">
           const __designerFrameId = ${safeFrameId};
           const __designerVersionId = ${safeVersionId};
+          const __heightTrackingWindowMs = 1800;
           let __lastReportedHeight = 0;
           let __heightRaf = null;
+          let __heightTrackingStopped = false;
+          let __heightObserver = null;
+          let __resizeObserver = null;
 
           const __postHeight = () => {
             const root = document.getElementById("root");
@@ -177,6 +181,7 @@ body{font-family:ui-sans-serif,system-ui,sans-serif;display:grid;place-items:cen
               nextHeight = Math.ceil(
                 Math.max(
                   root ? root.scrollHeight : 0,
+                  document.documentElement ? document.documentElement.scrollHeight : 0,
                   document.body ? document.body.scrollHeight : 0
                 )
               );
@@ -199,6 +204,9 @@ body{font-family:ui-sans-serif,system-ui,sans-serif;display:grid;place-items:cen
           };
 
           const __scheduleHeight = () => {
+            if (__heightTrackingStopped) {
+              return;
+            }
             if (__heightRaf !== null) {
               return;
             }
@@ -206,6 +214,22 @@ body{font-family:ui-sans-serif,system-ui,sans-serif;display:grid;place-items:cen
               __heightRaf = null;
               __postHeight();
             });
+          };
+
+          const __stopHeightTracking = () => {
+            if (__heightTrackingStopped) {
+              return;
+            }
+
+            __heightTrackingStopped = true;
+            if (__heightObserver) {
+              __heightObserver.disconnect();
+            }
+            if (__resizeObserver) {
+              __resizeObserver.disconnect();
+            }
+            window.removeEventListener("load", __scheduleHeight);
+            window.removeEventListener("resize", __scheduleHeight);
           };
 
           try {
@@ -223,9 +247,10 @@ body{font-family:ui-sans-serif,system-ui,sans-serif;display:grid;place-items:cen
             window.setTimeout(__scheduleHeight, 200);
             window.setTimeout(__scheduleHeight, 600);
             window.setTimeout(__scheduleHeight, 1200);
+            window.setTimeout(__stopHeightTracking, __heightTrackingWindowMs);
           }
 
-          const __heightObserver = new MutationObserver(() => __scheduleHeight());
+          __heightObserver = new MutationObserver(() => __scheduleHeight());
           if (document.body) {
             __heightObserver.observe(document.body, {
               childList: true,
@@ -234,7 +259,8 @@ body{font-family:ui-sans-serif,system-ui,sans-serif;display:grid;place-items:cen
               characterData: true
             });
             if (typeof ResizeObserver !== "undefined") {
-              new ResizeObserver(() => __scheduleHeight()).observe(document.body);
+              __resizeObserver = new ResizeObserver(() => __scheduleHeight());
+              __resizeObserver.observe(document.body);
             }
           }
           window.addEventListener("load", __scheduleHeight);

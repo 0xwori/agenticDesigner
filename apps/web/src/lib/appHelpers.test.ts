@@ -34,6 +34,14 @@ describe("buildPreviewDocument", () => {
     expect(html).toContain('"version-9"');
   });
 
+  it("stops live height observation after the initial settle window", () => {
+    const html = buildPreviewDocument("frame-123", createVersion({ id: "version-9" }));
+
+    expect(html).toContain("const __heightTrackingWindowMs = 1800");
+    expect(html).toContain("__stopHeightTracking");
+    expect(html).toContain("window.setTimeout(__stopHeightTracking, __heightTrackingWindowMs)");
+  });
+
   it("escapes style and script closing tags", () => {
     const html = buildPreviewDocument(
       "frame-123",

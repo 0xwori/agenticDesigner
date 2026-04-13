@@ -31,6 +31,26 @@ describe("flowWorkspaceInteractions", () => {
     expect(gesture.factor).toBeGreaterThan(0.5);
   });
 
+  it("classifies meta-wheel gestures as zoom for macOS pinch events", () => {
+    const gesture = resolveFlowWheelGesture({
+      deltaX: 0,
+      deltaY: -18,
+      deltaZ: 0,
+      deltaMode: 0,
+      ctrlKey: false,
+      metaKey: true,
+      shiftKey: false,
+      viewportWidth: 1440,
+      viewportHeight: 900,
+    });
+
+    expect(gesture.kind).toBe("zoom");
+    if (gesture.kind !== "zoom") {
+      throw new Error("Expected a zoom gesture");
+    }
+    expect(gesture.factor).toBeGreaterThan(1);
+  });
+
   it("routes shift-wheel to horizontal panning when there is no horizontal delta", () => {
     const gesture = resolveFlowWheelGesture({
       deltaX: 0,

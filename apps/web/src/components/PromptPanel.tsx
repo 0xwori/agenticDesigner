@@ -24,7 +24,7 @@ import {
   UserRound,
   X
 } from "lucide-react";
-import type { CanvasMode, LocalPreferences, PromptEntry, RunMode } from "../types/ui";
+import type { CanvasMode, FlowMutationReviewState, LocalPreferences, PromptEntry, RunMode } from "../types/ui";
 import { ErrorHint, EventStageIcon, stageLabel } from "./pipelineVisuals";
 import { sortPipelineEvents } from "../lib/eventOrdering";
 
@@ -65,6 +65,9 @@ type PromptPanelProps = {
   eventCapReached: boolean;
   canvasMode: CanvasMode;
   activeFlowBoardName: string | null;
+  flowMutationReviews: Record<string, FlowMutationReviewState>;
+  onApproveFlowMutationReview: (runId: string) => void;
+  onRejectFlowMutationReview: (runId: string) => void;
 };
 
 function toDisplayUrl(value: string) {
@@ -162,6 +165,9 @@ export function PromptPanel(props: PromptPanelProps) {
     eventCapReached,
     canvasMode,
     activeFlowBoardName,
+    flowMutationReviews,
+    onApproveFlowMutationReview,
+    onRejectFlowMutationReview,
   } = props;
 
   // -------------------------------------------------------------------------
@@ -353,6 +359,7 @@ export function PromptPanel(props: PromptPanelProps) {
           const actionEvents = runEvents.filter((event) => event.kind !== "summary");
           const runActivity = resolveRunActivity(runEvents);
           const runStage = stageLabel(runActivity.stage);
+          const pendingReview = flowMutationReviews[entry.runId] ?? null;
           const runElapsed =
             runActivity.state === "running"
               ? `${Math.max(1, Math.round((Date.now() - new Date(entry.submittedAt).getTime()) / 1000))}s`
@@ -387,6 +394,54 @@ export function PromptPanel(props: PromptPanelProps) {
                           <p>{summaryEvent.message}</p>
                           {typeof summaryEvent.payload?.reason === "string" ? (
                             <span className="thought-card__meta">{summaryEvent.payload.reason}</span>
+                          ) : null}
+                          {pendingReview ? (
+                            <div className={`flow-review-card flow-review-card--${pendingReview.status}`}>
+                              <div className="flow-review-card__header">
+                                <strong>Review required before apply</strong>
+                                <span>
+                                  {pendingReview.status === "pending"
+                                    ? `${pendingReview.commands.length} pending`
+                                    : pendingReview.status === "applying"
+                                      ? "Applying..."
+                                      : pendingReview.status === "applied"
+                                        ? "Applied"
+                                        : pendingReview.status === "rejected"
+                                          ? "Rejected"
+                                          : "Failed"}
+                                </span>
+                              </div>
+                              <p className="flow-review-card__summary">{pendingReview.summary}</p>
+                              {pendingReview.status === "pending" ? (
+                                <p className="flow-review-card__hint">These edits are not on the board yet. Click Apply changes to update the selected board.</p>
+                              ) : null}
+                              <div className="flow-review-card__list">
+                                {pendingReview.commands.map((item, index) => (
+                                  <div key={`${pendingReview.runId}-${index}`} className={`flow-review-card__item flow-review-card__item--${item.severity}`}>
+                                    <span>{item.severity === "remove" ? "Remove" : "Change"}</span>
+                                    <p>{item.summary}</p>
+                                  </div>
+                                ))}
+                              </div>
+                              {pendingReview.error ? <p className="flow-review-card__error">{pendingReview.error}</p> : null}
+                              <div className="flow-review-card__actions">
+                                <button
+                                  type="button"
+                                  onClick={() => onApproveFlowMutationReview(entry.runId)}
+                                  disabled={pendingReview.status !== "pending"}
+                                >
+                                  Apply changes
+                                </button>
+                                <button
+                                  type="button"
+                                  className="flow-review-card__reject"
+                                  onClick={() => onRejectFlowMutationReview(entry.runId)}
+                                  disabled={pendingReview.status !== "pending"}
+                                >
+                                  Reject
+                                </button>
+                              </div>
+                            </div>
                           ) : null}
                           <div className={`thought-card__run-state thought-card__run-state--${runActivity.state}`}>
                             <span className="thought-card__run-state-icon" aria-hidden="true">

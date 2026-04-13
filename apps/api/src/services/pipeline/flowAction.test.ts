@@ -3,6 +3,7 @@ import { FLOW_DEFAULT_AREA_ID, createEmptyFlowDocument, type ComposerAttachment 
 
 import { requestCompletion } from "../llmProviders.js";
 import {
+  REVIEW_REQUIRED_FLOW_MUTATION_OPS,
   runFlowAction,
   normalizeFlowActionCommands,
   type FlowActionCommand,
@@ -243,6 +244,104 @@ describe("normalizeFlowActionCommands", () => {
       },
     ]);
   });
+
+  it("preserves existing cell ids for remove and update mutations", () => {
+    const normalized = normalizeFlowActionCommands({
+      doc: {
+        ...createEmptyFlowDocument(),
+        cells: [
+          {
+            id: "tech-1",
+            laneId: "technical-briefing",
+            column: 0,
+            artifact: { type: "technical-brief", title: "Legacy API", language: "http", body: "GET /legacy" },
+          },
+        ],
+      },
+      commands: [
+        {
+          op: "remove-cell",
+          cellId: "tech-1",
+        },
+        {
+          op: "update-cell",
+          cellId: "tech-1",
+          artifact: { type: "technical-brief", title: "Checkout API", language: "http", body: "POST /checkout" },
+        },
+      ],
+    });
+
+    expect(normalized).toEqual([
+      {
+        op: "remove-cell",
+        cellId: "tech-1",
+      },
+      {
+        op: "update-cell",
+        cellId: "tech-1",
+        artifact: { type: "technical-brief", title: "Checkout API", language: "http", body: "POST /checkout" },
+      },
+    ]);
+  });
+
+  it("remaps only newly created cell ids when later commands reference them", () => {
+    const normalized = normalizeFlowActionCommands({
+      doc: {
+        ...createEmptyFlowDocument(),
+        cells: [
+          {
+            id: "existing-step",
+            laneId: "user-journey",
+            column: 0,
+            artifact: { type: "journey-step", text: "Start" },
+          },
+          {
+            id: "duplicate-id",
+            laneId: "technical-briefing",
+            column: 0,
+            artifact: { type: "technical-brief", title: "Legacy API", language: "http", body: "GET /legacy" },
+          },
+        ],
+      },
+      commands: [
+        {
+          op: "add-cell",
+          cellId: "duplicate-id",
+          laneId: "user-journey",
+          artifact: { type: "journey-step", text: "New step" },
+        },
+        {
+          op: "add-connection",
+          fromCellId: "duplicate-id",
+          toCellId: "existing-step",
+        },
+        {
+          op: "remove-cell",
+          cellId: "existing-step",
+        },
+      ],
+    });
+
+    const addCell = normalized[0];
+    const addConnection = normalized[1];
+    const removeCell = normalized[2];
+
+    expect(addCell.op).toBe("add-cell");
+    if (addCell.op !== "add-cell") {
+      throw new Error("Expected add-cell mutation");
+    }
+    expect(addCell.cellId).toBeDefined();
+    expect(addCell.cellId).not.toBe("duplicate-id");
+    expect(addConnection).toEqual({
+      op: "add-connection",
+      fromCellId: addCell.cellId,
+      toCellId: "existing-step",
+    });
+    expect(removeCell).toEqual({
+      op: "remove-cell",
+      cellId: "existing-step",
+    });
+  });
 });
 
 describe("runFlowAction", () => {
@@ -291,6 +390,8 @@ describe("runFlowAction", () => {
     expect(input.prompt).toContain('Focused area: "Checkout" (id: "area-2")');
     expect(input.prompt).toContain("Board memory:");
     expect(input.prompt).toContain("goals=1");
+    expect(input.prompt).toContain("Reduce signup drop-off");
+    expect(input.prompt).toContain("Authored YAML excerpt:");
   });
 
   it("fills in missing journey steps from existing screen refs when the model returns no commands", async () => {
@@ -340,6 +441,168 @@ describe("runFlowAction", () => {
     });
     expect(result.updatedDocument.cells.some((cell) => cell.laneId === "user-journey" && cell.artifact.type === "journey-step")).toBe(true);
     expect(result.updatedDocument.connections).toHaveLength(1);
+    expect(result.summary).toContain("backfilled 2 journey step(s)");
+  });
+
+  it("unwraps JSON-object command payloads returned from JSON mode", async () => {
+    vi.mocked(requestCompletion).mockResolvedValue({
+      content: JSON.stringify({
+        commands: [
+          {
+            op: "add-cell",
+            cellId: "wait-step",
+            laneId: "user-journey",
+            artifact: { type: "journey-step", text: "Wait for confirmation" },
+          },
+        ],
+      }),
+    } as never);
+
+    const result = await runFlowAction({
+      prompt: "Please add a wait step",
+      flowDocument: createEmptyFlowDocument(),
+      designFrames: [],
+      provider: "openai",
+      model: "gpt-5.4-mini",
+    });
+
+    expect(result.commands).toEqual([
+      expect.objectContaining({
+        op: "add-cell",
+        cellId: "wait-step",
+        laneId: "user-journey",
+        areaId: FLOW_DEFAULT_AREA_ID,
+        artifact: expect.objectContaining({ type: "journey-step", text: "Wait for confirmation" }),
+      }),
+    ]);
+    expect(result.updatedDocument.cells).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "wait-step", laneId: "user-journey" }),
+      ]),
+    );
+    expect(result.summary).not.toContain("No confident changes applied");
+  });
+
+  it("adds prompt-derived wait steps when the model returns no usable commands", async () => {
+    vi.mocked(requestCompletion).mockResolvedValue({ content: JSON.stringify({ commands: [] }) } as never);
+
+    const result = await runFlowAction({
+      prompt: "Please add 2 steps on the board that the user needs to wait",
+      flowDocument: {
+        ...createEmptyFlowDocument(),
+        cells: [
+          {
+            id: "start",
+            laneId: "user-journey",
+            column: 0,
+            artifact: { type: "journey-step", text: "Start" },
+          },
+        ],
+      },
+      designFrames: [],
+      provider: "openai",
+      model: "gpt-5.4-mini",
+    });
+
+    const addedCells = result.commands.filter((command) => command.op === "add-cell");
+    const addedConnections = result.commands.filter((command) => command.op === "add-connection");
+
+    expect(addedCells).toHaveLength(2);
+    expect(addedCells).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          laneId: "user-journey",
+          artifact: expect.objectContaining({ text: "Wait for the request to process" }),
+        }),
+        expect.objectContaining({
+          laneId: "user-journey",
+          artifact: expect.objectContaining({ text: "Wait for confirmation before continuing" }),
+        }),
+      ]),
+    );
+    expect(addedConnections).toHaveLength(2);
+    expect(result.updatedDocument.cells).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ artifact: expect.objectContaining({ text: "Wait for the request to process" }) }),
+        expect.objectContaining({ artifact: expect.objectContaining({ text: "Wait for confirmation before continuing" }) }),
+      ]),
+    );
+    expect(result.summary).toContain("prompt-derived step(s)");
+  });
+
+  it("returns a no-op summary instead of creating journey steps from a generic screenshot filename", async () => {
+    vi.mocked(requestCompletion).mockResolvedValue({ content: "[]" } as never);
+
+    const result = await runFlowAction({
+      prompt: "Review this board and improve the flow",
+      flowDocument: {
+        ...createEmptyFlowDocument(),
+        cells: [
+          {
+            id: "image-1",
+            laneId: "normal-flow",
+            column: 0,
+            artifact: {
+              type: "uploaded-image",
+              dataUrl: "data:image/png;base64,screenshot-only",
+              label: "Screenshot 2026-04-12 at 13.40.08.png",
+            },
+          },
+        ],
+      },
+      designFrames: [],
+      provider: "openai",
+      model: "gpt-5.4-mini",
+    });
+
+    expect(result.commands).toEqual([]);
+    expect(result.updatedDocument.cells).toHaveLength(1);
+    expect(result.updatedDocument.cells.some((cell) => cell.artifact.type === "journey-step")).toBe(false);
+    expect(result.summary).toContain("No confident changes applied");
+    expect(result.summary).toContain("generic screenshot labels");
+  });
+
+  it("includes existing artifact details and update guidance for in-place edits", async () => {
+    vi.mocked(requestCompletion).mockClear();
+    vi.mocked(requestCompletion).mockResolvedValue({ content: "[]" } as never);
+
+    await runFlowAction({
+      prompt: "Update the checkout API brief to use POST /orders",
+      flowDocument: {
+        ...createEmptyFlowDocument(),
+        cells: [
+          {
+            id: "journey-1",
+            laneId: "user-journey",
+            column: 0,
+            artifact: { type: "journey-step", text: "Review cart", shape: "rectangle" },
+          },
+          {
+            id: "brief-1",
+            laneId: "technical-briefing",
+            column: 0,
+            artifact: {
+              type: "technical-brief",
+              title: "Checkout API",
+              language: "http",
+              body: "POST /checkout\n200 OK",
+            },
+          },
+        ],
+      },
+      designFrames: [],
+      provider: "openai",
+      model: "gpt-5.4-mini",
+    });
+
+    const input = vi.mocked(requestCompletion).mock.calls.at(-1)?.[0];
+
+    expect(input?.system).toContain('prefer "update-cell"');
+    expect(input?.system).toContain('full replacement artifact object');
+    expect(input?.prompt).toContain('cell "journey-1"');
+    expect(input?.prompt).toContain('journey-step: text="Review cart" shape="rectangle"');
+    expect(input?.prompt).toContain('cell "brief-1"');
+    expect(input?.prompt).toContain('technical-brief: title="Checkout API" language="http" body="POST /checkout 200 OK"');
   });
 
   it("passes board images and frame summaries into the completion request", async () => {
@@ -388,6 +651,7 @@ describe("runFlowAction", () => {
     const input = vi.mocked(requestCompletion).mock.calls[0][0];
 
     expect(input.prompt).toContain("summary: Visible content: Order summary / Billing address. Actions: Continue to payment.");
+    expect(input.prompt).toContain('vision attachment id: "board-image-image-1"');
     expect(input.prompt).toContain('attachment "board-image-image-1" name="Checkout confirmation"');
     expect(input.attachments).toEqual(
       expect.arrayContaining([
@@ -395,5 +659,14 @@ describe("runFlowAction", () => {
         expect.objectContaining({ id: "board-image-image-1", dataUrl: "data:image/png;base64,board-image" }),
       ]),
     );
+  });
+
+  it("classifies destructive flow mutations as review-required", () => {
+    expect(REVIEW_REQUIRED_FLOW_MUTATION_OPS.has("remove-cell")).toBe(true);
+    expect(REVIEW_REQUIRED_FLOW_MUTATION_OPS.has("remove-connection")).toBe(true);
+    expect(REVIEW_REQUIRED_FLOW_MUTATION_OPS.has("move-cell")).toBe(true);
+    expect(REVIEW_REQUIRED_FLOW_MUTATION_OPS.has("update-cell")).toBe(true);
+    expect(REVIEW_REQUIRED_FLOW_MUTATION_OPS.has("add-cell")).toBe(false);
+    expect(REVIEW_REQUIRED_FLOW_MUTATION_OPS.has("add-connection")).toBe(false);
   });
 });
