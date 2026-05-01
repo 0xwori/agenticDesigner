@@ -307,12 +307,14 @@ function derivePalette(colors: string[], fallback: ReferenceStyleContext["palett
     [...byLuminance]
       .reverse()
       .find((hex) => hex !== primary && hex !== accent && hexLuminance(hex) > 0.82) ?? fallback.surface;
+  const background = surface ?? fallback.background ?? fallback.surface;
   const text = byLuminance.find((hex) => hex !== surface && hexLuminance(hex) < 0.24) ?? fallback.text;
 
   return {
     primary,
     secondary,
     accent,
+    background,
     surface,
     text
   };
@@ -352,7 +354,7 @@ function buildBaseCss(styleContext: ReferenceStyleContext) {
     "html, body, #root { min-height: 100%; }",
     "body {",
     "  margin: 0;",
-    `  background: ${styleContext.palette.surface};`,
+    `  background: ${styleContext.palette.background ?? styleContext.palette.surface};`,
     `  color: ${styleContext.palette.text};`,
     `  font-family: ${styleContext.typography.bodyFamily};`,
     "}"
@@ -724,6 +726,7 @@ export async function syncReferenceViaMcp(figmaUrl: string): Promise<SyncedMcpRe
           primary: `hsl(${hue} 70% 46%)`,
           secondary: "#445268",
           accent: `hsl(${(hue + 24) % 360} 80% 58%)`,
+          background: "#f5f6f8",
           surface: "#f5f6f8",
           text: "#1d2433"
         },

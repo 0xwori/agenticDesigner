@@ -1,6 +1,7 @@
 import type {
   ApplyFlowActionResponse,
   ComposerAttachment,
+  DeckSlideCount,
   DesignMode,
   DesignSystemMode,
   DevicePreset,
@@ -12,12 +13,14 @@ import type {
   FrameVersion,
   PipelineEvent,
   Project,
+  ProjectAsset,
   ProjectBundle,
   ProjectDesignSystem,
   ProjectSettings,
   PromptIntentType,
   ProviderId,
   ReferenceSource,
+  SelectedBlockContext,
   SelectedFrameContext,
   SurfaceTarget
 } from "@designer/shared";
@@ -37,6 +40,8 @@ export type RunRequestPayload = {
   tailwindEnabled: boolean;
   attachments?: ComposerAttachment[];
   selectedFrameContext?: SelectedFrameContext;
+  selectedBlockContext?: SelectedBlockContext;
+  deckSlideCount?: DeckSlideCount;
   intentHint?: PromptIntentType;
 };
 
@@ -89,6 +94,37 @@ export function createProject(apiBaseUrl: string, name?: string) {
 
 export function getProjectBundle(apiBaseUrl: string, projectId: string) {
   return request<ProjectBundle>(apiBaseUrl, `/projects/${encodeURIComponent(projectId)}`);
+}
+
+export function getProjectAssets(apiBaseUrl: string, projectId: string) {
+  return request<{ assets: ProjectAsset[] }>(apiBaseUrl, `/projects/${encodeURIComponent(projectId)}/assets`);
+}
+
+export function createProjectAsset(
+  apiBaseUrl: string,
+  projectId: string,
+  payload: {
+    kind: ProjectAsset["kind"];
+    name: string;
+    mimeType: string;
+    dataUrl?: string;
+    textContent?: string;
+  }
+) {
+  return request<{ asset: ProjectAsset }>(apiBaseUrl, `/projects/${encodeURIComponent(projectId)}/assets`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function deleteProjectAsset(apiBaseUrl: string, projectId: string, assetId: string) {
+  return request<{ ok: boolean }>(
+    apiBaseUrl,
+    `/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`,
+    {
+      method: "DELETE"
+    }
+  );
 }
 
 export function clearBoard(apiBaseUrl: string, projectId: string) {
@@ -444,6 +480,10 @@ export function startEditRun(apiBaseUrl: string, frameId: string, payload: Omit<
     method: "POST",
     body: JSON.stringify(payload)
   });
+}
+
+export function getDeckDownloadUrl(apiBaseUrl: string, frameId: string) {
+  return `${apiBaseUrl}/frames/${encodeURIComponent(frameId)}/deck.pptx`;
 }
 
 export function openRunStream(

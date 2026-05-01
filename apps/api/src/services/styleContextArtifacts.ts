@@ -241,10 +241,11 @@ function extractPreferredPaletteFromVariables(combined: string, fallback: Refere
   const primary = pick(["tw-primary", "ds-primary", "primary", "brand", "brand-primary"]);
   const secondary = pick(["tw-secondary", "ds-secondary", "secondary", "support", "brand-secondary"]);
   const accent = pick(["tw-accent", "ds-accent", "accent", "tertiary"]);
-  const surface = pick(["tw-surface", "ds-surface", "surface", "background", "neutral"]);
+  const background = pick(["tw-background", "ds-background", "background", "page", "canvas"]);
+  const surface = pick(["tw-surface", "ds-surface", "surface", "card", "panel", "neutral"]);
   const text = pick(["tw-text", "ds-text", "text", "ink", "on-primary", "on-surface"]);
 
-  if (!primary && !secondary && !accent && !surface && !text) {
+  if (!primary && !secondary && !accent && !background && !surface && !text) {
     return null;
   }
 
@@ -252,6 +253,7 @@ function extractPreferredPaletteFromVariables(combined: string, fallback: Refere
     primary: primary ?? fallback.primary,
     secondary: secondary ?? fallback.secondary,
     accent: accent ?? primary ?? fallback.accent,
+    background: background ?? fallback.background ?? fallback.surface,
     surface: surface ?? fallback.surface,
     text: text ?? fallback.text
   };
@@ -293,6 +295,7 @@ function derivePaletteFromCandidates(
   const surface = [...byLuminance]
     .reverse()
     .find((color) => color !== primary && color !== accent && hexLuminance(color) > 0.84) ?? fallback.surface;
+  const background = surface ?? fallback.background ?? fallback.surface;
 
   const text = byLuminance.find((color) => color !== surface && hexLuminance(color) < 0.24) ?? fallback.text;
 
@@ -300,6 +303,7 @@ function derivePaletteFromCandidates(
     primary,
     secondary,
     accent,
+    background,
     surface,
     text
   };

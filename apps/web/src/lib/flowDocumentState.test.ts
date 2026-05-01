@@ -23,6 +23,7 @@ function createBundle(flowDocument = createEmptyFlowDocument()): ProjectBundle {
     },
     references: [],
     designSystem: null,
+    assets: [],
     frames: [
       {
         id: "flow-1",

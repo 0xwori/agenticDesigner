@@ -47,6 +47,7 @@ type ArtboardPaneProps = {
   onOpenBrandPicker?: () => void;
   toggleFrameHeight: (frameId: string) => void;
   onRegenerate?: (frameId: string) => void;
+  onDownloadDeck?: (frameId: string) => void;
   framePrompts?: Map<string, string>;
   canvasMode: CanvasMode;
   onCanvasModeChange: (mode: CanvasMode) => void;
@@ -99,6 +100,7 @@ export function ArtboardPane(props: ArtboardPaneProps) {
     onOpenBrandPicker,
     toggleFrameHeight,
     onRegenerate,
+    onDownloadDeck,
     framePrompts,
     canvasMode,
     onCanvasModeChange,
@@ -389,6 +391,7 @@ export function ArtboardPane(props: ArtboardPaneProps) {
                     hasDesignSystem={hasDesignSystem ?? false}
                     onOpenBrandPicker={onOpenBrandPicker}
                     onRegenerate={onRegenerate}
+                    onDownloadDeck={onDownloadDeck}
                     framePrompt={framePrompts?.get(frame.id)}
                   />
                 );

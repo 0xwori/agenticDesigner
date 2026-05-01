@@ -131,6 +131,7 @@ function buildFallbackStyleContext(): NonNullStyleContext {
       primary: "#8b8f98",
       secondary: "#6f7785",
       accent: "#9b8f82",
+      background: "#f5f5f6",
       surface: "#f5f5f6",
       text: "#202327"
     },
@@ -167,6 +168,59 @@ function toNumber(value: unknown, fallback: number) {
     return fallback;
   }
   return value;
+}
+
+const ASSET_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpg", "image/jpeg", "image/webp", "image/gif", "image/svg+xml"]);
+const ASSET_DOCUMENT_MIME_TYPES = new Set(["text/plain", "text/markdown", "text/x-markdown"]);
+
+function approxDataUrlBytes(value: string) {
+  const commaIndex = value.indexOf(",");
+  const payload = commaIndex >= 0 ? value.slice(commaIndex + 1) : value;
+  return Math.floor((payload.length * 3) / 4);
+}
+
+function parseProjectAssetPayload(value: unknown) {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const name = toNonEmptyString(record.name);
+  const mimeType = toNonEmptyString(record.mimeType);
+  const rawKind = record.kind === "document" ? "document" : record.kind === "image" ? "image" : null;
+  const dataUrl = typeof record.dataUrl === "string" ? record.dataUrl : null;
+  const textContent = typeof record.textContent === "string" ? record.textContent : null;
+
+  if (!name || !mimeType) {
+    throw new Error("Asset name and mimeType are required.");
+  }
+
+  const normalizedName = name.toLowerCase();
+  const kind: "image" | "document" =
+    rawKind ??
+    (mimeType.startsWith("image/") || normalizedName.endsWith(".svg") ? "image" : "document");
+
+  if (kind === "image") {
+    if (!ASSET_IMAGE_MIME_TYPES.has(mimeType)) {
+      throw new Error("Unsupported asset image type. Use png, jpg, jpeg, webp, gif, or svg.");
+    }
+    if (!dataUrl || !dataUrl.startsWith("data:image/")) {
+      throw new Error("Image assets require a valid data URL.");
+    }
+    const size = approxDataUrlBytes(dataUrl);
+    if (size > 8 * 1024 * 1024) {
+      throw new Error("Image asset is too large. Max supported size is 8 MB.");
+    }
+    return { kind, name, mimeType, size, dataUrl, textContent: null };
+  }
+
+  const hasAllowedExtension = normalizedName.endsWith(".txt") || normalizedName.endsWith(".md");
+  if (!ASSET_DOCUMENT_MIME_TYPES.has(mimeType) && !hasAllowedExtension) {
+    throw new Error("Unsupported document asset type. Use .txt or .md.");
+  }
+  if (!textContent || textContent.trim().length === 0) {
+    throw new Error("Document assets require text content.");
+  }
+  if (textContent.length > 500_000) {
+    throw new Error("Document asset is too large. Max supported size is 500 KB.");
+  }
+  return { kind, name, mimeType, size: textContent.length, dataUrl: null, textContent };
 }
 
 function buildImageStyleContextFromPassOutputs(
@@ -233,10 +287,8 @@ function buildImageStyleContextFromPassOutputs(
       primary,
       secondary,
       accent,
-      surface:
-        toNonEmptyString(colorTokens.background) ??
-        toNonEmptyString(colorTokens.surface) ??
-        fallback.palette.surface,
+      background: toNonEmptyString(colorTokens.background) ?? fallback.palette.background ?? fallback.palette.surface,
+      surface: toNonEmptyString(colorTokens.surface) ?? fallback.palette.surface,
       text: toNonEmptyString(colorTokens.textPrimary) ?? fallback.palette.text
     },
     typography: {
@@ -394,12 +446,32 @@ function buildImageStyleContextFromPassOutputs(
   };
 }
 
+function isForegroundColorRole(entry: { role?: string }) {
+  const text = (entry.role ?? "").toLowerCase();
+  return (
+    /\b(text|copy|heading|foreground|ink)\b/.test(text) ||
+    /\bon\s+(?:light|dark|brand|colored|neutral)?\s*backgrounds?\b/.test(text)
+  );
+}
+
 function buildStyleContextFromProfile(profile: StyleProfile, fallback: NonNullStyleContext): NonNullStyleContext {
-  const color = (names: string[], defaultValue: string) => {
-    const token = profile.tokens.colors.find((entry) =>
-      names.some((name) => entry.name.toLowerCase().includes(name))
-    );
-    return token?.hex ?? defaultValue;
+  const color = (names: string[], defaultValue: string, options?: { skipForegroundRoles?: boolean }) => {
+    const shouldSkip = (entry: { role?: string }) =>
+      options?.skipForegroundRoles === true && isForegroundColorRole(entry);
+
+    for (const name of names) {
+      const needle = name.toLowerCase();
+      const token = profile.tokens.colors.find(
+        (entry) =>
+          !shouldSkip(entry) &&
+          (entry.name.toLowerCase().includes(needle) ||
+            entry.role.toLowerCase().includes(needle))
+      );
+      if (token?.hex) {
+        return token.hex;
+      }
+    }
+    return defaultValue;
   };
 
   const buttonRecipe = profile.componentRecipes.find((recipe) => recipe.family === "buttons");
@@ -407,10 +479,15 @@ function buildStyleContextFromProfile(profile: StyleProfile, fallback: NonNullSt
   return {
     source: profile.sourceType === "figma-reference" ? "figma-public-link" : "heuristic",
     palette: {
-      primary: color(["primary", "brand"], fallback.palette.primary),
-      secondary: color(["secondary", "support"], fallback.palette.secondary),
-      accent: color(["accent", "tertiary"], fallback.palette.accent),
-      surface: color(["surface", "neutral", "background"], fallback.palette.surface),
+      primary: color(["primary", "brand"], fallback.palette.primary, { skipForegroundRoles: true }),
+      secondary: color(["secondary", "support"], fallback.palette.secondary, { skipForegroundRoles: true }),
+      accent: color(["accent", "tertiary"], fallback.palette.accent, { skipForegroundRoles: true }),
+      background: color(["background", "page", "canvas"], fallback.palette.background ?? fallback.palette.surface, {
+        skipForegroundRoles: true
+      }),
+      surface: color(["surface", "container", "panel", "card", "neutral"], fallback.palette.surface, {
+        skipForegroundRoles: true
+      }),
       text: color(["text", "ink", "on"], fallback.palette.text)
     },
     typography: {
@@ -801,6 +878,46 @@ export function registerProjectRoutes(app: Express, deps: ApiDeps) {
     response.json(bundle);
   });
 
+  app.get("/projects/:id/assets", async (request, response) => {
+    const bundle = await deps.getProjectBundle(request.params.id);
+    if (!bundle) {
+      sendApiError(response, 404, "Project not found.", "not_found");
+      return;
+    }
+
+    const assets = await deps.getProjectAssets(request.params.id);
+    response.json({ assets });
+  });
+
+  app.post("/projects/:id/assets", async (request, response) => {
+    const bundle = await deps.getProjectBundle(request.params.id);
+    if (!bundle) {
+      sendApiError(response, 404, "Project not found.", "not_found");
+      return;
+    }
+
+    try {
+      const assetInput = parseProjectAssetPayload(request.body);
+      const asset = await deps.createProjectAsset({
+        projectId: request.params.id,
+        ...assetInput
+      });
+      response.status(201).json({ asset });
+    } catch (error) {
+      sendApiError(response, 400, error instanceof Error ? error.message : String(error), "bad_request");
+    }
+  });
+
+  app.delete("/projects/:id/assets/:assetId", async (request, response) => {
+    const deleted = await deps.deleteProjectAsset(request.params.id, request.params.assetId);
+    if (!deleted) {
+      sendApiError(response, 404, "Asset not found.", "not_found");
+      return;
+    }
+
+    response.json({ ok: true });
+  });
+
   app.post("/projects/:id/clear-board", async (request, response) => {
     const bundle = await deps.getProjectBundle(request.params.id);
     if (!bundle) {
@@ -840,7 +957,7 @@ export function registerProjectRoutes(app: Express, deps: ApiDeps) {
           ? request.body.designSystemModeDefault
           : undefined,
       surfaceDefault:
-        request.body?.surfaceDefault === "web" || request.body?.surfaceDefault === "mobile"
+        request.body?.surfaceDefault === "web" || request.body?.surfaceDefault === "mobile" || request.body?.surfaceDefault === "deck"
           ? request.body.surfaceDefault
           : undefined
     });

@@ -1,6 +1,7 @@
 import type { CaptureLogEntry } from "../lib/figmaCapture";
 import type {
   ComposerAttachment,
+  DeckSlideCount,
   DesignMode,
   DesignSystemMode,
   DevicePreset,
@@ -9,6 +10,7 @@ import type {
   PipelineEvent,
   ProviderId,
   ProjectBundle,
+  SelectedBlockContext,
   SurfaceTarget,
 } from "@designer/shared";
 
@@ -124,6 +126,8 @@ export type AppInputState = {
   selectedMode: DesignMode;
   selectedDesignSystemMode: DesignSystemMode;
   selectedSurfaceTarget: SurfaceTarget;
+  deckSlideCount: DeckSlideCount;
+  selectedBlockContext: SelectedBlockContext | null;
   variation: number;
   tailwindOverride: boolean;
 };
@@ -136,6 +140,7 @@ export type AppUIState = {
   expandedHistoryFrameId: string | null;
   isWorkspaceSettingsOpen: boolean;
   isProjectDesignSystemOpen: boolean;
+  isProjectAssetsOpen: boolean;
   isBrandPickerOpen: boolean;
   activeBrandName: string | null;
   designSystemWarnings: string[];

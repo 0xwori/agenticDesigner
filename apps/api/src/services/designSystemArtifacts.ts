@@ -280,6 +280,43 @@ function renderSectionJsx(section: DesignSystemVisualSection) {
   )}</h2>${section.blocks.map((block) => renderBlockJsx(block)).join("\n")}</section>`;
 }
 
+function pickColorToken(
+  colors: Array<{ name: string; hex: string; role: string; _subsection?: string }>,
+  matchers: string[],
+  fallback: string,
+  options?: { skipForegroundRoles?: boolean }
+) {
+  const shouldSkip = (entry: { role: string; _subsection?: string }) =>
+    options?.skipForegroundRoles === true && isForegroundColorRole(entry);
+
+  for (const matcher of matchers) {
+    const needle = matcher.toLowerCase();
+    const byName = colors.find((entry) => entry.name.toLowerCase().includes(needle) && !shouldSkip(entry));
+    if (byName?.hex) {
+      return byName.hex;
+    }
+
+    const byRole = colors.find((entry) => entry.role.toLowerCase().includes(needle) && !shouldSkip(entry));
+    if (byRole?.hex) {
+      return byRole.hex;
+    }
+
+    const bySection = colors.find((entry) => (entry._subsection ?? "").toLowerCase().includes(needle) && !shouldSkip(entry));
+    if (bySection?.hex) {
+      return bySection.hex;
+    }
+  }
+  return fallback;
+}
+
+function isForegroundColorRole(entry: { role?: string; _subsection?: string }) {
+  const text = `${entry.role ?? ""} ${entry._subsection ?? ""}`.toLowerCase();
+  return (
+    /\b(text|copy|heading|foreground|ink)\b/.test(text) ||
+    /\bon\s+(?:light|dark|brand|colored|neutral)?\s*backgrounds?\b/.test(text)
+  );
+}
+
 export function buildDesignSystemComponentsArtifacts(args: BuildDesignSystemArtifactsInput): FrameArtifacts {
   const sourceLabel = args.sourceLabel ?? "Reference";
 
@@ -306,11 +343,22 @@ export function buildDesignSystemComponentsArtifacts(args: BuildDesignSystemArti
     donts: []
   });
 
-  const primary = styleProfile.tokens.colors[0]?.hex ?? "#6f7480";
-  const secondary = styleProfile.tokens.colors[1]?.hex ?? "#8a909d";
-  const accent = styleProfile.tokens.colors[2]?.hex ?? "#9b8f82";
-  const surface = styleProfile.tokens.colors.find((token) => token.name.toLowerCase().includes("surface"))?.hex ?? "#f3f4f6";
-  const text = styleProfile.tokens.colors.find((token) => token.name.toLowerCase().includes("text"))?.hex ?? "#1f2430";
+  const primary = pickColorToken(styleProfile.tokens.colors, ["primary", "brand"], styleProfile.tokens.colors[0]?.hex ?? "#6f7480", {
+    skipForegroundRoles: true
+  });
+  const secondary = pickColorToken(styleProfile.tokens.colors, ["secondary", "support"], styleProfile.tokens.colors[1]?.hex ?? "#8a909d", {
+    skipForegroundRoles: true
+  });
+  const accent = pickColorToken(styleProfile.tokens.colors, ["accent", "tertiary"], styleProfile.tokens.colors[2]?.hex ?? "#9b8f82", {
+    skipForegroundRoles: true
+  });
+  const background = pickColorToken(styleProfile.tokens.colors, ["background", "page", "canvas"], "#f3f4f6", {
+    skipForegroundRoles: true
+  });
+  const surface = pickColorToken(styleProfile.tokens.colors, ["surface", "container", "panel", "card", "neutral"], background, {
+    skipForegroundRoles: true
+  });
+  const text = pickColorToken(styleProfile.tokens.colors, ["text", "ink", "heading", "on-"], "#1f2430");
   const radius = Math.max(8, styleProfile.tokens.radiusScale[0] ?? 12);
   const googleFontsTag = buildGoogleFontsLink([typography.headlineFont, typography.bodyFont, typography.labelFont].filter(Boolean));
 
@@ -330,6 +378,7 @@ export function buildDesignSystemComponentsArtifacts(args: BuildDesignSystemArti
       --ds-primary: ${primary};
       --ds-secondary: ${secondary};
       --ds-accent: ${accent};
+      --ds-background: ${background};
       --ds-surface: ${surface};
       --ds-text: ${text};
       --ds-radius: ${radius}px;
@@ -340,7 +389,7 @@ export function buildDesignSystemComponentsArtifacts(args: BuildDesignSystemArti
     body {
       margin: 0;
       padding: 16px;
-      background: color-mix(in srgb, var(--ds-surface) 90%, white);
+      background: var(--ds-background);
       color: var(--ds-text);
       font-family: ${typography.bodyFont};
     }
@@ -348,7 +397,7 @@ export function buildDesignSystemComponentsArtifacts(args: BuildDesignSystemArti
     .ds-kit {
       border: 1px solid color-mix(in srgb, var(--ds-secondary) 20%, white);
       border-radius: calc(var(--ds-radius) + 8px);
-      background: linear-gradient(165deg, #ffffff 0%, color-mix(in srgb, var(--ds-surface) 94%, white) 100%);
+      background: linear-gradient(165deg, color-mix(in srgb, var(--ds-surface) 96%, white) 0%, color-mix(in srgb, var(--ds-background) 88%, white) 100%);
       padding: 12px;
       display: grid;
       gap: 10px;

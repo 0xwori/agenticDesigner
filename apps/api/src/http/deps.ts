@@ -2,8 +2,10 @@ import {
   clearProjectDesignSystem,
   clearProjectBoard,
   createPipelineRun,
+  createProjectAsset,
   createProject,
   createReferenceSource,
+  deleteProjectAsset,
   deleteFrame,
   getFrame,
   getFrameVersions,
@@ -11,6 +13,7 @@ import {
   getProjectDesignSystem,
   getProjectBundle,
   getReferenceSource,
+  getProjectAssets,
   resetReferenceDesignSystemMetadata,
   upsertProjectDesignSystem,
   updateFlowDocument,
@@ -71,6 +74,9 @@ export type ApiDeps = {
   getFrame: typeof getFrame;
   getFrameVersions: typeof getFrameVersions;
   createPipelineRun: typeof createPipelineRun;
+  getProjectAssets: typeof getProjectAssets;
+  createProjectAsset: typeof createProjectAsset;
+  deleteProjectAsset: typeof deleteProjectAsset;
   startPipeline: typeof startPipeline;
   generateDesignMarkdownFromStyleContext: typeof generateDesignMarkdownFromStyleContext;
   parseDesignMarkdown: typeof parseDesignMarkdown;
@@ -107,6 +113,9 @@ export const defaultApiDeps: ApiDeps = {
   getFrame,
   getFrameVersions,
   createPipelineRun,
+  getProjectAssets,
+  createProjectAsset,
+  deleteProjectAsset,
   startPipeline,
   generateDesignMarkdownFromStyleContext,
   parseDesignMarkdown,

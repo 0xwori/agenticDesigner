@@ -1,14 +1,17 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   ComposerAttachment,
+  DeckSlideCount,
   DesignSystemMode,
   DevicePreset,
   FlowDocument,
   FlowStory,
   FrameVersion,
   PipelineEvent,
+  ProjectAsset,
   ProjectSettings,
   ReferenceSource,
+  SelectedBlockContext,
   SurfaceTarget
 } from "@designer/shared";
 import { createEmptyFlowDocument, FLOW_LANE_ORDER, isMobilePreset, normalizeFlowDocument } from "@designer/shared";
@@ -19,9 +22,12 @@ import {
   calibrateProjectDesignSystem,
   clearBoard,
   createManualFrame,
+  createProjectAsset,
+  deleteProjectAsset,
   deleteFrame,
   generateFlowStory,
   getApiBaseUrl,
+  getDeckDownloadUrl,
   getProjectBundle,
   resyncReference,
   saveFlowBoardMemory,
@@ -41,7 +47,9 @@ import {
   shouldUseFlowActionRoute,
 } from "./lib/flowMode";
 import { replaceFlowDocumentInBundle, rollbackFlowDocumentIfCurrent } from "./lib/flowDocumentState";
-import { PromptPanel } from "./components/PromptPanel";
+import { ChatPanel } from "./components/chat/ChatPanel";
+import { FloatingDesignControls } from "./components/FloatingDesignControls";
+import { ProjectAssetsPanel } from "./components/ProjectAssetsPanel";
 import { FlowBoardMemoryModal } from "./components/FlowBoardMemoryModal";
 import { FlowStoryModal } from "./components/FlowStoryModal";
 import { WorkspaceSettingsModal } from "./components/WorkspaceSettingsModal";
@@ -118,6 +126,46 @@ function buildFlowBoardScopedPrompt(prompt: string) {
     "- Use the existing cell id from the board context for in-place edits whenever possible.",
     "- If the request is broad, make a coherent end-to-end journey with concise technical notes where they materially help delivery.",
   ].join("\n");
+}
+
+function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+      } else {
+        reject(new Error("File reader did not return a data URL."));
+      }
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read file."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function readFileAsText(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+      } else {
+        reject(new Error("File reader did not return text."));
+      }
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read file."));
+    reader.readAsText(file);
+  });
+}
+
+function mergeProjectAsset(bundle: AppState["project"]["bundle"], asset: ProjectAsset) {
+  if (!bundle) {
+    return bundle;
+  }
+  return {
+    ...bundle,
+    assets: [asset, ...(bundle.assets ?? []).filter((item) => item.id !== asset.id)]
+  };
 }
 
 function buildFlowStoryClipboard(story: FlowStory) {
@@ -339,6 +387,8 @@ const appStore = createStore<AppState>({
     selectedMode: _initialPrefs.modeDefault,
     selectedDesignSystemMode: "strict",
     selectedSurfaceTarget: "web",
+    deckSlideCount: 10,
+    selectedBlockContext: null,
     variation: 1,
     tailwindOverride: _initialPrefs.tailwindDefault,
   },
@@ -350,6 +400,7 @@ const appStore = createStore<AppState>({
     expandedHistoryFrameId: null,
     isWorkspaceSettingsOpen: false,
     isProjectDesignSystemOpen: false,
+    isProjectAssetsOpen: false,
     isBrandPickerOpen: false,
     activeBrandName: null,
     designSystemWarnings: [],
@@ -403,6 +454,8 @@ function AppContent() {
     selectedMode, setSelectedMode,
     selectedDesignSystemMode, setSelectedDesignSystemMode,
     selectedSurfaceTarget, setSelectedSurfaceTarget,
+    deckSlideCount, setDeckSlideCount,
+    selectedBlockContext, setSelectedBlockContext,
     variation, setVariation,
     tailwindOverride, setTailwindOverride,
   } = useInputState();
@@ -415,6 +468,7 @@ function AppContent() {
     expandedHistoryFrameId, setExpandedHistoryFrameId,
     isWorkspaceSettingsOpen, setWorkspaceSettingsOpen,
     isProjectDesignSystemOpen, setProjectDesignSystemOpen,
+    isProjectAssetsOpen, setProjectAssetsOpen,
     isBrandPickerOpen, setBrandPickerOpen,
     activeBrandName, setActiveBrandName,
     designSystemWarnings, setDesignSystemWarnings,
@@ -507,7 +561,7 @@ function AppContent() {
   // Keep the ref in sync so pipelineEvents can call openProjectDesignSystem without a circular dep
   openProjectDesignSystemRef.current = openProjectDesignSystem;
 
-  const { removeComposerAttachment, addFigmaAttachment, addImageAttachment } = useComposerAttachments(appendSystemEvent);
+  const { removeComposerAttachment, addFigmaAttachment, addImageAttachment, addTextAttachment } = useComposerAttachments(appendSystemEvent);
 
   // Toast state for artboard import guidance
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -530,11 +584,78 @@ function AppContent() {
   const [flowBoardMemoryDraft, setFlowBoardMemoryDraft] = useState("");
   const [flowBoardMemorySaving, setFlowBoardMemorySaving] = useState(false);
   const [flowBoardMemoryError, setFlowBoardMemoryError] = useState<string | null>(null);
+  const [assetPanelBusy, setAssetPanelBusy] = useState(false);
   const showToast = useCallback((msg: string, durationMs = 5000) => {
     setToastMessage(msg);
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     toastTimerRef.current = setTimeout(() => setToastMessage(null), durationMs);
   }, []);
+
+  const handleUploadProjectAssets = useCallback(async (files: File[]) => {
+    if (!projectId) {
+      showToast("Create or load a project before uploading assets.", 3200);
+      return;
+    }
+
+    setAssetPanelBusy(true);
+    try {
+      for (const file of files) {
+        const normalizedName = file.name.toLowerCase();
+        const isImage = file.type.startsWith("image/") || normalizedName.endsWith(".svg");
+        const isDocument = normalizedName.endsWith(".txt") || normalizedName.endsWith(".md");
+        if (!isImage && !isDocument) {
+          appendSystemEvent({ status: "error", kind: "action", message: `Unsupported asset: ${file.name}` });
+          continue;
+        }
+
+        if (isImage && file.size > 8 * 1024 * 1024) {
+          appendSystemEvent({ status: "error", kind: "action", message: `${file.name} is too large. Image assets are capped at 8 MB.` });
+          continue;
+        }
+        if (isDocument && file.size > 500 * 1024) {
+          appendSystemEvent({ status: "error", kind: "action", message: `${file.name} is too large. Document assets are capped at 500 KB.` });
+          continue;
+        }
+
+        const payload = isImage
+          ? {
+              kind: "image" as const,
+              name: file.name,
+              mimeType: file.type || "image/svg+xml",
+              dataUrl: await readFileAsDataUrl(file)
+            }
+          : {
+              kind: "document" as const,
+              name: file.name,
+              mimeType: file.type || (normalizedName.endsWith(".md") ? "text/markdown" : "text/plain"),
+              textContent: await readFileAsText(file)
+            };
+        const { asset } = await createProjectAsset(getApiBaseUrl(preferences.apiBaseUrl), projectId, payload);
+        setBundle((current) => mergeProjectAsset(current, asset));
+      }
+      showToast("Assets uploaded", 2600);
+    } catch (reason) {
+      appendSystemEvent({
+        status: "error",
+        kind: "action",
+        message: reason instanceof Error ? reason.message : String(reason)
+      });
+    } finally {
+      setAssetPanelBusy(false);
+    }
+  }, [appendSystemEvent, preferences.apiBaseUrl, projectId, setBundle, showToast]);
+
+  const handleDeleteProjectAsset = useCallback(async (assetId: string) => {
+    if (!projectId) {
+      return;
+    }
+    await deleteProjectAsset(getApiBaseUrl(preferences.apiBaseUrl), projectId, assetId);
+    setBundle((current) => current ? {
+      ...current,
+      assets: (current.assets ?? []).filter((asset) => asset.id !== assetId)
+    } : current);
+    showToast("Asset removed", 2200);
+  }, [preferences.apiBaseUrl, projectId, setBundle, showToast]);
 
   // Artboard Figma import handler
   const handleImportFigmaScreen = useCallback(async (figmaUrl: string) => {
@@ -595,7 +716,63 @@ function AppContent() {
         frameId?: string;
         versionId?: string;
         height?: number;
+        blockId?: string;
+        label?: string;
+        selector?: string;
+        tagName?: string;
+        className?: string;
+        textSnippet?: string;
+        outerHtml?: string;
+        rect?: SelectedBlockContext["rect"];
       } | null;
+
+      if (payload?.type === "designer.block-selected") {
+        const frameId = typeof payload.frameId === "string" ? payload.frameId : null;
+        const versionId = typeof payload.versionId === "string" ? payload.versionId : null;
+        const blockId = typeof payload.blockId === "string" ? payload.blockId : null;
+        const rect = payload.rect;
+        if (!frameId || !versionId || !blockId || !rect) {
+          return;
+        }
+
+        const currentBundle = bundleRef.current;
+        const frame = currentBundle?.frames.find((item) => item.id === frameId);
+        const latestVersion = frame?.versions[frame.versions.length - 1];
+        if (!frame || !latestVersion || latestVersion.id !== versionId) {
+          return;
+        }
+
+        setSelectedBlockContext({
+          frameId,
+          versionId,
+          blockId,
+          label: typeof payload.label === "string" && payload.label.trim().length > 0 ? payload.label.trim() : blockId,
+          selector: typeof payload.selector === "string" ? payload.selector : "",
+          tagName: typeof payload.tagName === "string" ? payload.tagName : "",
+          className: typeof payload.className === "string" ? payload.className : "",
+          textSnippet: typeof payload.textSnippet === "string" ? payload.textSnippet : "",
+          outerHtml: typeof payload.outerHtml === "string" ? payload.outerHtml : "",
+          rect
+        });
+        setRunMode("edit-selected");
+        setBundle((current) => {
+          if (!current) {
+            return current;
+          }
+          return {
+            ...current,
+            frames: current.frames.map((item) => ({
+              ...item,
+              selected: item.id === frameId
+            }))
+          };
+        });
+        void updateFrameLayout(getApiBaseUrl(preferences.apiBaseUrl), frameId, { selected: true }).catch((reason) => {
+          pushDebugLog("select-block", reason, { frameId, blockId }, "warn");
+        });
+        showToast(`Editing block: ${payload.label || blockId}`, 2400);
+        return;
+      }
 
       if (!payload || payload.type !== "designer.frame-content-height") {
         return;
@@ -741,7 +918,7 @@ function AppContent() {
 
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [clearAutoFitTimer, preferences.apiBaseUrl, pushDebugLog]);
+  }, [clearAutoFitTimer, preferences.apiBaseUrl, pushDebugLog, setRunMode, setSelectedBlockContext, showToast]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -802,6 +979,7 @@ function AppContent() {
         return { ...current, frames: current.frames.filter((f) => f.id !== selected.id) };
       });
       setRunMode("new-frame");
+      setSelectedBlockContext(null);
       showToast("Frame deleted", 2500);
 
       void deleteFrame(getApiBaseUrl(preferences.apiBaseUrl), selected.id).catch((reason) => {
@@ -968,6 +1146,26 @@ function AppContent() {
     },
     [persistProjectSettings, pushDebugLog]
   );
+
+  const handleCanvasSurfaceTargetChange = useCallback((next: SurfaceTarget) => {
+    setCanvasMode("design");
+    setSelectedSurfaceTarget(next);
+    setSelectedBlockContext(null);
+    if (next === "web") {
+      setSelectedDevice("desktop");
+    } else if (next === "mobile") {
+      setSelectedDevice((current) => (isMobilePreset(current) ? current : "iphone"));
+    } else {
+      setSelectedDevice("desktop");
+      setDeckSlideCount((current) => current ?? 10);
+    }
+  }, [
+    setCanvasMode,
+    setDeckSlideCount,
+    setSelectedBlockContext,
+    setSelectedDevice,
+    setSelectedSurfaceTarget,
+  ]);
 
   async function handleResyncReference(reference: ReferenceSource) {
     const runId = createLocalRunId("resync");
@@ -1296,8 +1494,21 @@ function AppContent() {
       composerAttachments.find(
         (attachment) => attachment.type === "image" && attachment.dataUrl && attachment.status !== "failed"
       ) ?? null;
+    const textAttachment =
+      composerAttachments.find(
+        (attachment) => attachment.type === "text" && attachment.textContent && attachment.status !== "failed"
+      ) ?? null;
 
-    if (!promptValue && !figmaUrl && !imageAttachment) {
+    if (!promptValue && !figmaUrl && !imageAttachment && !textAttachment) {
+      return;
+    }
+
+    if (selectedSurfaceTarget === "deck" && (figmaUrl || imageAttachment)) {
+      appendSystemEvent({
+        status: "error",
+        kind: "action",
+        message: "Deck mode supports pasted text or .txt/.md uploads in v1. Switch to Web or Mobile for Figma/image rebuilds."
+      });
       return;
     }
 
@@ -1357,6 +1568,8 @@ function AppContent() {
       cleanedPrompt = "Add the attached image to the flow board in the user-journey lane.";
     } else if (!cleanedPrompt && imageAttachment) {
       cleanedPrompt = "Rebuild the attached image into an editable screen and refresh the canonical design-system board.";
+    } else if (selectedSurfaceTarget === "deck" && !cleanedPrompt && textAttachment) {
+      cleanedPrompt = "Create a presentation deck from the attached text.";
     }
 
     if (canvasMode === "flow" && !activeFlowFrame && (cleanedPrompt || imageAttachment) && !figmaUrl) {
@@ -1397,6 +1610,8 @@ function AppContent() {
     }
 
     const selectedSourceMeta = selectedDesignFrame ? extractFrameSourceMeta(selectedDesignFrame) : null;
+    const selectedDesignVersionId =
+      selectedDesignFrame?.currentVersionId ?? selectedDesignFrame?.versions[selectedDesignFrame.versions.length - 1]?.id ?? null;
     const selectedFrameContext = selectedDesignFrame
       ? {
           frameId: selectedDesignFrame.id,
@@ -1407,12 +1622,21 @@ function AppContent() {
             width: selectedDesignFrame.size.width,
             height: selectedDesignFrame.size.height
           },
-          latestVersionId: selectedDesignFrame.currentVersionId,
+          latestVersionId: selectedDesignVersionId,
           sourceType: selectedSourceMeta?.sourceType ?? null,
           sourceRole: selectedSourceMeta?.sourceRole ?? null,
-          sourceGroupId: selectedSourceMeta?.sourceGroupId ?? null
+          sourceGroupId: selectedSourceMeta?.sourceGroupId ?? null,
+          frameKind: selectedDesignFrame.frameKind
         }
       : undefined;
+
+    const blockContextForRun =
+      selectedBlockContext &&
+      selectedDesignFrame &&
+      selectedBlockContext.frameId === selectedDesignFrame.id &&
+      selectedBlockContext.versionId === selectedDesignVersionId
+        ? selectedBlockContext
+        : undefined;
 
     const payload = {
       prompt: cleanedPrompt,
@@ -1423,10 +1647,12 @@ function AppContent() {
       mode: selectedMode,
       surfaceTarget: selectedSurfaceTarget,
       designSystemMode: selectedDesignSystemMode,
+      deckSlideCount,
       variation,
       tailwindEnabled: tailwindOverride,
-      attachments: imageAttachment ? [imageAttachment] : undefined,
+      attachments: imageAttachment ? [imageAttachment] : textAttachment ? [textAttachment] : undefined,
       selectedFrameContext,
+      selectedBlockContext: blockContextForRun,
       intentHint: runMode === "edit-selected" && selectedDesignFrame && !imageAttachment ? "screen-action" as const : undefined
     } as const;
 
@@ -1490,9 +1716,11 @@ function AppContent() {
         designMode: selectedMode,
         surfaceTarget: selectedSurfaceTarget,
         designSystemMode: selectedDesignSystemMode,
+        deckSlideCount,
         variation,
         attachmentCount: payload.attachments?.length ?? 0,
-        selectedFrameContext: payload.selectedFrameContext ?? null
+        selectedFrameContext: payload.selectedFrameContext ?? null,
+        selectedBlockContext: payload.selectedBlockContext ?? null
       }, "info");
     } catch (reason) {
       pushDebugLog("start-run", reason, {
@@ -1523,6 +1751,7 @@ function AppContent() {
       mode: frame.mode,
       surfaceTarget: selectedSurfaceTarget,
       designSystemMode: selectedDesignSystemMode,
+      deckSlideCount,
       variation: 1,
       tailwindEnabled: tailwindOverride,
     } as const;
@@ -1727,6 +1956,7 @@ function AppContent() {
     if (!selectedFrame) {
       lastFocusedFrameIdRef.current = null;
       setRunMode((current) => (current === "edit-selected" ? "new-frame" : current));
+      setSelectedBlockContext(null);
       return;
     }
     if (lastFocusedFrameIdRef.current === selectedFrame.id) {
@@ -1750,7 +1980,7 @@ function AppContent() {
     if (selectedFrame.frameKind !== "flow") {
       focusViewportOnFrame(selectedFrame.id);
     }
-  }, [appendSystemEvent, focusViewportOnFrame, selectedFrame]);
+  }, [appendSystemEvent, focusViewportOnFrame, selectedFrame, setSelectedBlockContext, setRunMode]);
 
   function zoomBy(factor: number) {
     if (canvasMode === "flow") {
@@ -1906,6 +2136,7 @@ function AppContent() {
     if (frame?.frameKind === "flow") {
       setLastFlowFrameId(frameId);
     }
+    setSelectedBlockContext(null);
     setRunMode("edit-selected");
     setBundle((current) => {
       if (!current) {
@@ -2027,11 +2258,13 @@ function AppContent() {
     const selected = currentBundle.frames.find((frame) => frame.selected);
     if (!selected) {
       setRunMode("new-frame");
+      setSelectedBlockContext(null);
       return;
     }
 
     lastFocusedFrameIdRef.current = null;
     setRunMode("new-frame");
+    setSelectedBlockContext(null);
     showToast("Deselected — next prompt creates a new screen", 3000);
     setBundle((current) => {
       if (!current) {
@@ -2196,6 +2429,9 @@ function AppContent() {
   const hasReadyAttachment = composerAttachments.some((attachment) => {
     if (attachment.type === "figma-link") {
       return Boolean(attachment.url);
+    }
+    if (attachment.type === "text") {
+      return Boolean(attachment.textContent?.trim()) && attachment.status !== "failed";
     }
     return Boolean(attachment.dataUrl) && attachment.status !== "failed";
   });
@@ -2622,6 +2858,9 @@ function AppContent() {
 
   const handleCanvasModeChange = useCallback(async (mode: "design" | "flow") => {
     setCanvasMode(mode);
+    if (mode === "flow") {
+      setSelectedBlockContext(null);
+    }
     if (mode !== "flow") {
       setFocusedFlowAreaId(null);
       if (selectedFrame?.frameKind === "flow") {
@@ -2661,6 +2900,7 @@ function AppContent() {
     setCanvasMode,
     setFocusedFlowAreaId,
     setLastFlowFrameId,
+    setSelectedBlockContext,
     setRunMode,
   ]);
 
@@ -2720,13 +2960,14 @@ function AppContent() {
 
   return (
     <div className="app-shell">
-      <PromptPanel
+      <ChatPanel
         bundle={bundle}
         preferences={preferences}
         composerPrompt={composerPrompt}
         setComposerPrompt={setComposerPrompt}
         composerAttachments={composerAttachments}
         addImageAttachment={addImageAttachment}
+        addTextAttachment={addTextAttachment}
         addFigmaAttachment={addFigmaAttachment}
         removeComposerAttachment={removeComposerAttachment}
         runMode={runMode}
@@ -2738,7 +2979,9 @@ function AppContent() {
         selectedDesignSystemMode={selectedDesignSystemMode}
         setSelectedDesignSystemMode={setSelectedDesignSystemMode}
         selectedSurfaceTarget={selectedSurfaceTarget}
-        setSelectedSurfaceTarget={setSelectedSurfaceTarget}
+        deckSlideCount={deckSlideCount}
+        setDeckSlideCount={setDeckSlideCount}
+        selectedBlockContext={selectedBlockContext}
         variation={variation}
         setVariation={setVariation}
         tailwindOverride={tailwindOverride}
@@ -2750,9 +2993,6 @@ function AppContent() {
         initializeProject={initializeProject}
         handleRun={handleRun}
         openWorkspaceSettings={() => setWorkspaceSettingsOpen(true)}
-        openProjectDesignSystem={() => {
-          void openProjectDesignSystem();
-        }}
         formatThoughtDuration={formatThoughtDuration}
         canSubmit={canSubmit}
         selectedFrameContextLabel={selectedFrameContextLabel}
@@ -2762,6 +3002,15 @@ function AppContent() {
         flowMutationReviews={flowMutationReviews}
         onApproveFlowMutationReview={approveFlowMutationReview}
         onRejectFlowMutationReview={rejectFlowMutationReview}
+      />
+
+      <FloatingDesignControls
+        canvasMode={canvasMode}
+        selectedSurfaceTarget={selectedSurfaceTarget}
+        assetCount={bundle?.assets?.length ?? 0}
+        assetsOpen={isProjectAssetsOpen}
+        onSurfaceTargetChange={handleCanvasSurfaceTargetChange}
+        onOpenAssets={() => setProjectAssetsOpen(true)}
       />
 
       <WorkspaceSettingsModal
@@ -2834,6 +3083,15 @@ function AppContent() {
         onRegenerateAllReferences={regenerateDesignSystemFromAllReferences}
         onAddFigmaReference={addFigmaReferenceFromDesignSystemModal}
         onAddImageReferences={addImageReferencesFromDesignSystemModal}
+      />
+
+      <ProjectAssetsPanel
+        open={isProjectAssetsOpen}
+        assets={bundle?.assets ?? []}
+        busy={assetPanelBusy}
+        onClose={() => setProjectAssetsOpen(false)}
+        onUpload={handleUploadProjectAssets}
+        onDelete={handleDeleteProjectAsset}
       />
 
       <FlowStoryModal
@@ -2911,6 +3169,9 @@ function AppContent() {
         onOpenBrandPicker={() => setBrandPickerOpen(true)}
         toggleFrameHeight={toggleFrameHeight}
         onRegenerate={(fId) => void handleRegenerate(fId)}
+        onDownloadDeck={(frameId) => {
+          window.open(getDeckDownloadUrl(getApiBaseUrl(preferences.apiBaseUrl), frameId), "_blank", "noopener,noreferrer");
+        }}
         framePrompts={framePromptsSnapshot}
         canvasMode={canvasMode}
         onCanvasModeChange={handleCanvasModeChange}

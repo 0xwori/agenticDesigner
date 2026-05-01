@@ -104,4 +104,73 @@ describe("buildDesignSystemComponentsArtifacts", () => {
     expect(artifacts.sourceCode).toContain('data-section-id="color-system"');
     expect(artifacts.sourceCode).toContain('className="ds-swatch-grid"');
   });
+
+  it("uses the explicit background role instead of positional black tokens", () => {
+    const profileBundle = buildStyleProfileFromStyleContext({
+      styleContext,
+      sourceType: "manual",
+      componentRecipes,
+      explicitQualityScore: 0.88
+    });
+    const styleProfile = {
+      ...profileBundle.styleProfile,
+      tokens: {
+        ...profileBundle.styleProfile.tokens,
+        colors: [
+          { name: "Near Black", hex: "#111111", role: "Primary text on light backgrounds" },
+          { name: "Brand Blue", hex: "#2563eb", role: "Primary CTA and focus color" },
+          { name: "Pure White", hex: "#ffffff", role: "Page background and app canvas" },
+          { name: "Light Surface", hex: "#f4f4f5", role: "Cards, panels, and container surfaces" }
+        ]
+      }
+    };
+
+    const artifacts = buildDesignSystemComponentsArtifacts({
+      styleContext,
+      frameName: "Role-aware DS",
+      scope: "page",
+      styleProfile,
+      qualityReport: profileBundle.qualityReport,
+      sourceLabel: "Manual",
+      sourceDescription: "role-aware color fixture"
+    });
+
+    expect(artifacts.cssCode).toContain("--ds-background: #ffffff;");
+    expect(artifacts.cssCode).toContain("--ds-surface: #f4f4f5;");
+    expect(artifacts.cssCode).toContain("--ds-text: #111111;");
+  });
+
+  it("honors explicit dark background tokens", () => {
+    const profileBundle = buildStyleProfileFromStyleContext({
+      styleContext,
+      sourceType: "manual",
+      componentRecipes,
+      explicitQualityScore: 0.88
+    });
+    const styleProfile = {
+      ...profileBundle.styleProfile,
+      tokens: {
+        ...profileBundle.styleProfile.tokens,
+        colors: [
+          { name: "Background", hex: "#000000", role: "Primary page and app background" },
+          { name: "Surface", hex: "#151515", role: "Cards, panels, and container surfaces" },
+          { name: "Text", hex: "#f8fafc", role: "Primary text on dark backgrounds" },
+          { name: "Brand Green", hex: "#00d992", role: "Primary CTA and focus color" }
+        ]
+      }
+    };
+
+    const artifacts = buildDesignSystemComponentsArtifacts({
+      styleContext,
+      frameName: "Dark DS",
+      scope: "page",
+      styleProfile,
+      qualityReport: profileBundle.qualityReport,
+      sourceLabel: "Manual"
+    });
+
+    expect(artifacts.cssCode).toContain("--ds-background: #000000;");
+    expect(artifacts.cssCode).toContain("--ds-surface: #151515;");
+    expect(artifacts.cssCode).toContain("--ds-text: #f8fafc;");
+  });
 });

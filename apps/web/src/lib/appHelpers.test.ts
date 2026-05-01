@@ -42,6 +42,14 @@ describe("buildPreviewDocument", () => {
     expect(html).toContain("window.setTimeout(__stopHeightTracking, __heightTrackingWindowMs)");
   });
 
+  it("embeds block selection bridge for option-click scoped edits", () => {
+    const html = buildPreviewDocument("frame-123", createVersion({ id: "version-9" }));
+
+    expect(html).toContain("designer.block-selected");
+    expect(html).toContain("data-designer-block");
+    expect(html).toContain("__installBlockSelection");
+  });
+
   it("escapes style and script closing tags", () => {
     const html = buildPreviewDocument(
       "frame-123",

@@ -441,9 +441,14 @@ function buildColorTokens(styleContext: ReferenceStyleContext): DesignMdColorTok
       role: "Highlights, badges, decorative accents"
     },
     {
+      name: "Background",
+      hex: normalizeHexColor(styleContext.palette.background ?? styleContext.palette.surface),
+      role: "Primary page and app background"
+    },
+    {
       name: "Surface",
       hex: normalizeHexColor(styleContext.palette.surface),
-      role: "Background and container surfaces"
+      role: "Cards, panels, and container surfaces"
     },
     {
       name: "Text",

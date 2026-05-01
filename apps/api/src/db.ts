@@ -15,6 +15,7 @@ import {
   type ProjectDesignSystem,
   type Project,
   type ProjectBundle,
+  type ProjectAsset,
   type ProjectSettings,
   type ReferenceSource,
   type ReferenceStyleContext,
@@ -225,6 +226,21 @@ function mapReferenceRow(row: Record<string, any>): ReferenceSource {
   };
 }
 
+function mapProjectAssetRow(row: Record<string, any>): ProjectAsset {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    kind: row.kind,
+    name: row.name,
+    mimeType: row.mime_type,
+    size: Number(row.size_bytes ?? 0),
+    dataUrl: row.data_url ?? null,
+    textContent: row.text_content ?? null,
+    createdAt: toIso(row.created_at) ?? new Date().toISOString(),
+    updatedAt: toIso(row.updated_at) ?? new Date().toISOString()
+  };
+}
+
 function mapFrameRow(row: Record<string, any>): Frame {
   return {
     id: row.id,
@@ -324,6 +340,19 @@ export async function initDatabase() {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
 
+      CREATE TABLE IF NOT EXISTS project_assets (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        data_url TEXT,
+        text_content TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
       CREATE TABLE IF NOT EXISTS frames (
         id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -387,6 +416,7 @@ export async function initDatabase() {
 
       CREATE INDEX IF NOT EXISTS idx_reference_project ON reference_sources(project_id);
       CREATE INDEX IF NOT EXISTS idx_project_design_system_source_ref ON project_design_systems(source_reference_id);
+      CREATE INDEX IF NOT EXISTS idx_project_assets_project ON project_assets(project_id);
       CREATE INDEX IF NOT EXISTS idx_frames_project ON frames(project_id);
       CREATE INDEX IF NOT EXISTS idx_frame_versions_frame ON frame_versions(frame_id);
       CREATE INDEX IF NOT EXISTS idx_runs_project ON pipeline_runs(project_id);
@@ -460,6 +490,12 @@ export async function getProjectBundle(projectId: string): Promise<ProjectBundle
   );
   const references = referencesResult.rows.map(mapReferenceRow);
 
+  const assetsResult = await pool.query(
+    `SELECT * FROM project_assets WHERE project_id = $1 ORDER BY created_at DESC`,
+    [projectId]
+  );
+  const assets = assetsResult.rows.map(mapProjectAssetRow);
+
   const framesResult = await pool.query(`SELECT * FROM frames WHERE project_id = $1 ORDER BY created_at ASC`, [projectId]);
   const frames = framesResult.rows.map(mapFrameRow);
 
@@ -497,8 +533,52 @@ export async function getProjectBundle(projectId: string): Promise<ProjectBundle
     project,
     references,
     frames: frameWithVersions,
-    designSystem
+    designSystem,
+    assets
   };
+}
+
+export async function getProjectAssets(projectId: string): Promise<ProjectAsset[]> {
+  const result = await pool.query(`SELECT * FROM project_assets WHERE project_id = $1 ORDER BY created_at DESC`, [projectId]);
+  return result.rows.map(mapProjectAssetRow);
+}
+
+export async function createProjectAsset(input: {
+  projectId: string;
+  kind: ProjectAsset["kind"];
+  name: string;
+  mimeType: string;
+  size: number;
+  dataUrl?: string | null;
+  textContent?: string | null;
+}): Promise<ProjectAsset> {
+  const id = crypto.randomUUID();
+  const result = await pool.query(
+    `
+      INSERT INTO project_assets (
+        id, project_id, kind, name, mime_type, size_bytes, data_url, text_content
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+    `,
+    [
+      id,
+      input.projectId,
+      input.kind,
+      input.name,
+      input.mimeType,
+      Math.max(0, Math.floor(input.size)),
+      input.dataUrl ?? null,
+      input.textContent ?? null
+    ]
+  );
+
+  return mapProjectAssetRow(result.rows[0]);
+}
+
+export async function deleteProjectAsset(projectId: string, assetId: string): Promise<boolean> {
+  const result = await pool.query(`DELETE FROM project_assets WHERE project_id = $1 AND id = $2`, [projectId, assetId]);
+  return (result.rowCount ?? 0) > 0;
 }
 
 export async function updateProjectSettings(projectId: string, patch: Partial<ProjectSettings>): Promise<Project | null> {

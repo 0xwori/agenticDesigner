@@ -66,6 +66,7 @@ const FALLBACK_STYLE_CONTEXT: ReferenceStyleContext = {
     primary: "#8b8f98",
     secondary: "#6f7785",
     accent: "#9b8f82",
+    background: "#f5f5f6",
     surface: "#f5f5f6",
     text: "#202327"
   },
@@ -236,29 +237,39 @@ function parseLayoutTokens(sectionBody: string): { spacingScale: number[]; radiu
   return { spacingScale, radiusScale };
 }
 
-function firstColorByName(colors: DesignMdColorToken[], fallback: string, names: string[]) {
-  // 1. Check name
-  const byName = colors.find((item) => {
-    const lowered = item.name.toLowerCase();
-    return names.some((name) => lowered.includes(name));
-  });
-  if (byName) return byName.hex;
+function firstColorByName(
+  colors: DesignMdColorToken[],
+  fallback: string,
+  names: string[],
+  options?: { skipForegroundRoles?: boolean }
+) {
+  const shouldSkip = (item: DesignMdColorToken & { _subsection?: string }) =>
+    options?.skipForegroundRoles === true && isForegroundColorRole(item);
 
-  // 2. Check role description (e.g. role says "Primary brand color" → matches "primary")
-  const byRole = colors.find((item) => {
-    const lowered = item.role.toLowerCase();
-    return names.some((name) => lowered.includes(name));
-  });
-  if (byRole) return byRole.hex;
+  for (const matcher of names) {
+    const needle = matcher.toLowerCase();
+    const byName = colors.find((item) => item.name.toLowerCase().includes(needle) && !shouldSkip(item));
+    if (byName) return byName.hex;
 
-  // 3. Check subsection tag (injected from ### headers during parsing)
-  const byTag = colors.find((item) => {
-    const tag = (item as DesignMdColorToken & { _subsection?: string })._subsection?.toLowerCase() ?? "";
-    return names.some((name) => tag.includes(name));
-  });
-  if (byTag) return byTag.hex;
+    const byRole = colors.find((item) => item.role.toLowerCase().includes(needle) && !shouldSkip(item));
+    if (byRole) return byRole.hex;
+
+    const byTag = colors.find((item) => {
+      const tag = (item as DesignMdColorToken & { _subsection?: string })._subsection?.toLowerCase() ?? "";
+      return tag.includes(needle) && !shouldSkip(item);
+    });
+    if (byTag) return byTag.hex;
+  }
 
   return fallback;
+}
+
+function isForegroundColorRole(item: DesignMdColorToken & { _subsection?: string }) {
+  const text = `${item.role ?? ""} ${item._subsection ?? ""}`.toLowerCase();
+  return (
+    /\b(text|copy|heading|foreground|ink)\b/.test(text) ||
+    /\bon\s+(?:light|dark|brand|colored|neutral)?\s*backgrounds?\b/.test(text)
+  );
 }
 
 function normalizeColorTokens(colors: DesignMdColorToken[], styleContext: ReferenceStyleContext): DesignMdColorToken[] {
@@ -435,7 +446,8 @@ function colorTokensFromContext(styleContext?: ReferenceStyleContext): DesignMdC
       { name: "Primary", hex: safeContext.palette.primary, role: "CTAs, active states, key interactive elements" },
       { name: "Secondary", hex: safeContext.palette.secondary, role: "Supporting actions, chips, toggle states" },
       { name: "Accent", hex: safeContext.palette.accent, role: "Accent highlights, badges, decorative elements" },
-      { name: "Surface", hex: safeContext.palette.surface, role: "Backgrounds and container surfaces" },
+      { name: "Background", hex: safeContext.palette.background ?? safeContext.palette.surface, role: "Primary page and app background" },
+      { name: "Surface", hex: safeContext.palette.surface, role: "Cards, panels, and container surfaces" },
       { name: "Text", hex: safeContext.palette.text, role: "Primary text and icon color" }
     ],
     safeContext
@@ -644,10 +656,15 @@ export function parseDesignMarkdown(
 
   // Build palette with positional fallbacks: if name/role/subsection search fails,
   // use the first few distinct colors from the parsed list as fallbacks.
-  const resolvedPrimary = firstColorByName(colors, "", ["primary", "brand"]);
-  const resolvedSecondary = firstColorByName(colors, "", ["secondary", "support"]);
-  const resolvedAccent = firstColorByName(colors, "", ["accent", "tertiary"]);
-  const resolvedSurface = firstColorByName(colors, "", ["surface", "neutral", "background", "page"]);
+  const resolvedPrimary = firstColorByName(colors, "", ["primary", "brand"], { skipForegroundRoles: true });
+  const resolvedSecondary = firstColorByName(colors, "", ["secondary", "support"], { skipForegroundRoles: true });
+  const resolvedAccent = firstColorByName(colors, "", ["accent", "tertiary"], { skipForegroundRoles: true });
+  const resolvedBackground = firstColorByName(colors, "", ["background", "page", "canvas"], {
+    skipForegroundRoles: true
+  });
+  const resolvedSurface = firstColorByName(colors, "", ["surface", "container", "panel", "card", "neutral"], {
+    skipForegroundRoles: true
+  });
   const resolvedText = firstColorByName(colors, "", ["text", "ink", "on", "heading"]);
 
   // Positional fallback: first color = primary, skip duplicates for others
@@ -669,6 +686,7 @@ export function parseDesignMarkdown(
   usedPositional.add(finalSecondary);
   const finalAccent = resolvedAccent || nextPositional() || safeContext.palette.accent;
   usedPositional.add(finalAccent);
+  const finalBackground = resolvedBackground || safeContext.palette.background || safeContext.palette.surface;
   const finalSurface = resolvedSurface || safeContext.palette.surface;
   const finalText = resolvedText || safeContext.palette.text;
 
@@ -678,6 +696,7 @@ export function parseDesignMarkdown(
       primary: finalPrimary,
       secondary: finalSecondary,
       accent: finalAccent,
+      background: finalBackground,
       surface: finalSurface,
       text: finalText
     },

@@ -215,6 +215,7 @@ export function WorkspaceSettingsModal(props: WorkspaceSettingsModalProps) {
                 >
                   <option value="web">Web</option>
                   <option value="mobile">Mobile</option>
+                  <option value="deck">Deck</option>
                 </select>
               </SettingsField>
               <SettingsField label="Design system mode default">

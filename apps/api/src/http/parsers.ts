@@ -1,10 +1,12 @@
 import crypto from "node:crypto";
 import type {
   ComposerAttachment,
+  DeckSlideCount,
   DesignMode,
   DesignSystemMode,
   DevicePreset,
   ProviderId,
+  SelectedBlockContext,
   SelectedFrameContext,
   SurfaceTarget
 } from "@designer/shared";
@@ -52,7 +54,23 @@ export function parseDesignSystemMode(value: unknown): DesignSystemMode {
 }
 
 export function parseSurfaceTarget(value: unknown): SurfaceTarget {
-  return value === "mobile" ? "mobile" : "web";
+  if (value === "mobile" || value === "deck") {
+    return value;
+  }
+  return "web";
+}
+
+export function parseDeckSlideCount(value: unknown): DeckSlideCount {
+  if (value === 5 || value === 10 || value === 25) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (parsed === 5 || parsed === 10 || parsed === 25) {
+      return parsed;
+    }
+  }
+  return 10;
 }
 
 export function parseNonEmptyString(value: unknown): string | undefined {
@@ -76,7 +94,7 @@ export function parseAttachments(value: unknown): ComposerAttachment[] | undefin
     }
     const record = item as Record<string, unknown>;
     const type = record.type;
-    if (type !== "image" && type !== "figma-link") {
+    if (type !== "image" && type !== "figma-link" && type !== "text") {
       continue;
     }
 
@@ -90,7 +108,8 @@ export function parseAttachments(value: unknown): ComposerAttachment[] | undefin
       url: typeof record.url === "string" ? record.url : undefined,
       name: typeof record.name === "string" ? record.name : undefined,
       mimeType: typeof record.mimeType === "string" ? record.mimeType : undefined,
-      dataUrl: typeof record.dataUrl === "string" ? record.dataUrl : undefined
+      dataUrl: typeof record.dataUrl === "string" ? record.dataUrl : undefined,
+      textContent: typeof record.textContent === "string" ? record.textContent : undefined
     };
 
     if (attachment.type === "figma-link") {
@@ -124,7 +143,71 @@ export function parseAttachments(value: unknown): ComposerAttachment[] | undefin
     }
   }
 
+  const textAttachments = parsed.filter((attachment) => attachment.type === "text");
+  if (textAttachments.length > 1) {
+    throw new Error("Only one text attachment is supported per message.");
+  }
+
+  const text = textAttachments[0];
+  if (text) {
+    const allowedMime = new Set(["text/plain", "text/markdown", "text/x-markdown"]);
+    const normalizedName = text.name?.toLowerCase() ?? "";
+    const hasAllowedExtension = normalizedName.endsWith(".txt") || normalizedName.endsWith(".md");
+    if ((text.mimeType && !allowedMime.has(text.mimeType)) && !hasAllowedExtension) {
+      throw new Error("Unsupported text attachment type. Use .txt or .md.");
+    }
+    if (!text.textContent || text.textContent.trim().length === 0) {
+      throw new Error("Text attachment must include text content.");
+    }
+    if (text.textContent.length > 300_000) {
+      throw new Error("Text attachment is too large. Max supported size is 300 KB.");
+    }
+  }
+
   return parsed.length > 0 ? parsed : undefined;
+}
+
+function parseFiniteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+export function parseSelectedBlockContext(value: unknown): SelectedBlockContext | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const rect = record.rect as Record<string, unknown> | null;
+  if (!rect || typeof rect !== "object") {
+    return undefined;
+  }
+
+  const frameId = typeof record.frameId === "string" ? record.frameId.trim() : "";
+  const versionId = typeof record.versionId === "string" ? record.versionId.trim() : "";
+  const blockId = typeof record.blockId === "string" ? record.blockId.trim() : "";
+  if (!frameId || !versionId || !blockId) {
+    return undefined;
+  }
+
+  const x = parseFiniteNumber(rect.x);
+  const y = parseFiniteNumber(rect.y);
+  const width = parseFiniteNumber(rect.width);
+  const height = parseFiniteNumber(rect.height);
+  if (x === null || y === null || width === null || height === null) {
+    return undefined;
+  }
+
+  return {
+    frameId,
+    versionId,
+    blockId,
+    label: typeof record.label === "string" ? record.label.slice(0, 160) : blockId,
+    selector: typeof record.selector === "string" ? record.selector.slice(0, 512) : "",
+    tagName: typeof record.tagName === "string" ? record.tagName.slice(0, 32) : "",
+    className: typeof record.className === "string" ? record.className.slice(0, 512) : "",
+    textSnippet: typeof record.textSnippet === "string" ? record.textSnippet.slice(0, 1000) : "",
+    outerHtml: typeof record.outerHtml === "string" ? record.outerHtml.slice(0, 6000) : "",
+    rect: { x, y, width, height }
+  };
 }
 
 export function parseSelectedFrameContext(value: unknown): SelectedFrameContext | undefined {

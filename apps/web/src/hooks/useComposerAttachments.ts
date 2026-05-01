@@ -8,6 +8,7 @@ export type ComposerAttachmentsApi = {
   removeComposerAttachment: (attachmentId: string) => void;
   addFigmaAttachment: (rawUrl: string) => void;
   addImageAttachment: (file: File) => Promise<void>;
+  addTextAttachment: (file: File) => Promise<void>;
 };
 
 export function useComposerAttachments(
@@ -92,5 +93,55 @@ export function useComposerAttachments(
     [appendSystemEvent, composerAttachments, setComposerAttachments]
   );
 
-  return { removeComposerAttachment, addFigmaAttachment, addImageAttachment };
+  const addTextAttachment = useCallback(
+    async (file: File) => {
+      const normalizedName = file.name.toLowerCase();
+      if (!normalizedName.endsWith(".txt") && !normalizedName.endsWith(".md")) {
+        appendSystemEvent({ status: "error", kind: "action", message: "Unsupported deck source. Use .txt or .md." });
+        return;
+      }
+      if (file.size > 300 * 1024) {
+        appendSystemEvent({ status: "error", kind: "action", message: "Text source is too large. Max supported size is 300 KB." });
+        return;
+      }
+      if (composerAttachments.some((a) => a.type === "text" && a.status !== "failed")) {
+        appendSystemEvent({ status: "error", kind: "action", message: "Only one text source is supported per message." });
+        return;
+      }
+
+      const provisionalId = `text-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      setComposerAttachments((current) => [
+        ...current.filter((a) => !(a.type === "text" && a.status === "failed")),
+        { id: provisionalId, type: "text", status: "pending", name: file.name, mimeType: file.type || "text/plain" }
+      ]);
+
+      const textContent = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          if (typeof reader.result === "string") resolve(reader.result);
+          else reject(new Error("File reader did not return text."));
+        };
+        reader.onerror = () => reject(reader.error ?? new Error("Failed to read text source."));
+        reader.readAsText(file);
+      }).catch((reason) => {
+        appendSystemEvent({ status: "error", kind: "action", message: reason instanceof Error ? reason.message : String(reason) });
+        return null;
+      });
+
+      if (!textContent) {
+        setComposerAttachments((current) =>
+          current.map((a) => (a.id !== provisionalId ? a : { ...a, status: "failed" }))
+        );
+        return;
+      }
+
+      setComposerAttachments((current) =>
+        current.map((a) => (a.id !== provisionalId ? a : { ...a, status: "uploaded", textContent }))
+      );
+      appendSystemEvent({ status: "success", kind: "action", message: "Text source attached for deck generation.", payload: { name: file.name } });
+    },
+    [appendSystemEvent, composerAttachments, setComposerAttachments]
+  );
+
+  return { removeComposerAttachment, addFigmaAttachment, addImageAttachment, addTextAttachment };
 }

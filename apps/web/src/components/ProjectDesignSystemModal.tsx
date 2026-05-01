@@ -45,20 +45,29 @@ type VisualPalette = {
   primary: string;
   secondary: string;
   accent: string;
+  background: string;
   surface: string;
   text: string;
 };
 
 function pickColorByName(
-  colors: Array<{ name: string; hex: string }>,
+  colors: Array<{ name: string; hex: string; role?: string; _subsection?: string }>,
   candidates: string[],
-  fallbackIndex?: number
+  fallbackIndex?: number,
+  options?: { skipForegroundRoles?: boolean }
 ) {
-  const tokenByName = colors.find((token) =>
-    candidates.some((candidate) => token.name.toLowerCase().includes(candidate.toLowerCase()))
-  );
-  if (tokenByName?.hex) {
-    return tokenByName.hex;
+  const shouldSkip = (item: { role?: string; _subsection?: string }) =>
+    options?.skipForegroundRoles === true && isForegroundColorRole(item);
+
+  for (const candidate of candidates) {
+    const needle = candidate.toLowerCase();
+    const token = colors.find((item) => {
+      const haystack = `${item.name} ${item.role ?? ""} ${item._subsection ?? ""}`.toLowerCase();
+      return haystack.includes(needle) && !shouldSkip(item);
+    });
+    if (token?.hex) {
+      return token.hex;
+    }
   }
   if (typeof fallbackIndex === "number" && colors[fallbackIndex]?.hex) {
     return colors[fallbackIndex].hex;
@@ -66,16 +75,31 @@ function pickColorByName(
   return null;
 }
 
+function isForegroundColorRole(item: { role?: string; _subsection?: string }) {
+  const text = `${item.role ?? ""} ${item._subsection ?? ""}`.toLowerCase();
+  return (
+    /\b(text|copy|heading|foreground|ink)\b/.test(text) ||
+    /\bon\s+(?:light|dark|brand|colored|neutral)?\s*backgrounds?\b/.test(text)
+  );
+}
+
 function buildPalette(designSystem: ProjectDesignSystem | null): VisualPalette | null {
   const tokens = designSystem?.structuredTokens.colors ?? [];
   if (tokens.length === 0) {
     return null;
   }
+  const background =
+    pickColorByName(tokens, ["background", "page", "canvas"], undefined, { skipForegroundRoles: true }) ??
+    pickColorByName(tokens, ["surface", "container", "panel", "card", "neutral"], undefined, { skipForegroundRoles: true }) ??
+    "#f5f5f6";
   return {
-    primary: pickColorByName(tokens, ["primary", "brand"], 0) ?? tokens[0].hex,
-    secondary: pickColorByName(tokens, ["secondary", "support"], 1) ?? tokens[0].hex,
-    accent: pickColorByName(tokens, ["accent", "tertiary"], 2) ?? tokens[0].hex,
-    surface: pickColorByName(tokens, ["surface", "background", "neutral"], 3) ?? tokens[0].hex,
+    primary: pickColorByName(tokens, ["primary", "brand"], 0, { skipForegroundRoles: true }) ?? tokens[0].hex,
+    secondary: pickColorByName(tokens, ["secondary", "support"], 1, { skipForegroundRoles: true }) ?? tokens[0].hex,
+    accent: pickColorByName(tokens, ["accent", "tertiary"], 2, { skipForegroundRoles: true }) ?? tokens[0].hex,
+    background,
+    surface:
+      pickColorByName(tokens, ["surface", "container", "panel", "card", "neutral"], undefined, { skipForegroundRoles: true }) ??
+      background,
     text: pickColorByName(tokens, ["text", "ink", "on"], 4) ?? tokens[0].hex
   };
 }
@@ -345,6 +369,7 @@ export function ProjectDesignSystemModal(props: ProjectDesignSystemModalProps) {
         "--ds-primary": visualPalette?.primary ?? "#8b8f98",
         "--ds-secondary": visualPalette?.secondary ?? "#6f7785",
         "--ds-accent": visualPalette?.accent ?? "#9b8f82",
+        "--ds-background": visualPalette?.background ?? "#f5f5f6",
         "--ds-surface": visualPalette?.surface ?? "#f5f5f6",
         "--ds-text": visualPalette?.text ?? "#202327"
       }) as CSSProperties,

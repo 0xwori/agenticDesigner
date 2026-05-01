@@ -126,6 +126,7 @@ function buildHeuristicStyleContext(seedSource: string): ReferenceStyleContext {
       primary: hslToHex(hue, 76, 46),
       secondary: hslToHex((hue + 195) % 360, 24, 38),
       accent: hslToHex(accentHue, 80, 56),
+      background: hslToHex((hue + 8) % 360, 26, 96),
       surface: hslToHex((hue + 8) % 360, 26, 96),
       text: hslToHex((hue + 210) % 360, 26, 14)
     },
@@ -340,6 +341,7 @@ function buildStyleContextFromHtmlPalette(seedSource: string, colors: string[]):
     .reverse()
     .find((hex) => hex !== primary && hex !== accent && hexLuminance(hex) > 0.82) ??
     fallback.palette.surface;
+  const background = surface ?? fallback.palette.background ?? fallback.palette.surface;
   const text =
     byLuminance.find((hex) => hex !== surface && hexLuminance(hex) < 0.24) ?? fallback.palette.text;
 
@@ -350,6 +352,7 @@ function buildStyleContextFromHtmlPalette(seedSource: string, colors: string[]):
       primary,
       secondary,
       accent,
+      background,
       surface,
       text
     }
@@ -431,7 +434,7 @@ export function buildDesignSystemChecklistFromStyleContext(styleContext: Referen
         `Brand primary token: ${styleContext.palette.primary}.`,
         `Secondary/support token: ${styleContext.palette.secondary}.`,
         `Accent token for focus/action: ${styleContext.palette.accent}.`,
-        `Surface base token: ${styleContext.palette.surface}; text base token: ${styleContext.palette.text}.`,
+        `Background token: ${styleContext.palette.background ?? styleContext.palette.surface}; surface token: ${styleContext.palette.surface}; text base token: ${styleContext.palette.text}.`,
         "Required color roles: background, surface, border, text-primary, text-secondary, action-primary, action-secondary, success, warning, error, info."
       ]
     },

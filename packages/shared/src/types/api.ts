@@ -1,4 +1,4 @@
-import type { DesignMode, DesignSystemMode, DevicePreset, ProviderId, SurfaceTarget } from "./core.js";
+import type { DeckSlideCount, DesignMode, DesignSystemMode, DevicePreset, ProviderId, SurfaceTarget } from "./core.js";
 import type { FlowBoardMemoryState, FlowDocument, FlowMutationCommand, FlowStory, FrameKind, FlowSummary } from "./flow.js";
 import type { FrameWithVersions } from "./frames.js";
 import type { PipelineRun } from "./pipeline.js";
@@ -11,9 +11,25 @@ export interface ProjectBundle {
   references: ReferenceSource[];
   frames: FrameWithVersions[];
   designSystem: ProjectDesignSystem | null;
+  assets: ProjectAsset[];
 }
 
-export type ComposerAttachmentType = "image" | "figma-link";
+export type ProjectAssetKind = "image" | "document";
+
+export interface ProjectAsset {
+  id: string;
+  projectId: string;
+  kind: ProjectAssetKind;
+  name: string;
+  mimeType: string;
+  size: number;
+  dataUrl?: string | null;
+  textContent?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ComposerAttachmentType = "image" | "figma-link" | "text";
 
 export interface ComposerAttachment {
   id: string;
@@ -23,6 +39,25 @@ export interface ComposerAttachment {
   name?: string;
   mimeType?: string;
   dataUrl?: string;
+  textContent?: string;
+}
+
+export interface SelectedBlockContext {
+  frameId: string;
+  versionId: string;
+  blockId: string;
+  label: string;
+  selector: string;
+  tagName: string;
+  className: string;
+  textSnippet: string;
+  outerHtml: string;
+  rect: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
 }
 
 export interface SelectedFrameContext {
@@ -55,6 +90,8 @@ export interface GenerateRunInput {
   tailwindEnabled?: boolean;
   attachments?: ComposerAttachment[];
   selectedFrameContext?: SelectedFrameContext;
+  selectedBlockContext?: SelectedBlockContext;
+  deckSlideCount?: DeckSlideCount;
 }
 
 export interface EditRunInput extends GenerateRunInput {

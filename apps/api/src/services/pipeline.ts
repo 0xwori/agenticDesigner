@@ -1,10 +1,12 @@
 import crypto from "node:crypto";
 import { diffLines } from "diff";
+import * as cheerio from "cheerio";
 import {
   type ComponentFamilyConfidence,
   type ComponentRecipe,
   type ComponentStateRecipe,
   type ComposerAttachment,
+  type DeckSlideCount,
   type AgentRole,
   type DesignSystemChecklist,
   type DesignSystemComponentFamily,
@@ -18,11 +20,13 @@ import {
   type PipelineEvent,
   type PipelineStage,
   type ProjectBundle,
+  type ProjectAsset,
   type PromptIntentType,
   type ProjectDesignSystem,
   type ProviderId,
   type ReferenceStyleContext,
   type SelectedFrameContext,
+  type SelectedBlockContext,
   type SurfaceTarget,
   type RunStatus
 } from "@designer/shared";
@@ -74,8 +78,8 @@ import {
   validateArtifactsForDevice as validateArtifactsForDeviceViaValidators,
   validateDesignSystemAdherence as validateDesignSystemAdherenceViaValidators
 } from "./pipeline/validators.js";
-import { WEB_DESIGN_SKILL } from "./pipeline/skills-web.js";
-import { MOBILE_DESIGN_SKILL } from "./pipeline/skills-mobile.js";
+import { getDesignSkill } from "./pipeline/skills.js";
+import { buildDeckPreviewArtifacts, normalizeDeckSpec, readDeckSpecFromVersion, type DeckSpec } from "./deckArtifacts.js";
 import { deriveStyleContextFromArtifacts } from "./styleContextArtifacts.js";
 
 type PipelineInput = {
@@ -93,6 +97,8 @@ type PipelineInput = {
   tailwindEnabled?: boolean;
   attachments?: ComposerAttachment[];
   selectedFrameContext?: SelectedFrameContext;
+  selectedBlockContext?: SelectedBlockContext;
+  deckSlideCount?: DeckSlideCount;
   frameId?: string;
   editing: boolean;
   intentHint?: PromptIntentType;
@@ -305,7 +311,7 @@ function resolveModelForPass(
   }
 
   // Editing: route based on complexity
-  const complexity = classifyEditComplexity(input.prompt);
+  const complexity = input.selectedBlockContext ? "moderate" : classifyEditComplexity(input.prompt);
 
   if (complexity === "trivial") {
     // Trivial edits: fast model for everything
@@ -349,6 +355,66 @@ type FrameArtifacts = {
   cssCode: string;
   exportHtml: string;
 };
+
+function buildProjectAssetContext(assets: ProjectAsset[] | undefined) {
+  const usableAssets = (assets ?? []).filter((asset) => asset.kind === "image" || asset.kind === "document");
+  if (usableAssets.length === 0) {
+    return "";
+  }
+
+  const imageLines = usableAssets
+    .filter((asset) => asset.kind === "image" && asset.dataUrl)
+    .slice(0, 12)
+    .map((asset) => `- asset://${asset.id} — ${asset.name} (${asset.mimeType}, ${Math.round(asset.size / 1024)} KB)`);
+  const documentLines = usableAssets
+    .filter((asset) => asset.kind === "document" && asset.textContent)
+    .slice(0, 6)
+    .map((asset) => {
+      const content = (asset.textContent ?? "").slice(0, 20_000);
+      return `Document asset://${asset.id} — ${asset.name}\n${content}`;
+    });
+
+  return [
+    "Reusable project assets:",
+    imageLines.length > 0
+      ? `Image assets available for generated UI. Use the exact asset:// id in src/background-image when relevant; the runtime will replace it with the uploaded data URL.\n${imageLines.join("\n")}`
+      : "",
+    documentLines.length > 0 ? `Document assets for source material:\n${documentLines.join("\n\n---\n\n")}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function materializeAssetUris(artifacts: FrameArtifacts, assets: ProjectAsset[] | undefined): FrameArtifacts {
+  const imageAssets = (assets ?? []).filter((asset) => asset.kind === "image" && asset.dataUrl);
+  if (imageAssets.length === 0) {
+    return artifacts;
+  }
+
+  const replaceUris = (value: string) => {
+    let next = value;
+    for (const asset of imageAssets) {
+      next = next.replaceAll(`asset://${asset.id}`, asset.dataUrl ?? "");
+    }
+    return next;
+  };
+
+  return {
+    ...artifacts,
+    sourceCode: replaceUris(artifacts.sourceCode),
+    cssCode: replaceUris(artifacts.cssCode),
+    exportHtml: replaceUris(artifacts.exportHtml)
+  };
+}
+
+function hasVisualRichness(artifacts: FrameArtifacts) {
+  const combined = `${artifacts.sourceCode}\n${artifacts.cssCode}\n${artifacts.exportHtml}`.toLowerCase();
+  return (
+    /<img\b|<svg\b|<canvas\b|<figure\b|background-image\s*:|asset:\/\//.test(combined) ||
+    /\b(diagram|timeline|chart|graph|metric|illustration|icon-grid|visual)\b/.test(combined) ||
+    /@keyframes|animation\s*:|transition\s*:/.test(combined)
+  );
+}
 
 type GenerateArtifactsResult = {
   artifacts: FrameArtifacts;
@@ -419,6 +485,64 @@ type ValidationResult = {
   issues: string[];
   checks: ValidationCheck[];
 };
+
+function extractDesignerBlockHtml(html: string) {
+  const blocks = new Map<string, string>();
+  if (!html || !html.includes("data-designer-block")) {
+    return blocks;
+  }
+  const $ = cheerio.load(html, { xmlMode: false });
+  $("[data-designer-block]").each((_, element) => {
+    const blockId = $(element).attr("data-designer-block")?.trim();
+    if (!blockId || blocks.has(blockId)) {
+      return;
+    }
+    blocks.set(blockId, $.html(element).replace(/\s+/g, " ").trim());
+  });
+  return blocks;
+}
+
+function validateScopedBlockEdit(input: {
+  previousExportHtml: string;
+  nextExportHtml: string;
+  selectedBlockId: string;
+}): ValidationResult {
+  const previousBlocks = extractDesignerBlockHtml(input.previousExportHtml);
+  const nextBlocks = extractDesignerBlockHtml(input.nextExportHtml);
+  const checks: ValidationCheck[] = [];
+
+  if (previousBlocks.size === 0 || nextBlocks.size === 0) {
+    return {
+      valid: true,
+      issues: [],
+      checks: [
+        {
+          id: "scoped-block-legacy",
+          passed: true,
+          detail: "Legacy frame has incomplete block annotations; scoped edit relies on prompt constraints."
+        }
+      ]
+    };
+  }
+
+  const ids = new Set([...previousBlocks.keys(), ...nextBlocks.keys()]);
+  const changedIds = [...ids].filter((id) => previousBlocks.get(id) !== nextBlocks.get(id));
+  const changedOutsideSelection = changedIds.filter((id) => id !== input.selectedBlockId && !id.startsWith(`${input.selectedBlockId}-`));
+
+  checks.push({
+    id: "scoped-block-only",
+    passed: changedOutsideSelection.length === 0,
+    detail: changedOutsideSelection.length === 0
+      ? "Changed annotated blocks stay within the selected block."
+      : `Changed outside selected block: ${changedOutsideSelection.slice(0, 8).join(", ")}`
+  });
+
+  return {
+    valid: checks.every((check) => check.passed),
+    issues: checks.filter((check) => !check.passed).map((check) => check.detail),
+    checks
+  };
+}
 
 type PromptIntent = {
   type: PromptIntentType;
@@ -526,6 +650,7 @@ function buildFallbackStyleContext(): ReferenceStyleContext {
       primary: "#8b8f98",
       secondary: "#6f7785",
       accent: "#9b8f82",
+      background: "#f5f5f6",
       surface: "#f5f5f6",
       text: "#202327"
     },
@@ -568,7 +693,8 @@ function buildStyleContextFromImageSpec(base: ReferenceStyleContext, spec: Image
     (spec.colorTokens.textSecondary && spec.colorTokens.textSecondary !== textPrimary
       ? spec.colorTokens.textSecondary
       : base.palette.secondary);
-  const surface = spec.colorTokens.background || spec.colorTokens.surface || base.palette.surface;
+  const background = spec.colorTokens.background || base.palette.background || base.palette.surface;
+  const surface = spec.colorTokens.surface || base.palette.surface;
   const componentPatterns = spec.componentCandidates.length > 0 ? spec.componentCandidates.slice(0, 7) : base.componentPatterns;
   const layoutMotifs = [
     ...spec.layoutRegions.map((region) => `${region.role}: ${region.name}`),
@@ -584,6 +710,7 @@ function buildStyleContextFromImageSpec(base: ReferenceStyleContext, spec: Image
       primary,
       secondary,
       accent,
+      background,
       surface,
       text: textPrimary
     },
@@ -619,21 +746,34 @@ function parseDesignSystemCornerRadius(designSystem: ProjectDesignSystem): numbe
 function pickDesignSystemColorToken(
   designSystem: ProjectDesignSystem,
   matchers: string[],
-  fallback: string
+  fallback: string,
+  options?: { skipForegroundRoles?: boolean }
 ) {
-  // Check token name first
-  const byName = designSystem.structuredTokens.colors.find((token) => {
-    const name = token.name.toLowerCase();
-    return matchers.some((matcher) => name.includes(matcher));
-  });
-  if (byName) return byName.hex;
+  const shouldSkip = (token: { role?: string }) =>
+    options?.skipForegroundRoles === true && isForegroundColorRole(token);
 
-  // Check token role description (e.g. role "Primary brand color" matches "primary")
-  const byRole = designSystem.structuredTokens.colors.find((token) => {
-    const role = token.role.toLowerCase();
-    return matchers.some((matcher) => role.includes(matcher));
-  });
-  return byRole?.hex ?? fallback;
+  for (const matcher of matchers) {
+    const needle = matcher.toLowerCase();
+    const byName = designSystem.structuredTokens.colors.find(
+      (token) => token.name.toLowerCase().includes(needle) && !shouldSkip(token)
+    );
+    if (byName) return byName.hex;
+
+    const byRole = designSystem.structuredTokens.colors.find(
+      (token) => token.role.toLowerCase().includes(needle) && !shouldSkip(token)
+    );
+    if (byRole) return byRole.hex;
+  }
+
+  return fallback;
+}
+
+function isForegroundColorRole(token: { role?: string }) {
+  const text = (token.role ?? "").toLowerCase();
+  return (
+    /\b(text|copy|heading|foreground|ink)\b/.test(text) ||
+    /\bon\s+(?:light|dark|brand|colored|neutral)?\s*backgrounds?\b/.test(text)
+  );
 }
 
 function buildStyleContextFromProjectDesignSystem(designSystem: ProjectDesignSystem | null): ReferenceStyleContext | null {
@@ -657,18 +797,29 @@ function buildStyleContextFromProjectDesignSystem(designSystem: ProjectDesignSys
     return "";
   }
 
-  const rawPrimary = pickDesignSystemColorToken(designSystem, ["primary", "brand"], "");
+  const rawPrimary = pickDesignSystemColorToken(designSystem, ["primary", "brand"], "", { skipForegroundRoles: true });
   const finalPrimary = rawPrimary || nextPositional() || fallback.palette.primary;
   usedPositional.add(finalPrimary);
 
-  const rawSecondary = pickDesignSystemColorToken(designSystem, ["secondary", "support"], "");
+  const rawSecondary = pickDesignSystemColorToken(designSystem, ["secondary", "support"], "", { skipForegroundRoles: true });
   const finalSecondary = rawSecondary || nextPositional() || fallback.palette.secondary;
   usedPositional.add(finalSecondary);
 
-  const rawAccent = pickDesignSystemColorToken(designSystem, ["accent", "tertiary"], "");
+  const rawAccent = pickDesignSystemColorToken(designSystem, ["accent", "tertiary"], "", { skipForegroundRoles: true });
   const finalAccent = rawAccent || nextPositional() || fallback.palette.accent;
 
-  const finalSurface = pickDesignSystemColorToken(designSystem, ["surface", "neutral", "background", "page"], fallback.palette.surface);
+  const finalBackground = pickDesignSystemColorToken(
+    designSystem,
+    ["background", "page", "canvas"],
+    fallback.palette.background ?? fallback.palette.surface,
+    { skipForegroundRoles: true }
+  );
+  const finalSurface = pickDesignSystemColorToken(
+    designSystem,
+    ["surface", "container", "panel", "card", "neutral"],
+    fallback.palette.surface,
+    { skipForegroundRoles: true }
+  );
   const finalText = pickDesignSystemColorToken(designSystem, ["text", "on-", "ink", "heading"], fallback.palette.text);
 
   return {
@@ -677,6 +828,7 @@ function buildStyleContextFromProjectDesignSystem(designSystem: ProjectDesignSys
       primary: finalPrimary,
       secondary: finalSecondary,
       accent: finalAccent,
+      background: finalBackground,
       surface: finalSurface,
       text: finalText
     },
@@ -708,7 +860,10 @@ function buildStyleContextFromProjectDesignSystem(designSystem: ProjectDesignSys
   };
 }
 
-function getPrimaryAgentForDevice(devicePreset: DevicePreset): AgentRole {
+function getPrimaryAgentForDevice(devicePreset: DevicePreset, surfaceTarget?: SurfaceTarget): AgentRole {
+  if (surfaceTarget === "deck") {
+    return "deck-designer";
+  }
   return isMobilePreset(devicePreset) ? "app-designer" : "web-designer";
 }
 
@@ -786,6 +941,37 @@ function getFirstImageAttachment(attachments?: ComposerAttachment[]): ComposerAt
     }
   }
   return null;
+}
+
+function getTextAttachments(attachments?: ComposerAttachment[]): ComposerAttachment[] {
+  if (!attachments?.length) {
+    return [];
+  }
+  return attachments.filter((attachment) => attachment.type === "text" && typeof attachment.textContent === "string");
+}
+
+function buildDeckSourceContext(input: PipelineInput) {
+  const textAttachments = getTextAttachments(input.attachments);
+  if (textAttachments.length === 0) {
+    return "";
+  }
+  return textAttachments
+    .map((attachment) => {
+      const name = toNonEmptyString(attachment.name) ?? "Attached text";
+      return `Attachment: ${name}\n${attachment.textContent?.slice(0, 120_000) ?? ""}`;
+    })
+    .join("\n\n---\n\n");
+}
+
+function deckSlideCountFromSpec(deckSpec: DeckSpec | null, fallback: DeckSlideCount): DeckSlideCount {
+  if (deckSpec?.slides.length === 5 || deckSpec?.slides.length === 10 || deckSpec?.slides.length === 25) {
+    return deckSpec.slides.length;
+  }
+  return fallback;
+}
+
+function deckFrameSize() {
+  return { width: 1360, height: 980 };
 }
 
 function toNonEmptyString(input: unknown): string | null {
@@ -1100,6 +1286,24 @@ function formatSelectedFrameContext(input?: SelectedFrameContext) {
   return JSON.stringify(input, null, 2);
 }
 
+function formatSelectedBlockContext(input?: SelectedBlockContext) {
+  if (!input) {
+    return "No selected block context provided.";
+  }
+  return JSON.stringify({
+    frameId: input.frameId,
+    versionId: input.versionId,
+    blockId: input.blockId,
+    label: input.label,
+    selector: input.selector,
+    tagName: input.tagName,
+    className: input.className,
+    textSnippet: input.textSnippet,
+    outerHtml: input.outerHtml.slice(0, 3000),
+    rect: input.rect
+  }, null, 2);
+}
+
 function computeDiff(previous: string, next: string) {
   const chunks = diffLines(previous, next);
   let addedLines = 0;
@@ -1238,6 +1442,8 @@ Surface target: ${input.surfaceTarget ?? (isMobilePreset(input.devicePreset) ? "
 Design-system mode: ${input.designSystemMode ?? "strict"}
 Selected frame context:
 ${formatSelectedFrameContext(input.selectedFrameContext)}
+Selected block context:
+${formatSelectedBlockContext(input.selectedBlockContext)}
 Style palette: ${JSON.stringify(styleContext.palette)}${editContext}
 Return strict JSON.`
   });
@@ -1293,6 +1499,8 @@ Surface target: ${input.surfaceTarget ?? (isMobilePreset(input.devicePreset) ? "
 Design-system mode: ${input.designSystemMode ?? "strict"}
 Selected frame context:
 ${formatSelectedFrameContext(input.selectedFrameContext)}
+Selected block context:
+${formatSelectedBlockContext(input.selectedBlockContext)}
 Style motifs: ${styleContext.layoutMotifs.join(", ")}${editContext}`
   });
 
@@ -1371,6 +1579,8 @@ Surface target: ${input.surfaceTarget ?? (isMobilePreset(input.devicePreset) ? "
 Design-system mode: ${input.designSystemMode ?? "strict"}
 Selected frame context:
 ${formatSelectedFrameContext(input.selectedFrameContext)}
+Selected block context:
+${formatSelectedBlockContext(input.selectedBlockContext)}
 Style palette: ${JSON.stringify(styleContext.palette)}
 Style motifs: ${styleContext.layoutMotifs.join(", ")}${editContext}`
     });
@@ -2151,6 +2361,318 @@ ${JSON.stringify(imageSpec, null, 2)}
   });
 }
 
+async function generateDeckSpec(args: {
+  input: PipelineInput;
+  styleContext: ReferenceStyleContext;
+  slideCount: DeckSlideCount;
+  previousDeckSpec: DeckSpec | null;
+  designSystemMarkdown?: string;
+  projectAssetContext?: string;
+}): Promise<DeckSpec> {
+  const { model } = resolveModelForPass(args.input, "generate");
+  const deckSkill = getDesignSkill({ surfaceTarget: "deck", devicePreset: args.input.devicePreset });
+  const sourceContext = buildDeckSourceContext(args.input);
+  const completion = await requestCompletion({
+    provider: args.input.provider,
+    model,
+    apiKey: args.input.apiKey,
+    allowMock: false,
+    jsonMode: true,
+    timeoutMs: 90_000,
+    system: `You are a senior presentation designer.
+Return STRICT JSON only with keys:
+- specVersion (number, exactly 1)
+- title (string)
+- subtitle (string)
+- audience (string)
+- theme ({background,surface,text,mutedText,primary,secondary,accent,headingFont,bodyFont})
+- slides (array)
+
+Each slide must include:
+- id (string)
+- blockId (stable kebab-case string)
+- title (string)
+- eyebrow (string)
+- subtitle (string)
+- body (string[], 2 to 5 concise bullets)
+- callout (string)
+- speakerNotes (string)
+- layout ("title"|"section"|"content"|"comparison"|"quote"|"closing")
+- visual (object with type, title, items, assetId, caption)
+
+Hard constraints:
+- Return exactly ${args.slideCount} slides.
+- Make a coherent slide deck, not a web page.
+- Align theme tokens with the provided design system.
+- Keep text editable and concise.
+- visual.type must be one of "illustration", "diagram", "timeline", "metrics", "image", "icons", "chart", "process", or "none".
+- Include a useful visual artifact on every slide except purely closing slides: custom illustration, process diagram, timeline, metric row, chart, image composition, icon cluster, or comparison diagram.
+- If no relevant image asset exists, default to illustration, process, diagram, chart, or timeline instead of a text-only slide.
+- Use visual.items as short labels that can be rendered as nodes, steps, metric cards, chart labels, or illustration callouts.
+- Animation is preview-only and CSS-based; describe the intended motion through visual type/caption, but keep PPTX output static.
+- Use reusable project assets where relevant. For an image asset, set visual.assetId to the exact asset:// id from the asset context.
+- Use stable blockId values so individual slides can be edited later.
+- If editing, preserve unchanged slide blockIds and content unless the prompt asks for a change.
+- If a selected block is provided, change only that slide/block and keep the rest of the deck intact.
+- Return JSON only.
+
+${deckSkill}`,
+    prompt: `User prompt:
+${args.input.prompt}
+
+Slide count: ${args.slideCount}
+Editing existing deck: ${args.previousDeckSpec ? "yes" : "no"}
+
+Selected block context:
+${formatSelectedBlockContext(args.input.selectedBlockContext)}
+
+Source text attachments:
+${sourceContext || "None"}
+
+Reusable project assets:
+${args.projectAssetContext || "None"}
+
+Previous deck spec:
+${args.previousDeckSpec ? JSON.stringify(args.previousDeckSpec, null, 2) : "None"}
+
+Style context:
+${JSON.stringify(args.styleContext, null, 2)}
+
+${args.designSystemMarkdown ? `Full design system specification:
+${args.designSystemMarkdown.slice(0, 6000)}` : ""}`
+  });
+
+  const parsed = asJsonObject<Record<string, unknown>>(completion.content, {});
+  return normalizeDeckSpec(parsed, {
+    prompt: args.input.prompt,
+    slideCount: args.slideCount,
+    styleContext: args.styleContext
+  });
+}
+
+async function runDeckRoute(args: {
+  input: PipelineInput;
+  context: PipelineContext;
+  styleContext: ReferenceStyleContext;
+  passStatusMap: Record<string, RunStatus | "idle">;
+  projectBundle: ProjectBundle;
+}) {
+  const existingFrame = args.input.frameId ? await getFrame(args.input.frameId) : null;
+  const editingDeck = Boolean(args.input.editing && existingFrame?.frameKind === "deck");
+  const targetFrameId = editingDeck ? existingFrame?.id ?? null : null;
+  const previousVersion = targetFrameId ? await getLatestFrameVersion(targetFrameId) : null;
+  const previousDeckSpec = readDeckSpecFromVersion(previousVersion ?? undefined);
+  const slideCount = args.input.deckSlideCount ?? deckSlideCountFromSpec(previousDeckSpec, 10);
+  const primaryDesigner = getPrimaryAgentForDevice(args.input.devicePreset, "deck");
+
+  await setPassStatus(args.input.runId, args.passStatusMap, "enhance", "running");
+  await emitAgentEvent(args.context, {
+    runId: args.input.runId,
+    stage: "enhance",
+    status: "info",
+    kind: "summary",
+    agent: "orchestrator",
+    message: "I’m shaping the source material into a presentation brief.",
+    payload: {
+      step: "deck-brief",
+      deckSlideCount: slideCount,
+      selectedBlockContext: args.input.selectedBlockContext ?? null
+    }
+  });
+  const sourceContext = buildDeckSourceContext(args.input);
+  const projectAssetContext = buildProjectAssetContext(args.projectBundle.assets);
+  const enhanced: EnhanceResult = {
+    title: editingDeck ? "Edit Presentation Deck" : "Presentation Deck",
+    intent: args.input.prompt,
+    audience: "Presentation audience",
+    uxGoals: [
+      "Create a coherent story arc",
+      "Keep each slide editable",
+      "Align visuals with the project design system"
+    ],
+    constraints: [
+      `Exactly ${slideCount} slides`,
+      "16:9 slide format",
+      "Store structured deck JSON and generate PPTX on demand",
+      args.input.selectedBlockContext ? "Scoped edit: only the selected block may change" : "Full deck generation"
+    ]
+  };
+  await updateRunPassOutputs(args.input.runId, "enhance", {
+    ...enhanced,
+    sourceAttachmentCount: getTextAttachments(args.input.attachments).length
+  }).catch(() => {});
+  await setPassStatus(args.input.runId, args.passStatusMap, "enhance", "completed");
+
+  await setPassStatus(args.input.runId, args.passStatusMap, "plan", "running");
+  await emitAgentEvent(args.context, {
+    runId: args.input.runId,
+    stage: "plan",
+    status: "info",
+    kind: "summary",
+    agent: primaryDesigner,
+    message: `I’m drafting a structured ${slideCount}-slide deck spec.`,
+    payload: {
+      step: "deck-spec",
+      artifact: "deck-spec.json",
+      deckSlideCount: slideCount,
+      sourceAttachmentCount: getTextAttachments(args.input.attachments).length
+    }
+  });
+
+  const deckSpec = await generateDeckSpec({
+    input: args.input,
+    styleContext: args.styleContext,
+    slideCount,
+    previousDeckSpec,
+    designSystemMarkdown: args.projectBundle.designSystem?.markdown,
+    projectAssetContext
+  });
+  await updateRunPassOutputs(args.input.runId, "plan", {
+    title: deckSpec.title,
+    slideCount: deckSpec.slides.length,
+    slides: deckSpec.slides.map((slide, index) => ({
+      index: index + 1,
+      blockId: slide.blockId,
+      title: slide.title,
+      layout: slide.layout
+    }))
+  }).catch(() => {});
+  await setPassStatus(args.input.runId, args.passStatusMap, "plan", "completed");
+
+  await setPassStatus(args.input.runId, args.passStatusMap, "generate", "running");
+  const artifacts = materializeAssetUris(buildDeckPreviewArtifacts(deckSpec), args.projectBundle.assets);
+  let frameId = targetFrameId;
+  if (!frameId) {
+    const size = deckFrameSize();
+    const position = computeNextFramePosition(args.projectBundle.frames, size);
+    const frame = await createFrameRecord({
+      projectId: args.input.projectId,
+      name: deckSpec.title || `Deck ${args.projectBundle.frames.length + 1}`,
+      devicePreset: "desktop",
+      mode: args.input.mode,
+      position,
+      size,
+      status: "building",
+      selected: true,
+      frameKind: "deck"
+    });
+    frameId = frame.id;
+    await updatePipelineRun(args.input.runId, { frameId });
+    await emitAgentEvent(args.context, {
+      runId: args.input.runId,
+      stage: "generate",
+      status: "info",
+      kind: "action",
+      agent: "orchestrator",
+      message: "I placed a new deck frame on the canvas.",
+      payload: {
+        step: "frame-create",
+        frameId,
+        frameName: frame.name,
+        target: "deck"
+      }
+    });
+  } else {
+    await updateFrameStatus(frameId, "building");
+  }
+
+  const previousSource = previousVersion?.sourceCode ?? "";
+  const versionGenerate = await persistVersion({
+    frameId,
+    previousSourceCode: previousSource,
+    artifacts,
+    tailwindEnabled: false,
+    passName: "generate",
+    passOutput: {
+      deckSpec,
+      deckSlideCount: deckSpec.slides.length,
+      sourceTextLength: sourceContext.length,
+      selectedBlockContext: args.input.selectedBlockContext ?? null,
+      surfaceTarget: "deck",
+      strategy: "deck-spec"
+    }
+  });
+  await setPassStatus(args.input.runId, args.passStatusMap, "generate", "completed");
+  await emitAgentEvent(args.context, {
+    runId: args.input.runId,
+    stage: "generate",
+    status: "success",
+    kind: "action",
+    agent: primaryDesigner,
+    message: "Generated deck preview from structured slide data.",
+    payload: {
+      step: "artifact-generated",
+      frameId,
+      versionId: versionGenerate.id,
+      deckSlideCount: deckSpec.slides.length
+    }
+  });
+
+  await setPassStatus(args.input.runId, args.passStatusMap, "repair", "running");
+  const repaired = repairArtifacts(artifacts);
+  const versionRepair = await persistVersion({
+    frameId,
+    previousSourceCode: versionGenerate.sourceCode,
+    artifacts: repaired,
+    tailwindEnabled: false,
+    passName: "repair",
+    passOutput: {
+      deckSpec,
+      note: "Deck preview artifacts normalized.",
+      deckSlideCount: deckSpec.slides.length,
+      surfaceTarget: "deck"
+    }
+  });
+  await setPassStatus(args.input.runId, args.passStatusMap, "repair", "completed");
+
+  await setPassStatus(args.input.runId, args.passStatusMap, "diff-repair", "running");
+  const versionFinal = await persistVersion({
+    frameId,
+    previousSourceCode: versionRepair.sourceCode,
+    artifacts: repaired,
+    tailwindEnabled: false,
+    passName: "diff-repair",
+    passOutput: {
+      deckSpec,
+      prompt: args.input.prompt,
+      deckSlideCount: deckSpec.slides.length,
+      selectedBlockContext: args.input.selectedBlockContext ?? null,
+      surfaceTarget: "deck"
+    }
+  });
+  await setPassStatus(args.input.runId, args.passStatusMap, "diff-repair", "completed");
+  await updateFrameStatus(frameId, "ready");
+
+  await emitAgentEvent(args.context, {
+    runId: args.input.runId,
+    stage: "diff-repair",
+    status: "success",
+    kind: "action",
+    agent: "orchestrator",
+    message: "Deck is ready to preview or download as PPTX.",
+    payload: {
+      step: "diff-repair-complete",
+      frameId,
+      versionId: versionFinal.id,
+      previousVersionId: previousVersion?.id ?? null,
+      deckSlideCount: deckSpec.slides.length,
+      frameContent: {
+        sourceCode: repaired.sourceCode,
+        cssCode: repaired.cssCode,
+        exportHtml: repaired.exportHtml,
+        tailwindEnabled: false
+      }
+    }
+  });
+
+  await appendChatMessage({
+    projectId: args.input.projectId,
+    runId: args.input.runId,
+    role: "agent",
+    content: `Created ${deckSpec.slides.length} editable slides. Use Download PPTX on the deck frame to export.`
+  });
+}
+
 type ScreenArchetype = "login" | "onboarding" | "dashboard" | "settings" | "landing" | "generic";
 
 function detectScreenArchetype(prompt: string): ScreenArchetype {
@@ -2187,18 +2709,19 @@ function buildArtifacts(args: {
   const isWireframe = mode === "wireframe";
   const palette = isWireframe
     ? {
-        primary: "#5f646d",
-        secondary: "#717783",
-        accent: "#8e949f",
-        surface: "#f4f5f7",
-        text: "#151922"
+      primary: "#5f646d",
+      secondary: "#717783",
+      accent: "#8e949f",
+      background: "#f4f5f7",
+      surface: "#f4f5f7",
+      text: "#151922"
       }
     : styleContext.palette;
 
   const sectionHtml = plan.sections
     .map(
-      (section) => `
-      <article class="tw-card">
+      (section, index) => `
+      <article class="tw-card" data-designer-block="section-${index + 1}" data-designer-block-label="${escapeHtml(section.title)}">
         <h3>${escapeHtml(section.title)}</h3>
         <p>${escapeHtml(section.description)}</p>
       </article>
@@ -2208,8 +2731,8 @@ function buildArtifacts(args: {
 
   const sectionJsx = plan.sections
     .map(
-      (section) => `
-        <article className="tw-card">
+      (section, index) => `
+        <article className="tw-card" data-designer-block="section-${index + 1}" data-designer-block-label=${JSON.stringify(section.title)}>
           <h3>${JSON.stringify(section.title)}</h3>
           <p>${JSON.stringify(section.description)}</p>
         </article>
@@ -2225,18 +2748,18 @@ function buildArtifacts(args: {
   const subtitle = plan.subtitle;
 
   const exportHtml = `
-    <div class="tw-screen${args.tailwindEnabled ? " tw-tailwind-mode" : ""}">
-      <header class="tw-hero">
+    <div class="tw-screen${args.tailwindEnabled ? " tw-tailwind-mode" : ""}" data-designer-block="screen" data-designer-block-label="${escapeHtml(headerTitle)}">
+      <header class="tw-hero" data-designer-block="hero" data-designer-block-label="Hero">
         <div>
           <p class="tw-kicker">${escapeHtml(args.devicePreset.toUpperCase())} • ${escapeHtml(mode.toUpperCase())}</p>
           <h1>${escapeHtml(headerTitle)}</h1>
           <p>${escapeHtml(subtitle)}</p>
         </div>
       </header>
-      <section class="tw-grid">
+      <section class="tw-grid" data-designer-block="content-grid" data-designer-block-label="Content grid">
         ${sectionHtml}
       </section>
-      <footer class="tw-actions">${actionHtml}</footer>
+      <footer class="tw-actions" data-designer-block="actions" data-designer-block-label="Actions">${actionHtml}</footer>
     </div>
   `.trim();
 
@@ -2245,6 +2768,7 @@ function buildArtifacts(args: {
       --tw-primary: ${palette.primary};
       --tw-secondary: ${palette.secondary};
       --tw-accent: ${palette.accent};
+      --tw-background: ${palette.background ?? palette.surface};
       --tw-surface: ${palette.surface};
       --tw-text: ${palette.text};
       --tw-radius: ${styleContext.typography.cornerRadius}px;
@@ -2254,7 +2778,7 @@ function buildArtifacts(args: {
     body {
       margin: 0;
       font-family: ${styleContext.typography.bodyFamily};
-      background: var(--tw-surface);
+      background: var(--tw-background);
       color: var(--tw-text);
       min-height: 100vh;
       padding: 20px;
@@ -2350,18 +2874,18 @@ function buildArtifacts(args: {
   const sourceCode = `
     function GeneratedScreen() {
       return (
-        <div className="tw-screen${args.tailwindEnabled ? " tw-tailwind-mode" : ""}">
-          <header className="tw-hero">
+        <div className="tw-screen${args.tailwindEnabled ? " tw-tailwind-mode" : ""}" data-designer-block="screen" data-designer-block-label=${JSON.stringify(headerTitle)}>
+          <header className="tw-hero" data-designer-block="hero" data-designer-block-label="Hero">
             <div>
               <p className="tw-kicker">${JSON.stringify(args.devicePreset.toUpperCase())} + " • " + ${JSON.stringify(mode.toUpperCase())}</p>
               <h1>${JSON.stringify(headerTitle)}</h1>
               <p>${JSON.stringify(subtitle)}</p>
             </div>
           </header>
-          <section className="tw-grid">
+          <section className="tw-grid" data-designer-block="content-grid" data-designer-block-label="Content grid">
             ${sectionJsx}
           </section>
-          <footer className="tw-actions">
+          <footer className="tw-actions" data-designer-block="actions" data-designer-block-label="Actions">
             ${actionJsx}
           </footer>
         </div>
@@ -2685,6 +3209,7 @@ function buildPromptAwareFallbackArtifacts(args: {
       --tw-primary: ${palette.primary};
       --tw-secondary: ${palette.secondary};
       --tw-accent: ${palette.accent};
+      --tw-background: ${palette.background ?? palette.surface};
       --tw-surface: ${palette.surface};
       --tw-text: ${palette.text};
       --tw-radius: ${args.styleContext.typography.cornerRadius}px;
@@ -2696,7 +3221,7 @@ function buildPromptAwareFallbackArtifacts(args: {
       padding: 18px;
       font-family: ${args.styleContext.typography.bodyFamily};
       color: var(--tw-text);
-      background: var(--tw-surface);
+      background: var(--tw-background);
     }
     .tw-screen {
       border: 1px solid color-mix(in srgb, var(--tw-secondary) 18%, white);
@@ -2770,12 +3295,15 @@ async function generateScreenArtifacts(args: {
   previousExportHtml?: string;
   designSystemMarkdown?: string;
   imageContext?: string;
+  projectAssetContext?: string;
   onStreamChunk?: (chunk: string, accumulated: string) => void;
 }): Promise<GenerateArtifactsResult> {
   const isIphone = isMobilePreset(args.input.devicePreset);
   const surfaceTarget = args.input.surfaceTarget ?? (isIphone ? "mobile" : "web");
   const { model: generateModel } = resolveModelForPass(args.input, "generate");
   const designSystemMode = args.input.designSystemMode ?? "strict";
+  const surfaceSkill = getDesignSkill({ surfaceTarget, devicePreset: args.input.devicePreset });
+  const blockScopedEdit = args.input.editing && Boolean(args.input.selectedBlockContext);
 
   const editComplexityForTimeout = args.input.editing ? classifyEditComplexity(args.input.prompt) : null;
   const timeoutMs = editComplexityForTimeout === "trivial" ? 30_000
@@ -2807,13 +3335,15 @@ Hard constraints:
 - exportHtml must be static HTML for the same initial UI state and must not contain <script> tags.
 - Keep output production-like and brand-aligned using provided style context.
 - If a full DESIGN.md is provided, use its exact colors, typography hierarchy (font families, sizes, weights), component styling rules, spacing scale, radius scale, elevation system, and imagery directions.
+- Use reusable project assets when they fit the prompt. If using an uploaded image asset, reference the exact asset:// id from the asset context; do not invent asset ids.
 - Apply the do's and avoid the don'ts from the design system strictly.
 - Use the correct font families, sizes, and weights from the typography hierarchy table — do not default to generic sizes.
 - In strict mode, prefer style-context tokens (color, fonts, radius) and avoid unexplained drift.
 - In creative mode, keep recognizable brand cues while allowing broader visual exploration.
+- Add data-designer-block and data-designer-block-label to every major section, card/panel, repeated group, and primary content area so future edits can target one block.
 - Return JSON only.
 
-${isIphone ? MOBILE_DESIGN_SKILL : WEB_DESIGN_SKILL}${args.input.editing ? `
+${surfaceSkill}${args.input.editing ? `
 
 EDIT MODE — CRITICAL:
 - You are editing an EXISTING screen, NOT building from scratch.
@@ -2824,7 +3354,13 @@ EDIT MODE — CRITICAL:
 - The frameName should remain the same unless the user explicitly renamed it.
 - If the user says "delete X" or "remove X", remove only that element and leave everything else intact.
 - If the user says "change X to Y", find X in the existing code and replace it with Y. Do not touch other code.
-- Preserve all variable names, component names, className strings, and structure from the existing source.${args.input.selectedFrameContext?.sourceType === "figma-reference" ? "\n- This frame was imported from Figma. Preserve its original design integrity while making the requested changes." : ""}` : ""}`,
+- Preserve all variable names, component names, className strings, and structure from the existing source.${args.input.selectedFrameContext?.sourceType === "figma-reference" ? "\n- This frame was imported from Figma. Preserve its original design integrity while making the requested changes." : ""}` : ""}
+${blockScopedEdit ? `
+SELECTED BLOCK EDIT — CRITICAL:
+- The user selected exactly one block inside the iframe.
+- Change ONLY the selected block. Do not alter sibling blocks, global layout, unrelated content, or unrelated CSS unless it is strictly required for that selected block.
+- Preserve data-designer-block ids and labels on all unchanged blocks.
+- If the selected block cannot be found, make the smallest possible localized change matching the selected block label and snippet.` : ""}`,
     prompt: `User prompt:
 ${args.input.prompt}
 
@@ -2845,12 +3381,16 @@ Design constraints:
 Selected frame context:
 ${formatSelectedFrameContext(args.input.selectedFrameContext)}
 
+Selected block context:
+${formatSelectedBlockContext(args.input.selectedBlockContext)}
+
 Style context:
 ${JSON.stringify(args.styleContext, null, 2)}
 
 ${args.designSystemMarkdown ? `Full design system specification (DESIGN.md) — follow this closely for colors, typography, component styling, layout, spacing, imagery, and do's/don'ts:
 ${args.designSystemMarkdown.slice(0, 6000)}` : ""}
 
+${args.projectAssetContext ? `\n${args.projectAssetContext}\n` : ""}
 ${args.imageContext ? `\n${args.imageContext}\n` : ""}
 Existing frame source (for edit runs, copy unchanged code verbatim and only patch the requested changes):
 ${args.input.editing ? args.previousSourceCode : args.previousSourceCode.slice(0, 8500)}
@@ -3139,7 +3679,8 @@ export async function createManualFrame(input: {
     position: framePosition,
     size: frameSize,
     status: "ready",
-    selected: true
+    selected: true,
+    frameKind: input.frameKind
   });
 
   const artifacts = buildArtifacts({
@@ -3326,6 +3867,12 @@ export async function startPipeline(input: PipelineInput, context: PipelineConte
   void runPipeline(input, context);
 }
 
+export const pipelineTestHooks = {
+  buildProjectAssetContext,
+  materializeAssetUris,
+  hasVisualRichness
+};
+
 async function runPipeline(input: PipelineInput, context: PipelineContext) {
   const passStatusMap: Record<string, RunStatus | "idle"> = {
     enhance: "idle",
@@ -3376,6 +3923,37 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
     const designSystemStyleContext = buildStyleContextFromProjectDesignSystem(projectBundle.designSystem);
     const styleContext = projectStyleContexts[0] ?? designSystemStyleContext ?? buildFallbackStyleContext();
     const imageAttachment = getFirstImageAttachment(input.attachments);
+    const targetFrame = input.frameId ? await getFrame(input.frameId) : null;
+
+    if (input.surfaceTarget === "deck" || targetFrame?.frameKind === "deck") {
+      await runDeckRoute({
+        input,
+        context,
+        styleContext,
+        passStatusMap,
+        projectBundle
+      });
+
+      await updatePipelineRun(input.runId, {
+        status: "completed",
+        passStatusMap,
+        finished: true
+      });
+
+      await emitAgentEvent(context, {
+        runId: input.runId,
+        stage: "system",
+        status: "success",
+        kind: "summary",
+        agent: "orchestrator",
+        message: "Deck completed. You can preview it on the canvas or download the PPTX.",
+        payload: {
+          step: "run-complete",
+          target: "deck"
+        }
+      });
+      return;
+    }
 
     if (imageAttachment) {
       await runImageReferenceRoute({
@@ -3497,7 +4075,7 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
       return;
     }
 
-    const primaryDesigner = getPrimaryAgentForDevice(input.devicePreset);
+    const primaryDesigner = getPrimaryAgentForDevice(input.devicePreset, input.surfaceTarget);
     let targetFrameId = input.frameId;
 
     for (let variationIndex = 0; variationIndex < variationCount; variationIndex += 1) {
@@ -3556,7 +4134,11 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
       const previousExportHtml = previousVersion?.exportHtml ?? "";
 
       // For trivial edits, skip the LLM enhance+plan and use fast fallbacks
-      const editComplexity = input.editing ? classifyEditComplexity(input.prompt) : null;
+      const editComplexity = input.editing
+        ? input.selectedBlockContext
+          ? "moderate"
+          : classifyEditComplexity(input.prompt)
+        : null;
 
       if (editComplexity !== "trivial") {
         await setPassStatus(input.runId, passStatusMap, "enhance", "running");
@@ -3627,6 +4209,7 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
 
       // Select images for the planned sections (non-blocking; falls back to placeholders)
       let imageContext = "";
+      const projectAssetContext = buildProjectAssetContext(projectBundle.assets);
       if (!input.editing) {
         try {
           const slots = plan.sections
@@ -3802,8 +4385,13 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
             previousExportHtml,
             designSystemMarkdown: projectBundle.designSystem?.markdown,
             imageContext,
+            projectAssetContext,
             onStreamChunk
           });
+          generation = {
+            ...generation,
+            artifacts: materializeAssetUris(generation.artifacts, projectBundle.assets)
+          };
         } catch (genError) {
           const errorCode = classifyPipelineError(genError);
           if (!isRetriableError(errorCode) || attempt >= maxAttempts) {
@@ -3825,6 +4413,20 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
           devicePreset: input.devicePreset,
           mode: input.mode
         });
+        if (input.mode === "high-fidelity" && !input.editing && !hasVisualRichness(generation.artifacts)) {
+          await emitAgentEvent(context, {
+            runId: input.runId,
+            stage: "repair",
+            status: "info",
+            kind: "action",
+            agent: "design-system-designer",
+            message: "Visual richness check: this draft is mostly text-only. I will ask the next repair pass to add assets, diagrams, icons, or subtle motion if a retry is needed.",
+            payload: {
+              step: "visual-richness-warning",
+              surfaceTarget: input.surfaceTarget ?? (isMobilePreset(input.devicePreset) ? "mobile" : "web")
+            }
+          });
+        }
         // Skip expensive design-system validation for trivial edits (source was already valid)
         if (editComplexity !== "trivial") {
           designSystemValidation = validateDesignSystemAdherence(
@@ -3835,9 +4437,16 @@ async function runPipeline(input: PipelineInput, context: PipelineContext) {
         } else {
           designSystemValidation = { valid: true, issues: [], checks: [] };
         }
-        retryIssues = [...validation.issues, ...designSystemValidation.issues];
+        const scopedBlockValidation = input.selectedBlockContext
+          ? validateScopedBlockEdit({
+              previousExportHtml,
+              nextExportHtml: generation.artifacts.exportHtml,
+              selectedBlockId: input.selectedBlockContext.blockId
+            })
+          : { valid: true, issues: [], checks: [] as ValidationCheck[] };
+        retryIssues = [...validation.issues, ...designSystemValidation.issues, ...scopedBlockValidation.issues];
 
-        if (validation.valid && designSystemValidation.valid) {
+        if (validation.valid && designSystemValidation.valid && scopedBlockValidation.valid) {
           break;
         }
 

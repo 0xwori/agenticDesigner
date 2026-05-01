@@ -1,6 +1,38 @@
 @import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Sora:wght@500;600&display=swap");
 
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Shadcn CSS variable layer — maps our design tokens to the shadcn convention
+   used by @assistant-ui/react-ui components (HSL channel values, no hsl() wrapper). */
 :root {
+  /* Shadcn core tokens */
+  --background: 48 10% 95%;
+  --foreground: 224 18% 16%;
+  --card: 44 36% 98%;
+  --card-foreground: 224 18% 16%;
+  --popover: 44 36% 98%;
+  --popover-foreground: 224 18% 16%;
+  --primary: 216 92% 58%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 40 24% 94%;
+  --secondary-foreground: 224 18% 16%;
+  --muted: 40 24% 94%;
+  --muted-foreground: 220 11% 50%;
+  --accent: 40 24% 94%;
+  --accent-foreground: 224 18% 16%;
+  --destructive: 8 65% 47%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 220 27% 90%;
+  --input: 220 27% 90%;
+  --ring: 216 92% 58%;
+  --radius: 0.5rem;
+
+  /* aui-specific */
+  --aui-thread-max-width: 100%;
+
+  /* Our existing project tokens */
   --chat-width: 354px;
   --shell-gap: 14px;
   --dot-offset-x: 0px;
@@ -73,11 +105,74 @@ button:hover {
   backdrop-filter: blur(8px);
   box-shadow: 0 18px 40px rgba(24, 33, 52, 0.06);
   padding: 14px 12px 12px;
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
-  grid-template-rows: auto auto 1fr auto auto;
   overflow: hidden;
   z-index: 40;
+}
+
+.floating-control-rail {
+  position: fixed;
+  left: calc(var(--shell-gap) + var(--chat-width) + 10px);
+  top: var(--shell-gap);
+  z-index: 72;
+  display: grid;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.floating-control-group {
+  display: grid;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid rgba(49, 61, 86, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 12px 28px rgba(24, 33, 52, 0.08);
+  backdrop-filter: blur(8px);
+  pointer-events: auto;
+}
+
+.floating-control-button {
+  min-width: 96px;
+  min-height: 34px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: rgba(40, 47, 61, 0.84);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 7px;
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.floating-control-button:hover {
+  background: rgba(247, 250, 255, 0.94);
+  border-color: rgba(47, 126, 247, 0.2);
+  color: rgba(31, 92, 188, 0.96);
+}
+
+.floating-control-button.is-active {
+  background: rgba(47, 126, 247, 0.1);
+  border-color: rgba(47, 126, 247, 0.24);
+  color: rgba(31, 92, 188, 0.96);
+}
+
+.floating-control-button b {
+  margin-left: auto;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: rgba(47, 126, 247, 0.12);
+  color: rgba(31, 92, 188, 0.96);
+  font-size: 10px;
 }
 
 .chat-pane__header {
@@ -128,8 +223,8 @@ button:hover {
 .chat-pane__header button {
   border: 1px solid var(--line-soft);
   border-radius: 9px;
-  background: white;
-  color: var(--ink-strong);
+  background: transparent;
+  color: var(--ink-soft);
   width: 28px;
   height: 28px;
   padding: 0;
@@ -137,6 +232,12 @@ button:hover {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.chat-pane__header button:hover {
+  border-color: rgba(47, 126, 247, 0.3);
+  color: rgba(47, 126, 247, 0.9);
 }
 
 .composer {
@@ -320,13 +421,61 @@ button:hover {
   gap: 5px;
   border: 1px solid var(--line-soft);
   border-radius: 999px;
-  padding: 4px 8px;
+  padding: 3px 8px;
   font-size: 9px;
   color: var(--ink-soft);
+  font-weight: 500;
+}
+
+.prompt-type-switch {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
   background: rgba(255, 255, 255, 0.72);
 }
 
+.prompt-type-switch__btn {
+  min-width: 0;
+  height: 30px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(40, 47, 61, 0.84);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+
+.prompt-type-switch__btn:hover {
+  border-color: rgba(47, 126, 247, 0.18);
+  background: rgba(247, 250, 255, 0.94);
+  color: rgba(31, 92, 188, 0.96);
+}
+
+.prompt-type-switch__btn.is-active {
+  border-color: rgba(47, 126, 247, 0.24);
+  background: rgba(47, 126, 247, 0.1);
+  color: rgba(31, 92, 188, 0.96);
+}
+
+.chat-thread-root {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+}
+
 .chat-feed {
+  flex: 1;
   min-height: 0;
   overflow: auto;
   display: grid;
@@ -336,13 +485,10 @@ button:hover {
 }
 
 .chat-empty-state {
-  border: 1px dashed var(--line-soft);
-  border-radius: 14px;
-  padding: 12px;
+  padding: 8px 4px 4px;
   color: var(--ink-soft);
   font-size: 11px;
-  line-height: 1.5;
-  background: rgba(255, 255, 255, 0.55);
+  line-height: 1.6;
 }
 
 .chat-empty-state p {
@@ -360,6 +506,21 @@ button:hover {
   color: rgba(82, 90, 104, 0.45);
   font-size: 10px;
   font-weight: 600;
+}
+
+.chat-user-prompt {
+  padding: 9px 12px;
+  background: rgba(47, 126, 247, 0.05);
+  border: 1px solid rgba(47, 126, 247, 0.11);
+  border-radius: 10px;
+}
+
+.chat-user-prompt__text {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-strong);
+  line-height: 1.45;
 }
 
 .chat-message {
@@ -416,9 +577,9 @@ button:hover {
 }
 
 .thought-card {
-  border: 1px solid rgba(36, 46, 67, 0.08);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(36, 46, 67, 0.09);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.72);
   overflow: hidden;
 }
 
@@ -984,6 +1145,25 @@ button:hover {
   color: rgba(39, 92, 69, 0.76);
 }
 
+.composer-selection-chip--surface {
+  border-color: rgba(47, 126, 247, 0.18);
+  background: rgba(47, 126, 247, 0.06);
+}
+
+.composer-selection-chip--block {
+  border-color: rgba(31, 155, 98, 0.24);
+  background: rgba(31, 155, 98, 0.08);
+}
+
+.composer-selection-chip--assets {
+  border-color: rgba(92, 98, 239, 0.2);
+  background: rgba(92, 98, 239, 0.07);
+}
+
+.composer-selection-chip--block span:first-child {
+  color: rgba(20, 113, 74, 0.86);
+}
+
 .composer-selection-chip__hint {
   font-size: 9px !important;
   text-transform: none !important;
@@ -1362,6 +1542,8 @@ button:hover {
 .design-system-visual {
   display: grid;
   gap: 10px;
+  background: var(--ds-background, rgba(255, 255, 255, 0.8));
+  color: var(--ds-text, rgba(32, 35, 39, 0.92));
 }
 
 .design-system-visual__header {
@@ -3000,6 +3182,180 @@ button:hover {
   background: #fdfbf8;
 }
 
+.asset-panel-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center end;
+  padding: 18px;
+  background: rgba(13, 20, 34, 0.28);
+}
+
+.asset-panel {
+  width: min(420px, calc(100vw - 36px));
+  max-height: calc(100vh - 36px);
+  border: 1px solid rgba(49, 61, 86, 0.12);
+  border-radius: 8px;
+  background: rgba(252, 253, 255, 0.98);
+  box-shadow: 0 24px 70px rgba(16, 24, 40, 0.18);
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+  overflow: auto;
+}
+
+.asset-panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.asset-panel__header p,
+.asset-panel__header h2,
+.asset-panel__intro p {
+  margin: 0;
+}
+
+.asset-panel__header p {
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.asset-panel__header h2 {
+  margin-top: 3px;
+  font-family: "Sora", ui-sans-serif, system-ui;
+  font-size: 18px;
+  line-height: 1.15;
+}
+
+.asset-panel__close,
+.asset-card > button {
+  border: 1px solid rgba(49, 61, 86, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.92);
+  color: rgba(68, 78, 98, 0.82);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+
+.asset-panel__close {
+  width: 30px;
+  height: 30px;
+}
+
+.asset-panel__intro {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  border: 1px solid rgba(47, 126, 247, 0.12);
+  border-radius: 8px;
+  background: rgba(247, 250, 255, 0.94);
+  color: rgba(65, 76, 98, 0.8);
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.asset-panel__actions button {
+  width: 100%;
+  height: 36px;
+  border: 1px solid rgba(47, 126, 247, 0.18);
+  border-radius: 8px;
+  background: rgba(47, 126, 247, 0.1);
+  color: rgba(31, 92, 188, 0.96);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.asset-panel__actions button:disabled {
+  cursor: wait;
+  opacity: 0.66;
+}
+
+.asset-panel__list {
+  display: grid;
+  gap: 8px;
+}
+
+.asset-panel__empty {
+  border: 1px dashed rgba(49, 61, 86, 0.16);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.74);
+  color: var(--ink-soft);
+  padding: 14px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.asset-card {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr) 30px;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid rgba(49, 61, 86, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.92);
+  padding: 8px;
+}
+
+.asset-card__preview {
+  width: 54px;
+  aspect-ratio: 1;
+  border-radius: 8px;
+  background: rgba(247, 250, 255, 0.94);
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  color: var(--ink-soft);
+}
+
+.asset-card__preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.asset-card__body {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.asset-card__body strong,
+.asset-card__body span,
+.asset-card__body code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-card__body strong {
+  font-size: 12px;
+}
+
+.asset-card__body span,
+.asset-card__body code {
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.asset-card > button {
+  width: 30px;
+  height: 30px;
+}
+
 @media (max-width: 1120px) {
   :root {
     --chat-width: 100%;
@@ -3015,6 +3371,31 @@ button:hover {
     border-right: 0;
     border-top: 0;
     box-shadow: none;
+  }
+
+  .floating-control-rail {
+    position: sticky;
+    top: 0;
+    left: auto;
+    z-index: 74;
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding: 8px;
+    background: rgba(245, 244, 240, 0.96);
+    border-bottom: 1px solid var(--line-soft);
+  }
+
+  .floating-control-group {
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+  }
+
+  .floating-control-button {
+    min-width: 0;
+    justify-content: center;
+  }
+
+  .floating-control-button span {
+    display: none;
   }
 
   .canvas-pane {

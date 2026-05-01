@@ -60,7 +60,7 @@ export function usePipelineEvents(
   const {
     runMode, selectedDevice, selectedMode,
     setSelectedDevice, setSelectedMode, setSelectedDesignSystemMode,
-    setSelectedSurfaceTarget, setTailwindOverride
+    setSelectedSurfaceTarget, setTailwindOverride, setSelectedBlockContext
   } = useInputState();
   const { setPreferences, preferences, setPendingCanvasCards } = useUIState();
 
@@ -276,6 +276,7 @@ export function usePipelineEvents(
                 })
               };
             });
+            setSelectedBlockContext((current) => (current?.frameId === fid ? null : current));
           }
 
           if (step === "run-complete") {
@@ -316,7 +317,7 @@ export function usePipelineEvents(
       });
       runSockets.current.set(runId, socket);
     },
-    [appendOrderedEvent, pushDebugLog, resolveRunCompletion, scheduleRefresh, setPendingCanvasCards, setError, openProjectDesignSystemRef]
+    [appendOrderedEvent, pushDebugLog, resolveRunCompletion, scheduleRefresh, setPendingCanvasCards, setSelectedBlockContext, setError, openProjectDesignSystemRef]
   );
 
   // -------------------------------------------------------------------------

@@ -166,6 +166,227 @@ body{font-family:ui-sans-serif,system-ui,sans-serif;display:grid;place-items:cen
           let __heightTrackingStopped = false;
           let __heightObserver = null;
           let __resizeObserver = null;
+          let __designerBlockOverlay = null;
+          let __designerSelectedBlockId = null;
+
+          const __blockAttr = "data-designer-block";
+          const __blockLabelAttr = "data-designer-block-label";
+
+          const __cssEscape = (value) => {
+            if (window.CSS && typeof window.CSS.escape === "function") {
+              return window.CSS.escape(value);
+            }
+            return String(value).replace(/[^a-zA-Z0-9_-]/g, "\\\\$&");
+          };
+
+          const __textSnippet = (element) => (element.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 420);
+
+          const __blockIdForElement = (element, index) => {
+            const explicit = element.getAttribute(__blockAttr);
+            if (explicit) {
+              return explicit;
+            }
+            const label = element.getAttribute(__blockLabelAttr) || element.getAttribute("aria-label") || element.id || element.className || element.tagName;
+            return String(label || "block").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "block-" + index;
+          };
+
+          const __labelForElement = (element, blockId) =>
+            element.getAttribute(__blockLabelAttr) ||
+            element.getAttribute("aria-label") ||
+            element.getAttribute("data-section") ||
+            element.id ||
+            __textSnippet(element).slice(0, 64) ||
+            blockId;
+
+          const __selectorForElement = (element, blockId) => {
+            if (element.getAttribute(__blockAttr)) {
+              return "[" + __blockAttr + "='" + String(blockId).replace(/'/g, "\\\\'") + "']";
+            }
+            if (element.id) {
+              return "#" + __cssEscape(element.id);
+            }
+            const parts = [];
+            let node = element;
+            while (node && node.nodeType === 1 && node !== document.body && node !== document.documentElement && parts.length < 6) {
+              const tag = node.tagName.toLowerCase();
+              const parent = node.parentElement;
+              if (!parent) {
+                parts.unshift(tag);
+                break;
+              }
+              const sameTag = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+              const index = sameTag.indexOf(node) + 1;
+              parts.unshift(sameTag.length > 1 ? tag + ":nth-of-type(" + index + ")" : tag);
+              node = parent;
+            }
+            return parts.join(" > ");
+          };
+
+          const __isViableBlock = (element) => {
+            if (!(element instanceof HTMLElement) || element.id === "preview-error" || element.id === "root") {
+              return false;
+            }
+            const rect = element.getBoundingClientRect();
+            if (rect.width < 44 || rect.height < 36) {
+              return false;
+            }
+            const style = window.getComputedStyle(element);
+            if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+              return false;
+            }
+            return true;
+          };
+
+          const __getDesignerBlocks = () => {
+            const explicit = Array.from(document.querySelectorAll("[" + __blockAttr + "]")).filter(__isViableBlock);
+            if (explicit.length > 0) {
+              return explicit.slice(0, 96);
+            }
+            const fallbackSelector = [
+              "main",
+              "header",
+              "nav",
+              "section",
+              "article",
+              "aside",
+              "footer",
+              "form",
+              "[role='region']",
+              "[class*='hero']",
+              "[class*='card']",
+              "[class*='panel']",
+              "[class*='section']",
+              "[class*='slide']"
+            ].join(",");
+            return Array.from(new Set(Array.from(document.querySelectorAll(fallbackSelector)).filter(__isViableBlock))).slice(0, 96);
+          };
+
+          const __ensureBlockOverlay = () => {
+            if (__designerBlockOverlay) {
+              return __designerBlockOverlay;
+            }
+            const overlay = document.createElement("div");
+            overlay.setAttribute("data-designer-block-overlay", "true");
+            overlay.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none;display:none;";
+            document.body.appendChild(overlay);
+            __designerBlockOverlay = overlay;
+            return overlay;
+          };
+
+          const __paintBlockOverlays = (hoverElement) => {
+            const overlay = __ensureBlockOverlay();
+            overlay.textContent = "";
+            overlay.style.display = "block";
+            const blocks = __getDesignerBlocks();
+            blocks.forEach((element, index) => {
+              const rect = element.getBoundingClientRect();
+              const blockId = __blockIdForElement(element, index);
+              const isHover = element === hoverElement;
+              const isSelected = blockId === __designerSelectedBlockId;
+              const box = document.createElement("div");
+              box.style.cssText = [
+                "position:fixed",
+                "left:" + Math.max(0, rect.left - 4) + "px",
+                "top:" + Math.max(0, rect.top - 4) + "px",
+                "width:" + Math.max(0, rect.width + 8) + "px",
+                "height:" + Math.max(0, rect.height + 8) + "px",
+                "border:" + (isSelected ? "3px solid #1f9b62" : isHover ? "3px solid #2f7ef7" : "1px dashed rgba(47,126,247,0.55)"),
+                "background:" + (isSelected ? "rgba(31,155,98,0.10)" : isHover ? "rgba(47,126,247,0.10)" : "rgba(47,126,247,0.04)"),
+                "box-shadow:0 0 0 2px rgba(255,255,255,0.82)",
+                "border-radius:8px",
+                "box-sizing:border-box"
+              ].join(";");
+              if (isHover || isSelected) {
+                const label = document.createElement("div");
+                label.textContent = __labelForElement(element, blockId);
+                label.style.cssText = "position:absolute;left:0;top:-24px;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:#172033;color:white;border-radius:6px;padding:4px 7px;font:600 11px ui-sans-serif,system-ui;";
+                box.appendChild(label);
+              }
+              overlay.appendChild(box);
+            });
+          };
+
+          const __hideBlockOverlays = () => {
+            if (__designerBlockOverlay) {
+              __designerBlockOverlay.style.display = "none";
+            }
+          };
+
+          const __findDesignerBlockAtPoint = (clientX, clientY) => {
+            const blocks = __getDesignerBlocks();
+            const explicit = document.elementFromPoint(clientX, clientY);
+            if (explicit) {
+              const explicitBlock = explicit.closest("[" + __blockAttr + "]");
+              if (explicitBlock && blocks.includes(explicitBlock)) {
+                return explicitBlock;
+              }
+              for (const candidate of blocks) {
+                if (candidate === explicit || candidate.contains(explicit)) {
+                  return candidate;
+                }
+              }
+            }
+            return blocks
+              .map((element) => ({ element, rect: element.getBoundingClientRect() }))
+              .filter(({ rect }) => clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom)
+              .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))[0]?.element || null;
+          };
+
+          const __postSelectedBlock = (element) => {
+            const blocks = __getDesignerBlocks();
+            const index = Math.max(0, blocks.indexOf(element));
+            const rect = element.getBoundingClientRect();
+            const blockId = __blockIdForElement(element, index);
+            __designerSelectedBlockId = blockId;
+            __paintBlockOverlays(element);
+            if (window.parent && window.parent !== window) {
+              window.parent.postMessage(
+                {
+                  type: "designer.block-selected",
+                  frameId: __designerFrameId,
+                  versionId: __designerVersionId,
+                  blockId,
+                  label: __labelForElement(element, blockId),
+                  selector: __selectorForElement(element, blockId),
+                  tagName: element.tagName.toLowerCase(),
+                  className: typeof element.className === "string" ? element.className : "",
+                  textSnippet: __textSnippet(element),
+                  outerHtml: element.outerHTML.slice(0, 6000),
+                  rect: {
+                    x: rect.left,
+                    y: rect.top,
+                    width: rect.width,
+                    height: rect.height
+                  }
+                },
+                "*"
+              );
+            }
+          };
+
+          const __installBlockSelection = () => {
+            document.addEventListener("pointermove", (event) => {
+              if (!event.altKey) {
+                __hideBlockOverlays();
+                return;
+              }
+              const block = __findDesignerBlockAtPoint(event.clientX, event.clientY);
+              __paintBlockOverlays(block);
+            }, true);
+            document.addEventListener("click", (event) => {
+              if (!event.altKey) {
+                return;
+              }
+              const block = __findDesignerBlockAtPoint(event.clientX, event.clientY);
+              if (!block) {
+                return;
+              }
+              event.preventDefault();
+              event.stopPropagation();
+              __postSelectedBlock(block);
+            }, true);
+            document.addEventListener("mouseleave", __hideBlockOverlays);
+          };
 
           const __postHeight = () => {
             const root = document.getElementById("root");
@@ -242,6 +463,7 @@ body{font-family:ui-sans-serif,system-ui,sans-serif;display:grid;place-items:cen
               target.textContent = message;
             }
           } finally {
+            __installBlockSelection();
             __scheduleHeight();
             window.requestAnimationFrame(() => window.requestAnimationFrame(__scheduleHeight));
             window.setTimeout(__scheduleHeight, 200);

@@ -189,6 +189,7 @@ export function enforceStrictDesignSystemAlignment(
   --tw-primary: ${styleContext.palette.primary};
   --tw-secondary: ${styleContext.palette.secondary};
   --tw-accent: ${styleContext.palette.accent};
+  --tw-background: ${styleContext.palette.background ?? styleContext.palette.surface};
   --tw-surface: ${styleContext.palette.surface};
   --tw-text: ${styleContext.palette.text};
   --tw-radius: ${styleContext.typography.cornerRadius}px;

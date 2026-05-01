@@ -20,13 +20,17 @@ import {
 } from "../../services/pipeline/flowBoardMemory.js";
 import { buildDesignFrameSummary } from "../../services/pipeline/designFrameSummary.js";
 import { generateFlowStory } from "../../services/pipeline/flowStory.js";
+import { readDeckSpecFromVersion } from "../../services/deckArtifacts.js";
+import { buildDeckPptx } from "../../services/deckPptx.js";
 import {
   parseAttachments,
+  parseDeckSlideCount,
   parseDesignSystemMode,
   parseDevicePreset,
   parseMode,
   parseNonEmptyString,
   parseProvider,
+  parseSelectedBlockContext,
   parseSelectedFrameContext,
   parseSurfaceTarget,
   parseTailwind,
@@ -82,6 +86,15 @@ function buildFlowActionSummary(input: {
   return input.fallbackSummary;
 }
 
+function safeDeckFilename(value: string) {
+  const base = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+  return `${base || "deck"}.pptx`;
+}
+
 export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunHub) {
   app.post("/projects/:id/frames", async (request, response) => {
     const project = await deps.getProjectBundle(request.params.id);
@@ -99,7 +112,7 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
         name: typeof request.body?.name === "string" ? request.body.name : undefined,
         position: request.body?.position,
         size: request.body?.size,
-        frameKind: request.body?.frameKind === "flow" ? "flow" : undefined,
+        frameKind: request.body?.frameKind === "flow" || request.body?.frameKind === "deck" ? request.body.frameKind : undefined,
         flowDocument: request.body?.frameKind === "flow" ? request.body?.flowDocument : undefined,
       });
       const frame = await deps.getFrameWithVersions(frameId);
@@ -215,6 +228,31 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
     response.json(frame);
   });
 
+  app.get("/frames/:id/deck.pptx", async (request, response) => {
+    const frame = await deps.getFrameWithVersions(request.params.id);
+    if (!frame) {
+      sendApiError(response, 404, "Frame not found.", "not_found");
+      return;
+    }
+    if (frame.frameKind !== "deck") {
+      sendApiError(response, 400, "Frame is not a deck.", "validation_error");
+      return;
+    }
+
+    const latestVersion = frame.versions[frame.versions.length - 1];
+    const deckSpec = readDeckSpecFromVersion(latestVersion);
+    if (!deckSpec) {
+      sendApiError(response, 404, "Deck spec not found for this frame.", "not_found");
+      return;
+    }
+
+    const pptx = buildDeckPptx(deckSpec);
+    response.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+    response.setHeader("Content-Disposition", `attachment; filename="${safeDeckFilename(deckSpec.title || frame.name)}"`);
+    response.setHeader("Content-Length", String(pptx.length));
+    response.send(pptx);
+  });
+
   app.delete("/frames/:id", async (request, response) => {
     const frame = await deps.getFrame(request.params.id);
     if (!frame) {
@@ -263,7 +301,7 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
     }
 
     const surfaceTarget =
-      request.body?.surfaceTarget === "web" || request.body?.surfaceTarget === "mobile"
+      request.body?.surfaceTarget === "web" || request.body?.surfaceTarget === "mobile" || request.body?.surfaceTarget === "deck"
         ? parseSurfaceTarget(request.body.surfaceTarget)
         : project.project.settings.surfaceDefault;
     const designSystemMode =
@@ -295,6 +333,8 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
         tailwindEnabled: parseTailwind(request.body?.tailwindEnabled),
         attachments,
         selectedFrameContext: parseSelectedFrameContext(request.body?.selectedFrameContext),
+        selectedBlockContext: parseSelectedBlockContext(request.body?.selectedBlockContext),
+        deckSlideCount: parseDeckSlideCount(request.body?.deckSlideCount),
         editing: false
       },
       { hub: runHub }
@@ -331,7 +371,7 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
     }
 
     const surfaceTarget =
-      request.body?.surfaceTarget === "web" || request.body?.surfaceTarget === "mobile"
+      request.body?.surfaceTarget === "web" || request.body?.surfaceTarget === "mobile" || request.body?.surfaceTarget === "deck"
         ? parseSurfaceTarget(request.body.surfaceTarget)
         : projectBundle.project.settings.surfaceDefault;
     const designSystemMode =
@@ -363,6 +403,8 @@ export function registerFrameRunRoutes(app: Express, deps: ApiDeps, runHub: RunH
         tailwindEnabled: parseTailwind(request.body?.tailwindEnabled),
         attachments,
         selectedFrameContext: parseSelectedFrameContext(request.body?.selectedFrameContext),
+        selectedBlockContext: parseSelectedBlockContext(request.body?.selectedBlockContext),
+        deckSlideCount: parseDeckSlideCount(request.body?.deckSlideCount),
         frameId: frame.id,
         editing: true,
         intentHint: request.body?.intentHint === "screen-action" ? "screen-action" : undefined,

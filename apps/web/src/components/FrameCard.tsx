@@ -28,6 +28,7 @@ type FrameCardProps = {
   hasDesignSystem: boolean;
   onOpenBrandPicker?: () => void;
   onRegenerate?: (frameId: string) => void;
+  onDownloadDeck?: (frameId: string) => void;
   framePrompt?: string;
 };
 
@@ -52,6 +53,7 @@ export function FrameCard(props: FrameCardProps) {
     hasDesignSystem,
     onOpenBrandPicker,
     onRegenerate,
+    onDownloadDeck,
     framePrompt
   } = props;
 
@@ -110,6 +112,9 @@ export function FrameCard(props: FrameCardProps) {
             >
               <RotateCcw size={11} /> Regenerate
             </button>
+          ) : null}
+          {frame.frameKind === "deck" && onDownloadDeck && !isBuilding ? (
+            <button onClick={() => onDownloadDeck(frame.id)}>Download PPTX</button>
           ) : null}
           <button onClick={() => void selectFrame(frame.id)}>Select</button>
           <button onClick={() => setExpandedHistoryFrameId((current) => (current === frame.id ? null : frame.id))}>Versions</button>

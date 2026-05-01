@@ -9,6 +9,7 @@ const CONTEXT: ReferenceStyleContext = {
     primary: "#18a999",
     secondary: "#0f4c81",
     accent: "#ff6b35",
+    background: "#ffffff",
     surface: "#f6f8fb",
     text: "#17212b"
   },
@@ -23,6 +24,14 @@ const CONTEXT: ReferenceStyleContext = {
 };
 
 describe("parseDesignMarkdown", () => {
+  it("emits background as an explicit design-system color role", () => {
+    const markdown = generateDesignMarkdownFromStyleContext(CONTEXT);
+
+    expect(markdown).toContain("**Background**");
+    expect(markdown).toContain("Primary page and app background");
+    expect(markdown).toContain("**Surface**");
+  });
+
   it("does not auto-inject fallback palette tokens when markdown has no valid color lines", () => {
     const markdown = `## Overview
 Minimal style.

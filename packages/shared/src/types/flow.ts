@@ -1,4 +1,4 @@
-export type FrameKind = "design" | "flow";
+export type FrameKind = "design" | "flow" | "deck";
 
 export type FlowLaneId = "user-journey" | "normal-flow" | "unhappy-path" | "technical-briefing";
 

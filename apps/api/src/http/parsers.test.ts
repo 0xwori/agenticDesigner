@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { parseAttachments, parseSelectedFrameContext } from "./parsers.js";
+import {
+  parseAttachments,
+  parseDeckSlideCount,
+  parseSelectedBlockContext,
+  parseSelectedFrameContext,
+  parseSurfaceTarget
+} from "./parsers.js";
 
 describe("http parsers", () => {
   it("rejects more than one image attachment", () => {
@@ -19,6 +25,24 @@ describe("http parsers", () => {
 
     expect(parsed).toHaveLength(1);
     expect(parsed?.[0]?.url).toContain("figma.com/design");
+  });
+
+  it("parses text attachments for deck source material", () => {
+    const parsed = parseAttachments([
+      { id: "t-1", type: "text", name: "brief.md", mimeType: "text/markdown", textContent: "# Brief" }
+    ]);
+
+    expect(parsed).toHaveLength(1);
+    expect(parsed?.[0]?.textContent).toBe("# Brief");
+  });
+
+  it("parses deck surface and slide count defaults", () => {
+    expect(parseSurfaceTarget("deck")).toBe("deck");
+    expect(parseSurfaceTarget("mobile")).toBe("mobile");
+    expect(parseSurfaceTarget("other")).toBe("web");
+    expect(parseDeckSlideCount(5)).toBe(5);
+    expect(parseDeckSlideCount("25")).toBe(25);
+    expect(parseDeckSlideCount(7)).toBe(10);
   });
 
   it("parses selected frame context only when shape is valid", () => {
@@ -42,5 +66,24 @@ describe("http parsers", () => {
     });
 
     expect(invalid).toBeUndefined();
+  });
+
+  it("parses selected block context only when shape is valid", () => {
+    const valid = parseSelectedBlockContext({
+      frameId: "frame-1",
+      versionId: "version-1",
+      blockId: "hero",
+      label: "Hero",
+      selector: "[data-designer-block=\"hero\"]",
+      tagName: "section",
+      className: "hero",
+      textSnippet: "Launch faster",
+      outerHtml: "<section data-designer-block=\"hero\">Launch faster</section>",
+      rect: { x: 10, y: 20, width: 300, height: 180 }
+    });
+
+    expect(valid?.blockId).toBe("hero");
+
+    expect(parseSelectedBlockContext({ frameId: "frame-1" })).toBeUndefined();
   });
 });

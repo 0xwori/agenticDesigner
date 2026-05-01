@@ -1,18 +1,22 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import type {
   ComposerAttachment,
+  DeckSlideCount,
   DesignMode,
   DesignSystemMode,
   DevicePreset,
   PipelineEvent,
   ProjectBundle,
+  SelectedBlockContext,
   SurfaceTarget
 } from "@designer/shared";
 import {
   AlertCircle,
   Bot,
+  Boxes,
   CheckCircle2,
   ImagePlus,
+  FileText,
   Link2,
   LoaderCircle,
   Monitor,
@@ -35,6 +39,7 @@ type PromptPanelProps = {
   setComposerPrompt: (value: string) => void;
   composerAttachments: ComposerAttachment[];
   addImageAttachment: (file: File) => Promise<void>;
+  addTextAttachment: (file: File) => Promise<void>;
   addFigmaAttachment: (url: string) => void;
   removeComposerAttachment: (attachmentId: string) => void;
   runMode: RunMode;
@@ -46,7 +51,9 @@ type PromptPanelProps = {
   selectedDesignSystemMode: DesignSystemMode;
   setSelectedDesignSystemMode: (value: DesignSystemMode) => void;
   selectedSurfaceTarget: SurfaceTarget;
-  setSelectedSurfaceTarget: (value: SurfaceTarget) => void;
+  deckSlideCount: DeckSlideCount;
+  setDeckSlideCount: (value: DeckSlideCount) => void;
+  selectedBlockContext: SelectedBlockContext | null;
   variation: number;
   setVariation: (value: number) => void;
   tailwindOverride: boolean;
@@ -135,6 +142,7 @@ export function PromptPanel(props: PromptPanelProps) {
     setComposerPrompt,
     composerAttachments,
     addImageAttachment,
+    addTextAttachment,
     addFigmaAttachment,
     removeComposerAttachment,
     runMode,
@@ -146,7 +154,9 @@ export function PromptPanel(props: PromptPanelProps) {
     selectedDesignSystemMode,
     setSelectedDesignSystemMode,
     selectedSurfaceTarget,
-    setSelectedSurfaceTarget,
+    deckSlideCount,
+    setDeckSlideCount,
+    selectedBlockContext,
     variation,
     setVariation,
     tailwindOverride,
@@ -198,6 +208,7 @@ export function PromptPanel(props: PromptPanelProps) {
   const [, setTicker] = useState(0);
   const attachMenuRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const textFileInputRef = useRef<HTMLInputElement | null>(null);
   const chatFeedRef = useRef<HTMLElement | null>(null);
   const chatFeedEndRef = useRef<HTMLDivElement | null>(null);
   const isUserScrolledUpRef = useRef(false);
@@ -255,6 +266,13 @@ export function PromptPanel(props: PromptPanelProps) {
       ).length,
     [composerAttachments]
   );
+  const textAttachmentCount = useMemo(
+    () =>
+      composerAttachments.filter(
+        (attachment) => attachment.type === "text" && attachment.status !== "failed"
+      ).length,
+    [composerAttachments]
+  );
 
   async function onImageSelected(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -272,6 +290,17 @@ export function PromptPanel(props: PromptPanelProps) {
     }
   }
 
+  async function onTextSelected(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) {
+      return;
+    }
+
+    setAttachMenuOpen(false);
+    await addTextAttachment(file);
+  }
+
   function onSubmitFigmaLink() {
     if (!figmaInput.trim()) {
       return;
@@ -286,6 +315,8 @@ export function PromptPanel(props: PromptPanelProps) {
   const composerPlaceholder =
     canvasMode === "flow"
       ? "Describe the journey, ask the agent to fix gaps, add edge cases, or write technical briefings for this board..."
+      : selectedSurfaceTarget === "deck"
+        ? "Describe the presentation, paste source text, or attach a .txt/.md file..."
       : "Ask a question, request a screen, or attach a Figma/image reference...";
 
   return (
@@ -316,6 +347,10 @@ export function PromptPanel(props: PromptPanelProps) {
         <span>
           <Sparkles size={11} />
           {bundle?.references.length ?? 0} refs
+        </span>
+        <span>
+          <Boxes size={11} />
+          {bundle?.assets?.length ?? 0} assets
         </span>
         <span>
           <Bot size={11} />
@@ -589,6 +624,16 @@ export function PromptPanel(props: PromptPanelProps) {
                 <ImagePlus size={13} />
                 Add image
               </button>
+              {selectedSurfaceTarget === "deck" ? (
+                <button
+                  type="button"
+                  onClick={() => textFileInputRef.current?.click()}
+                  disabled={textAttachmentCount >= 1}
+                >
+                  <FileText size={13} />
+                  Add text
+                </button>
+              ) : null}
               <button
                 type="button"
                 onClick={() => {
@@ -608,6 +653,13 @@ export function PromptPanel(props: PromptPanelProps) {
             type="file"
             accept="image/png,image/jpeg,image/jpg,image/webp,image/svg+xml"
             onChange={onImageSelected}
+          />
+          <input
+            ref={textFileInputRef}
+            className="composer-hidden-file-input"
+            type="file"
+            accept=".txt,.md,text/plain,text/markdown"
+            onChange={onTextSelected}
           />
 
           {isFigmaInputOpen ? (
@@ -647,9 +699,12 @@ export function PromptPanel(props: PromptPanelProps) {
           <div className="composer-attachments">
             {composerAttachments.map((attachment) => {
               const isImage = attachment.type === "image";
+              const isText = attachment.type === "text";
               const label =
                 isImage
                   ? attachment.name || "image"
+                  : isText
+                    ? attachment.name || "text source"
                   : attachment.url
                     ? toDisplayUrl(attachment.url)
                     : "figma link";
@@ -657,7 +712,7 @@ export function PromptPanel(props: PromptPanelProps) {
               return (
                 <div key={attachment.id} className={`composer-attachment-chip composer-attachment-chip--${attachment.status ?? "uploaded"}`}>
                   <span className="composer-attachment-chip__label">
-                    {isImage ? <ImagePlus size={11} /> : <Link2 size={11} />}
+                    {isImage ? <ImagePlus size={11} /> : isText ? <FileText size={11} /> : <Link2 size={11} />}
                     {label}
                   </span>
                   <span className="composer-attachment-chip__status">{attachment.status ?? "uploaded"}</span>
@@ -683,6 +738,32 @@ export function PromptPanel(props: PromptPanelProps) {
             <span>{runMode === "edit-selected" ? "Editing:" : "Variant of:"}</span>
             <strong>{selectedFrameContextLabel}</strong>
             <span className="composer-selection-chip__hint">Click canvas to deselect</span>
+          </div>
+        ) : null}
+
+        {canvasMode !== "flow" ? (
+          <div className="composer-selection-chip composer-selection-chip--surface">
+            <span>Type</span>
+            <strong>{selectedSurfaceTarget === "deck" ? `Deck • ${deckSlideCount} slides` : selectedSurfaceTarget === "mobile" ? "Mobile" : "Web"}</strong>
+            <span className="composer-selection-chip__hint">
+              {selectedSurfaceTarget === "deck" ? "Prompt creates a slide deck" : "Prompt creates a screen"}
+            </span>
+          </div>
+        ) : null}
+
+        {(bundle?.assets?.length ?? 0) > 0 ? (
+          <div className="composer-selection-chip composer-selection-chip--assets">
+            <span>Assets</span>
+            <strong>{bundle?.assets.length} available</strong>
+            <span className="composer-selection-chip__hint">Agent can reuse them</span>
+          </div>
+        ) : null}
+
+        {canvasMode !== "flow" && selectedBlockContext ? (
+          <div className="composer-selection-chip composer-selection-chip--block">
+            <span>Editing block</span>
+            <strong>{selectedBlockContext.label || selectedBlockContext.blockId}</strong>
+            <span className="composer-selection-chip__hint">Next edit is scoped to this block</span>
           </div>
         ) : null}
 
@@ -714,21 +795,27 @@ export function PromptPanel(props: PromptPanelProps) {
             ) : null}
             {canvasMode === "flow" ? (
               <span className="composer-flow-hint">Journey agent mode. The selected board is the only editable scope.</span>
-            ) : (
+            ) : selectedSurfaceTarget === "deck" ? (
               <>
                 <label>
-                  <select
-                    value={selectedSurfaceTarget}
-                    onChange={(event) => {
-                      const next = event.target.value as SurfaceTarget;
-                      setSelectedSurfaceTarget(next);
-                      setSelectedDevice(next === "mobile" ? "iphone" : "desktop");
-                    }}
-                  >
-                    <option value="web">Web</option>
-                    <option value="mobile">Mobile</option>
+                  <select value={deckSlideCount} onChange={(event) => setDeckSlideCount(Number(event.target.value) as DeckSlideCount)}>
+                    <option value={5}>5 slides</option>
+                    <option value={10}>10 slides</option>
+                    <option value={25}>25 slides</option>
                   </select>
                 </label>
+                <label>
+                  <select
+                    value={selectedDesignSystemMode}
+                    onChange={(event) => setSelectedDesignSystemMode(event.target.value as DesignSystemMode)}
+                  >
+                    <option value="strict">DS strict</option>
+                    <option value="creative">DS creative</option>
+                  </select>
+                </label>
+              </>
+            ) : (
+              <>
                 <label>
                   <select value={selectedDevice} onChange={(event) => setSelectedDevice(event.target.value as DevicePreset)}>
                     <option value="desktop">Desktop</option>

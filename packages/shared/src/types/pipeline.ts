@@ -7,14 +7,16 @@ import type {
   ProviderId,
   ReferenceScope,
   RunStatus,
-  SurfaceTarget
+  SurfaceTarget,
+  DesignMode,
+  DevicePreset
 } from "./core.js";
 
 export interface SelectedFrameContextPayload {
   frameId: string;
   name: string;
-  devicePreset: "desktop" | "iphone";
-  mode: "wireframe" | "high-fidelity";
+  devicePreset: DevicePreset;
+  mode: DesignMode;
   size: {
     width: number;
     height: number;
@@ -53,6 +55,7 @@ export interface PipelineEventPayload {
   variationCount?: number;
   designSystemMode?: DesignSystemMode;
   surfaceTarget?: SurfaceTarget;
+  deckSlideCount?: 5 | 10 | 25;
   selectedFrameContext?: SelectedFrameContextPayload | null;
   shouldTakeAction?: boolean;
   designSystemAction?: "none" | "approve" | "iterate";
